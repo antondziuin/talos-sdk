@@ -18,14 +18,26 @@ namespace Talos.Sdk
         /// <summary>The product's public token (<c>tpt_…</c>) from the portal.</summary>
         public string ProductToken { get; set; } = "";
 
-        /// <summary>The product's Ed25519 public key, base64 (from the portal).</summary>
+        /// <summary>
+        /// The product's <b>anchor</b> public key, base64 (from the portal's
+        /// Integration page). The rotation-safe root: the SDK fetches the
+        /// anchor-signed keyset and learns the current license/release keys from
+        /// it, so rotating a signing key never breaks a deployed app. Strongly
+        /// recommended. If set, <see cref="PublicKey"/> is optional (a fallback).
+        /// </summary>
+        public string? AnchorPublicKey { get; set; }
+
+        /// <summary>
+        /// The product's Ed25519 license public key, base64. A direct pin used to
+        /// verify activation/validation tokens when no keyset is loaded. Optional
+        /// if <see cref="AnchorPublicKey"/> is set.
+        /// </summary>
         public string PublicKey { get; set; } = "";
 
         /// <summary>
-        /// The product's <b>release</b>-signing public key, base64 (from the
-        /// portal's Integration page). Used to verify update manifests — a key
-        /// distinct from <see cref="PublicKey"/>, under separate custody. Falls
-        /// back to <see cref="PublicKey"/> when unset.
+        /// The product's <b>release</b>-signing public key, base64. Direct pin
+        /// used to verify update manifests when no keyset is loaded. Falls back to
+        /// <see cref="PublicKey"/> when unset.
         /// </summary>
         public string? ReleasePublicKey { get; set; }
 
@@ -49,10 +61,15 @@ namespace Talos.Sdk
     {
         private readonly TalosOptions _options;
         private readonly HttpClient _http;
-        private readonly byte[] _publicKey;
-        private readonly byte[] _releaseKey;
+        private readonly byte[]? _anchorKey;
+        private readonly byte[]? _publicKey;
+        private readonly byte[]? _releaseKey;
         private readonly string _fingerprint;
         private readonly bool _ownsHttp;
+
+        // Learned from the anchor-signed keyset; take precedence over the pins.
+        private List<byte[]> _keysetLicenseKeys = new List<byte[]>();
+        private List<byte[]> _keysetReleaseKeys = new List<byte[]>();
 
         private string? _licenseKey;
         private string? _activationSecret;
@@ -62,18 +79,78 @@ namespace Talos.Sdk
         {
             _options = options ?? throw new ArgumentNullException(nameof(options));
             if (string.IsNullOrEmpty(options.ProductToken)) throw new ArgumentException("ProductToken required");
-            if (string.IsNullOrEmpty(options.PublicKey)) throw new ArgumentException("PublicKey required");
             if (string.IsNullOrEmpty(options.ServerUrl)) throw new ArgumentException("ServerUrl required");
-            _publicKey = Convert.FromBase64String(options.PublicKey);
-            if (_publicKey.Length != 32) throw new ArgumentException("PublicKey must decode to 32 bytes");
-            // Manifests verify against the release key; fall back to the license key.
+            if (string.IsNullOrEmpty(options.AnchorPublicKey) && string.IsNullOrEmpty(options.PublicKey))
+                throw new ArgumentException("AnchorPublicKey or PublicKey required");
+            _anchorKey = Decode32(options.AnchorPublicKey, "AnchorPublicKey");
+            _publicKey = Decode32(options.PublicKey, "PublicKey");
+            // Direct release pin falls back to the license pin (keyset overrides both).
             _releaseKey = string.IsNullOrEmpty(options.ReleasePublicKey)
                 ? _publicKey
-                : Convert.FromBase64String(options.ReleasePublicKey);
-            if (_releaseKey.Length != 32) throw new ArgumentException("ReleasePublicKey must decode to 32 bytes");
+                : Decode32(options.ReleasePublicKey, "ReleasePublicKey");
             _http = options.HttpClient ?? new HttpClient();
             _ownsHttp = options.HttpClient == null;
             _fingerprint = Fingerprint.Compute();
+        }
+
+        private static byte[]? Decode32(string? b64, string name)
+        {
+            if (string.IsNullOrEmpty(b64)) return null;
+            byte[] raw = Convert.FromBase64String(b64);
+            if (raw.Length != 32) throw new ArgumentException($"{name} must decode to 32 bytes");
+            return raw;
+        }
+
+        /// <summary>
+        /// Fetch and verify the product's keyset (signed by the pinned anchor) and
+        /// adopt its current license/release keys. Called automatically during
+        /// <see cref="ActivateAsync"/>; call it again after a server-side key
+        /// rotation to keep verifying with no config change. No-op without an anchor.
+        /// </summary>
+        public async Task RefreshKeysetAsync(CancellationToken ct = default)
+        {
+            if (_anchorKey == null) return;
+            var body = new { product_token = _options.ProductToken };
+            using var doc = await PostAsync("/v1/client/keyset", body, ct).ConfigureAwait(false);
+            if (doc.RootElement.TryGetProperty("keyset", out var ks) && ks.ValueKind == JsonValueKind.String)
+                AdoptKeyset(ks.GetString());
+        }
+
+        private void AdoptKeyset(string? token)
+        {
+            if (_anchorKey == null || string.IsNullOrEmpty(token)) return;
+            JsonElement claims = TalosCompact.VerifyKeyset(_anchorKey, _options.ProductToken, token!);
+            var licenseKeys = new List<byte[]>();
+            var releaseKeys = new List<byte[]>();
+            if (claims.TryGetProperty("keys", out var keys) && keys.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var entry in keys.EnumerateArray())
+                {
+                    string? pk = GetStr(entry, "pk");
+                    string? purpose = GetStr(entry, "purpose");
+                    if (pk == null) continue;
+                    byte[] raw = Convert.FromBase64String(pk);
+                    if (raw.Length != 32) continue;
+                    if (purpose == "license") licenseKeys.Add(raw);
+                    else if (purpose == "release") releaseKeys.Add(raw);
+                }
+            }
+            _keysetLicenseKeys = licenseKeys;
+            _keysetReleaseKeys = releaseKeys;
+        }
+
+        private IReadOnlyList<byte[]> LicenseVerifyKeys()
+        {
+            if (_keysetLicenseKeys.Count > 0) return _keysetLicenseKeys;
+            if (_publicKey != null) return new[] { _publicKey };
+            throw new TalosSignatureException("no license verification key (keyset unavailable)");
+        }
+
+        private IReadOnlyList<byte[]> ReleaseVerifyKeys()
+        {
+            if (_keysetReleaseKeys.Count > 0) return _keysetReleaseKeys;
+            if (_releaseKey != null) return new[] { _releaseKey };
+            throw new TalosSignatureException("no release verification key (keyset unavailable)");
         }
 
         /// <summary>The last verified license state, if any.</summary>
@@ -100,9 +177,13 @@ namespace Talos.Sdk
             using var doc = await PostAsync("/v1/client/activate", body, ct).ConfigureAwait(false);
             JsonElement root = doc.RootElement;
 
+            // Adopt the keyset delivered with activation, then verify against the
+            // current license keys (so a rotated key still works).
+            if (root.TryGetProperty("keyset", out var ks) && ks.ValueKind == JsonValueKind.String)
+                AdoptKeyset(ks.GetString());
             string token = root.GetProperty("activation_token").GetString()!;
             JsonElement claims = TalosCompact.Verify(
-                _publicKey, "activation", _options.ProductToken, nonce, token);
+                LicenseVerifyKeys(), "activation", _options.ProductToken, nonce, token);
 
             _licenseKey = licenseKey;
             _activationSecret = root.GetProperty("activation_secret").GetString();
@@ -128,7 +209,7 @@ namespace Talos.Sdk
             using var doc = await PostAsync("/v1/client/validate", body, ct).ConfigureAwait(false);
             string token = doc.RootElement.GetProperty("validation_token").GetString()!;
             JsonElement claims = TalosCompact.Verify(
-                _publicKey, "validation", _options.ProductToken, nonce, token);
+                LicenseVerifyKeys(), "validation", _options.ProductToken, nonce, token);
 
             string decision = claims.TryGetProperty("decision", out var d) ? d.GetString() ?? "invalid" : "invalid";
             Current = StateFromClaims(claims, decision);
@@ -182,7 +263,7 @@ namespace Talos.Sdk
             string manifest = root.GetProperty("manifest").GetString()
                 ?? throw new TalosSignatureException("update available but no manifest");
             // Trust only the signed manifest for version/seq/artifact metadata.
-            JsonElement m = TalosCompact.VerifyManifest(_releaseKey, _options.ProductToken, manifest);
+            JsonElement m = TalosCompact.VerifyManifest(ReleaseVerifyKeys(), _options.ProductToken, manifest);
 
             long releaseSeq = m.TryGetProperty("release_seq", out var rs) && rs.ValueKind == JsonValueKind.Number
                 ? rs.GetInt64() : 0;

@@ -15,10 +15,12 @@ describe("contract", () => {
   const run = process.env["TALOS_CONTRACT"] === "1";
 
   (run ? it : it.skip)("activate / validate / deactivate roundtrip", async () => {
+    // Pin ONLY the anchor: the demo rotated both signing keys, so the SDK has no
+    // direct key and MUST learn the (rotated) license/release keys from the
+    // anchor-signed keyset. Verifying at all proves keyset-consume / anti-lock-in.
     const client = new TalosClient({
       productToken: env("TALOS_PRODUCT_TOKEN"),
-      publicKey: env("TALOS_PUBLIC_KEY"),
-      releasePublicKey: env("TALOS_RELEASE_PUBLIC_KEY"),
+      anchorPublicKey: env("TALOS_ANCHOR_PUBLIC_KEY"),
       serverUrl: env("TALOS_SERVER_URL"),
       appVersion: "1.0.0",
     });
@@ -28,6 +30,9 @@ describe("contract", () => {
     expect(client.isFeatureEnabled("pro")).toBe(true);
     expect(client.current?.getEntitlement("seats")).toBe(5);
 
+    // Explicitly refresh the keyset (exercises the standalone endpoint), then
+    // validate against the keyset-learned key.
+    await client.refreshKeyset();
     const validated = await client.validate();
     expect(validated.decision).toBe("valid");
 

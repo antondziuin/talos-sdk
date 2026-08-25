@@ -5,7 +5,13 @@ import { type KeyObject } from "node:crypto";
 
 import { TalosApiError, TalosError, TalosSignatureError } from "./errors.js";
 import { computeFingerprint } from "./fingerprint.js";
-import { b64urlEncode, publicKeyFromBase64, verifyManifest, verifyToken } from "./talos-compact.js";
+import {
+  b64urlEncode,
+  publicKeyFromBase64,
+  verifyKeyset,
+  verifyManifest,
+  verifyToken,
+} from "./talos-compact.js";
 
 /** Minimal fetch signature (Node 18+ global fetch, or an injected one). */
 export type FetchLike = (
@@ -16,13 +22,24 @@ export type FetchLike = (
 export interface TalosOptions {
   /** The product's public token (`tpt_…`) from the portal. */
   productToken: string;
-  /** The product's Ed25519 public key, base64 (from the portal). */
-  publicKey: string;
   /**
-   * The product's **release**-signing public key, base64 (from the portal's
-   * Integration page). Used to verify update manifests. A key distinct from
-   * {@link publicKey}, under separate custody. Falls back to `publicKey` when
-   * omitted (for products that sign releases with the license key).
+   * The product's **anchor** public key, base64 (from the portal's Integration
+   * page). The rotation-safe root: the SDK fetches the anchor-signed keyset and
+   * learns the current license/release keys from it, so rotating a signing key
+   * never breaks a deployed app. Strongly recommended — pin this. If set,
+   * {@link publicKey} is optional (a fallback for when the keyset is unavailable).
+   */
+  anchorPublicKey?: string;
+  /**
+   * The product's Ed25519 license public key, base64. A direct pin used to
+   * verify activation/validation tokens when no keyset is loaded. Optional if
+   * {@link anchorPublicKey} is set.
+   */
+  publicKey?: string;
+  /**
+   * The product's **release**-signing public key, base64. Direct pin used to
+   * verify update manifests when no keyset is loaded. Falls back to
+   * {@link publicKey} when omitted.
    */
   releasePublicKey?: string;
   /** Base URL of the Talos (or self-hosted) server. */
@@ -101,10 +118,15 @@ export class LicenseState {
  */
 export class TalosClient {
   private readonly options: TalosOptions;
-  private readonly publicKey: KeyObject;
-  private readonly releaseKey: KeyObject;
+  private readonly anchorKey: KeyObject | null;
+  private readonly publicKey: KeyObject | null;
+  private readonly releaseKey: KeyObject | null;
   private readonly fingerprint: string;
   private readonly doFetch: FetchLike;
+
+  // Learned from the anchor-signed keyset; take precedence over the direct pins.
+  private keysetLicenseKeys: KeyObject[] = [];
+  private keysetReleaseKeys: KeyObject[] = [];
 
   private licenseKey: string | null = null;
   private activationSecret: string | null = null;
@@ -112,11 +134,16 @@ export class TalosClient {
 
   constructor(options: TalosOptions) {
     if (!options.productToken) throw new TalosError("productToken required");
-    if (!options.publicKey) throw new TalosError("publicKey required");
     if (!options.serverUrl) throw new TalosError("serverUrl required");
+    if (!options.anchorPublicKey && !options.publicKey) {
+      throw new TalosError("anchorPublicKey or publicKey required");
+    }
     this.options = options;
-    this.publicKey = publicKeyFromBase64(options.publicKey);
-    // Manifests verify against the release key; fall back to the license key.
+    this.anchorKey = options.anchorPublicKey
+      ? publicKeyFromBase64(options.anchorPublicKey)
+      : null;
+    this.publicKey = options.publicKey ? publicKeyFromBase64(options.publicKey) : null;
+    // Direct release pin falls back to the license pin (keyset overrides both).
     this.releaseKey = options.releasePublicKey
       ? publicKeyFromBase64(options.releasePublicKey)
       : this.publicKey;
@@ -127,6 +154,51 @@ export class TalosClient {
 
   isFeatureEnabled(name: string): boolean {
     return this.current?.isFeatureEnabled(name) ?? false;
+  }
+
+  /**
+   * Fetch and verify the product's keyset (signed by the pinned anchor) and
+   * adopt its current license/release keys. Called automatically during
+   * {@link activate}; call it again after a server-side key rotation to keep
+   * verifying without any config change. No-op if no `anchorPublicKey` is pinned.
+   */
+  async refreshKeyset(): Promise<void> {
+    if (!this.anchorKey) return;
+    const body = await this.post("/v1/client/keyset", {
+      product_token: this.options.productToken,
+    });
+    this.adoptKeyset(body["keyset"]);
+  }
+
+  /** Verify a keyset token against the anchor and adopt its keys. */
+  private adoptKeyset(token: unknown): void {
+    if (!this.anchorKey || typeof token !== "string") return;
+    const claims = verifyKeyset(this.anchorKey, this.options.productToken, token);
+    const licenseKeys: KeyObject[] = [];
+    const releaseKeys: KeyObject[] = [];
+    for (const entry of asArray(claims["keys"])) {
+      const o = entry as Record<string, unknown>;
+      if (typeof o["pk"] !== "string") continue;
+      const key = publicKeyFromBase64(o["pk"]);
+      if (o["purpose"] === "license") licenseKeys.push(key);
+      else if (o["purpose"] === "release") releaseKeys.push(key);
+    }
+    this.keysetLicenseKeys = licenseKeys;
+    this.keysetReleaseKeys = releaseKeys;
+  }
+
+  /** Keys to verify license tokens with: the keyset if loaded, else the direct pin. */
+  private licenseVerifyKeys(): KeyObject[] {
+    if (this.keysetLicenseKeys.length) return this.keysetLicenseKeys;
+    if (this.publicKey) return [this.publicKey];
+    throw new TalosSignatureError("no license verification key (keyset unavailable)");
+  }
+
+  /** Keys to verify manifests with: the keyset if loaded, else the direct pin. */
+  private releaseVerifyKeys(): KeyObject[] {
+    if (this.keysetReleaseKeys.length) return this.keysetReleaseKeys;
+    if (this.releaseKey) return [this.releaseKey];
+    throw new TalosSignatureError("no release verification key (keyset unavailable)");
   }
 
   async activate(licenseKey: string): Promise<LicenseState> {
@@ -142,8 +214,11 @@ export class TalosClient {
       sdk_version: "node/0.0.0",
     });
 
+    // Adopt the keyset delivered with activation, then verify the activation
+    // token against the current license keys (so a rotated key still works).
+    this.adoptKeyset(body["keyset"]);
     const claims = verifyToken(
-      this.publicKey,
+      this.licenseVerifyKeys(),
       "activation",
       this.options.productToken,
       nonce,
@@ -166,7 +241,7 @@ export class TalosClient {
       nonce,
     });
     const claims = verifyToken(
-      this.publicKey,
+      this.licenseVerifyKeys(),
       "validation",
       this.options.productToken,
       nonce,
@@ -213,7 +288,7 @@ export class TalosClient {
       throw new TalosSignatureError("update available but no manifest");
     }
     // Trust only the signed manifest for version/seq/artifact metadata.
-    const m = verifyManifest(this.releaseKey, this.options.productToken, manifestToken);
+    const m = verifyManifest(this.releaseVerifyKeys(), this.options.productToken, manifestToken);
     const releaseSeq = typeof m["release_seq"] === "number" ? (m["release_seq"] as number) : 0;
     if (opts.currentReleaseSeq !== undefined && releaseSeq <= opts.currentReleaseSeq) {
       return null; // anti-downgrade: never surface an older-or-equal manifest.

@@ -42,6 +42,7 @@ export TALOS_CONTRACT=1
 export TALOS_SERVER_URL="http://127.0.0.1:8080"
 export TALOS_PRODUCT_TOKEN="$(echo "$DEMO" | python -c "import json,sys;print(json.load(sys.stdin)['product_token'])")"
 export TALOS_PUBLIC_KEY="$(echo "$DEMO" | python -c "import json,sys;print(json.load(sys.stdin)['public_key'])")"
+export TALOS_ANCHOR_PUBLIC_KEY="$(echo "$DEMO" | python -c "import json,sys;print(json.load(sys.stdin)['anchor_public_key'])")"
 export TALOS_RELEASE_PUBLIC_KEY="$(echo "$DEMO" | python -c "import json,sys;print(json.load(sys.stdin)['release_public_key'])")"
 export TALOS_LICENSE_KEY="$(echo "$DEMO" | python -c "import json,sys;print(json.load(sys.stdin)['license_key'])")"
 export TALOS_CURRENT_VERSION="$(echo "$DEMO" | python -c "import json,sys;print(json.load(sys.stdin)['current_version'])")"

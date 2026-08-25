@@ -20,24 +20,28 @@ namespace Talos.Sdk.Tests
             if (Environment.GetEnvironmentVariable("TALOS_CONTRACT") != "1")
                 return; // not configured — treat as a no-op pass
 
+            // Pin ONLY the anchor: the demo rotated both signing keys, so the SDK
+            // has no direct key and MUST learn the (rotated) license/release keys
+            // from the anchor-signed keyset. Verifying proves keyset-consume.
             var options = new TalosOptions
             {
                 ProductToken = Env("TALOS_PRODUCT_TOKEN"),
-                PublicKey = Env("TALOS_PUBLIC_KEY"),
-                ReleasePublicKey = Env("TALOS_RELEASE_PUBLIC_KEY"),
+                AnchorPublicKey = Env("TALOS_ANCHOR_PUBLIC_KEY"),
                 ServerUrl = Env("TALOS_SERVER_URL"),
                 AppVersion = "1.0.0",
             };
             string licenseKey = Env("TALOS_LICENSE_KEY");
             var client = new TalosClient(options);
 
-            // Activate: the returned activation token verifies under the pinned key.
+            // Activate: the activation token verifies under a keyset-learned key.
             LicenseState activated = await client.ActivateAsync(licenseKey);
             Assert.True(activated.IsValid, "activation should be valid");
             Assert.True(client.IsFeatureEnabled("pro"), "the 'pro' entitlement is set");
             Assert.Equal(5, client.Current!.GetEntitlementInt("seats"));
 
-            // Validate: machine-bound signed decision.
+            // Explicitly refresh the keyset (exercises the standalone endpoint),
+            // then validate against the keyset-learned key.
+            await client.RefreshKeysetAsync();
             LicenseState validated = await client.ValidateAsync();
             Assert.Equal("valid", validated.Decision);
 

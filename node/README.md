@@ -9,8 +9,8 @@ runtime dependencies** (`node:crypto` Ed25519, built-in `fetch`), dual ESM + CJS
 import { TalosClient } from "@talos/sdk";
 
 const talos = new TalosClient({
-  productToken: "tpt_…",             // from the portal's Integration page
-  publicKey: "base64-ed25519-key",   // pinned at build time
+  productToken: "tpt_…",               // from the portal's Integration page
+  anchorPublicKey: "base64-anchor-key", // pin THIS — the rotation-safe root
   serverUrl: "https://api.talos.dev",
   appVersion: "1.4.2",
 });
@@ -26,10 +26,16 @@ const check = await talos.validate();   // machine-bound signed decision
 ```
 
 Every server response is a Talos-compact token signed by the product key and
-verified against the pinned `publicKey`, so a fake/MITM server cannot forge an
-acceptable answer. The SDK ignores any `kid` and enforces `typ`/`aud`/nonce/
-`exp`/`nbf`. In Electron, run this in the **main process** and bridge to the
-renderer over IPC.
+verified against the pinned key, so a fake/MITM server cannot forge an acceptable
+answer. The SDK ignores any `kid` and enforces `typ`/`aud`/nonce/`exp`/`nbf`. In
+Electron, run this in the **main process** and bridge to the renderer over IPC.
+
+**Key rotation (anti-lock-in).** Pin `anchorPublicKey` — the product's immutable
+root. The SDK fetches the anchor-signed *keyset* (delivered with activation, or
+`await talos.refreshKeyset()`) and learns the current license/release keys from
+it. When you rotate a signing key in the portal, deployed apps keep working with
+no reconfiguration. (`publicKey`/`releasePublicKey` are still accepted as direct
+pins, but they break on the first rotation — prefer the anchor.)
 
 Anti-tamper honesty: JS is patchable — gate premium value on server-returned
 *data* (entitlements/config), not client booleans.
