@@ -66,3 +66,40 @@ export function verifyToken(
   }
   return claims;
 }
+
+/**
+ * Verify a signed update **manifest** (`typ=manifest`) against the pinned
+ * release key. Unlike per-request tokens a manifest is a long-lived, static
+ * artifact, so there is no nonce to echo and no short `exp`; instead it carries
+ * a `not_before` gate. Enforces scheme/version/`typ`, the signature, `aud`, and
+ * `not_before`.
+ */
+export function verifyManifest(
+  releaseKey: KeyObject,
+  expectedAud: string,
+  token: string,
+): Record<string, unknown> {
+  const parts = token.split(".");
+  if (parts.length !== 5) throw new TalosSignatureError("malformed manifest");
+  if (parts[0] !== "talos") throw new TalosSignatureError("unexpected scheme");
+  if (parts[1] !== "1") throw new TalosSignatureError("unsupported wire version");
+  if (parts[2] !== "manifest") throw new TalosSignatureError("not a manifest token");
+
+  const lastDot = token.lastIndexOf(".");
+  const prefix = Buffer.from(token.slice(0, lastDot), "ascii");
+  const sig = b64urlDecode(parts[4]!);
+  if (!cryptoVerify(null, prefix, releaseKey, sig)) {
+    throw new TalosSignatureError("manifest signature verification failed");
+  }
+
+  const claims = JSON.parse(b64urlDecode(parts[3]!).toString("utf8")) as Record<string, unknown>;
+  if (claims["aud"] !== expectedAud) throw new TalosSignatureError("audience mismatch");
+  const notBefore = claims["not_before"];
+  if (typeof notBefore === "number") {
+    const now = Math.floor(Date.now() / 1000);
+    if (now + CLOCK_SKEW_SECONDS < notBefore) {
+      throw new TalosSignatureError("manifest not yet released");
+    }
+  }
+  return claims;
+}

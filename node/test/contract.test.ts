@@ -1,3 +1,7 @@
+import { readFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { TalosClient, TalosError } from "../src/index.js";
@@ -14,6 +18,7 @@ describe("contract", () => {
     const client = new TalosClient({
       productToken: env("TALOS_PRODUCT_TOKEN"),
       publicKey: env("TALOS_PUBLIC_KEY"),
+      releasePublicKey: env("TALOS_RELEASE_PUBLIC_KEY"),
       serverUrl: env("TALOS_SERVER_URL"),
       appVersion: "1.0.0",
     });
@@ -28,6 +33,23 @@ describe("contract", () => {
 
     const again = await client.validate();
     expect(again.isValid).toBe(true);
+
+    // Updates: check → verified manifest → download → SHA-256 verification.
+    const upd = await client.checkForUpdate({ currentVersion: env("TALOS_CURRENT_VERSION") });
+    expect(upd).not.toBeNull();
+    expect(upd!.version).toBe(env("TALOS_UPDATE_VERSION"));
+    expect(upd!.releaseSeq).toBeGreaterThan(0);
+    expect(upd!.artifacts.length).toBeGreaterThan(0);
+
+    const dest = path.join(os.tmpdir(), `talos-dl-${process.pid}-${upd!.artifacts[0]!.filename}`);
+    const got = await client.downloadUpdate(upd!, dest, upd!.artifacts[0]!);
+    expect(got.filename).toBe(upd!.artifacts[0]!.filename);
+    const written = await readFile(dest);
+    expect(written.length).toBe(got.size);
+
+    // Anti-downgrade: checking with a seq at/above the latest yields no update.
+    const none = await client.checkForUpdate({ currentReleaseSeq: upd!.releaseSeq });
+    expect(none).toBeNull();
 
     await client.deactivate();
     await expect(client.validate()).rejects.toBeInstanceOf(TalosError);

@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Threading.Tasks;
 using Talos.Sdk;
 using Xunit;
@@ -23,6 +24,7 @@ namespace Talos.Sdk.Tests
             {
                 ProductToken = Env("TALOS_PRODUCT_TOKEN"),
                 PublicKey = Env("TALOS_PUBLIC_KEY"),
+                ReleasePublicKey = Env("TALOS_RELEASE_PUBLIC_KEY"),
                 ServerUrl = Env("TALOS_SERVER_URL"),
                 AppVersion = "1.0.0",
             };
@@ -42,6 +44,24 @@ namespace Talos.Sdk.Tests
             // A second re-validate still works (idempotent, seat retained).
             LicenseState again = await client.ValidateAsync();
             Assert.True(again.IsValid);
+
+            // Updates: check → verified manifest → download → SHA-256 verification.
+            UpdateInfo? upd = await client.CheckForUpdateAsync(
+                new CheckForUpdateOptions { CurrentVersion = Env("TALOS_CURRENT_VERSION") });
+            Assert.NotNull(upd);
+            Assert.Equal(Env("TALOS_UPDATE_VERSION"), upd!.Version);
+            Assert.True(upd.ReleaseSeq > 0);
+            Assert.NotEmpty(upd.Artifacts);
+
+            string dest = Path.Combine(Path.GetTempPath(), $"talos-dl-{Guid.NewGuid():N}");
+            UpdateArtifact got = await client.DownloadUpdateAsync(upd, dest, upd.Artifacts[0]);
+            Assert.Equal(upd.Artifacts[0].Filename, got.Filename);
+            Assert.Equal(got.Size, new FileInfo(dest).Length);
+
+            // Anti-downgrade: checking with a seq at/above the latest yields no update.
+            UpdateInfo? none = await client.CheckForUpdateAsync(
+                new CheckForUpdateOptions { CurrentReleaseSeq = upd.ReleaseSeq });
+            Assert.Null(none);
 
             // Deactivate releases the seat; validating afterwards must fail
             // (machine no longer found / secret cleared).

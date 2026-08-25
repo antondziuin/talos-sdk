@@ -67,6 +67,54 @@ namespace Talos.Sdk
             return claims;
         }
 
+        /// <summary>
+        /// Verify a signed update <b>manifest</b> (<c>typ=manifest</c>) against the
+        /// pinned release key. A manifest is a long-lived, static artifact, so
+        /// there is no nonce to echo and no short <c>exp</c>; instead it carries a
+        /// <c>not_before</c> gate. Enforces scheme/version/<c>typ</c>, the
+        /// signature, <c>aud</c>, and <c>not_before</c>.
+        /// </summary>
+        public static JsonElement VerifyManifest(
+            byte[] releaseKey,
+            string expectedAud,
+            string token)
+        {
+            string[] parts = token.Split('.');
+            if (parts.Length != 5)
+                throw new TalosSignatureException("malformed manifest");
+            if (parts[0] != "talos")
+                throw new TalosSignatureException("unexpected scheme");
+            if (parts[1] != "1")
+                throw new TalosSignatureException("unsupported wire version");
+            if (parts[2] != "manifest")
+                throw new TalosSignatureException("not a manifest token");
+
+            int lastDot = token.LastIndexOf('.');
+            byte[] prefix = Encoding.ASCII.GetBytes(token.Substring(0, lastDot));
+            byte[] sig = Base64Url.Decode(parts[4]);
+
+            var verifier = new Ed25519Signer();
+            verifier.Init(false, new Ed25519PublicKeyParameters(releaseKey, 0));
+            verifier.BlockUpdate(prefix, 0, prefix.Length);
+            if (!verifier.VerifySignature(sig))
+                throw new TalosSignatureException("manifest signature verification failed");
+
+            byte[] payload = Base64Url.Decode(parts[3]);
+            using var doc = JsonDocument.Parse(payload);
+            JsonElement claims = doc.RootElement.Clone();
+
+            string? aud = GetString(claims, "aud");
+            if (aud != expectedAud)
+                throw new TalosSignatureException("audience mismatch");
+            if (claims.TryGetProperty("not_before", out var nb) && nb.ValueKind == JsonValueKind.Number)
+            {
+                long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                if (now + ClockSkewSeconds < nb.GetInt64())
+                    throw new TalosSignatureException("manifest not yet released");
+            }
+            return claims;
+        }
+
         private static string? GetString(JsonElement e, string name)
         {
             return e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String

@@ -1,4 +1,7 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -17,6 +20,14 @@ namespace Talos.Sdk
 
         /// <summary>The product's Ed25519 public key, base64 (from the portal).</summary>
         public string PublicKey { get; set; } = "";
+
+        /// <summary>
+        /// The product's <b>release</b>-signing public key, base64 (from the
+        /// portal's Integration page). Used to verify update manifests — a key
+        /// distinct from <see cref="PublicKey"/>, under separate custody. Falls
+        /// back to <see cref="PublicKey"/> when unset.
+        /// </summary>
+        public string? ReleasePublicKey { get; set; }
 
         /// <summary>Base URL of the Talos (or self-hosted) server.</summary>
         public string ServerUrl { get; set; } = "";
@@ -39,6 +50,7 @@ namespace Talos.Sdk
         private readonly TalosOptions _options;
         private readonly HttpClient _http;
         private readonly byte[] _publicKey;
+        private readonly byte[] _releaseKey;
         private readonly string _fingerprint;
         private readonly bool _ownsHttp;
 
@@ -54,6 +66,11 @@ namespace Talos.Sdk
             if (string.IsNullOrEmpty(options.ServerUrl)) throw new ArgumentException("ServerUrl required");
             _publicKey = Convert.FromBase64String(options.PublicKey);
             if (_publicKey.Length != 32) throw new ArgumentException("PublicKey must decode to 32 bytes");
+            // Manifests verify against the release key; fall back to the license key.
+            _releaseKey = string.IsNullOrEmpty(options.ReleasePublicKey)
+                ? _publicKey
+                : Convert.FromBase64String(options.ReleasePublicKey);
+            if (_releaseKey.Length != 32) throw new ArgumentException("ReleasePublicKey must decode to 32 bytes");
             _http = options.HttpClient ?? new HttpClient();
             _ownsHttp = options.HttpClient == null;
             _fingerprint = Fingerprint.Compute();
@@ -133,6 +150,174 @@ namespace Talos.Sdk
             Current = null;
             _activationSecret = null;
             _machineId = null;
+        }
+
+        /// <summary>
+        /// Ask whether a newer release is available. Returns a verified
+        /// <see cref="UpdateInfo"/> (all metadata from the manifest signed by the
+        /// pinned release key), or <c>null</c> when up to date. Enforces
+        /// anti-downgrade: a manifest whose <c>release_seq</c> is at or below
+        /// <see cref="CheckForUpdateOptions.CurrentReleaseSeq"/> is treated as no update.
+        /// </summary>
+        public async Task<UpdateInfo?> CheckForUpdateAsync(
+            CheckForUpdateOptions? opts = null, CancellationToken ct = default)
+        {
+            RequireActivated();
+            opts ??= new CheckForUpdateOptions();
+            var body = new
+            {
+                product_token = _options.ProductToken,
+                license_key = _licenseKey,
+                fingerprint = new { composite = _fingerprint, components = new { } },
+                activation_secret = _activationSecret,
+                current_version = opts.CurrentVersion ?? _options.AppVersion,
+                current_release_seq = opts.CurrentReleaseSeq,
+                channel = opts.Channel,
+            };
+            using var doc = await PostAsync("/v1/client/updates/check", body, ct).ConfigureAwait(false);
+            JsonElement root = doc.RootElement;
+            if (!root.TryGetProperty("update_available", out var ua) || ua.ValueKind != JsonValueKind.True)
+                return null;
+
+            string manifest = root.GetProperty("manifest").GetString()
+                ?? throw new TalosSignatureException("update available but no manifest");
+            // Trust only the signed manifest for version/seq/artifact metadata.
+            JsonElement m = TalosCompact.VerifyManifest(_releaseKey, _options.ProductToken, manifest);
+
+            long releaseSeq = m.TryGetProperty("release_seq", out var rs) && rs.ValueKind == JsonValueKind.Number
+                ? rs.GetInt64() : 0;
+            if (opts.CurrentReleaseSeq is long cur && releaseSeq <= cur)
+                return null; // anti-downgrade: never surface an older-or-equal manifest.
+
+            // Untrusted transport map: platform/arch/kind → download path.
+            var downloads = new Dictionary<string, string>();
+            if (root.TryGetProperty("artifacts", out var respArts) && respArts.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var d in respArts.EnumerateArray())
+                {
+                    string? path = GetStr(d, "download_path");
+                    if (path != null)
+                        downloads[SelKey(GetStr(d, "platform"), GetStr(d, "arch"), GetStr(d, "kind"))] = path;
+                }
+            }
+
+            var artifacts = new List<UpdateArtifact>();
+            if (m.TryGetProperty("artifacts", out var manArts) && manArts.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var a in manArts.EnumerateArray())
+                {
+                    string platform = GetStr(a, "platform") ?? "";
+                    string arch = GetStr(a, "arch") ?? "";
+                    string kind = GetStr(a, "kind") ?? "";
+                    downloads.TryGetValue(SelKey(platform, arch, kind), out var dp);
+                    artifacts.Add(new UpdateArtifact
+                    {
+                        Platform = platform,
+                        Arch = arch,
+                        Kind = kind,
+                        Filename = GetStr(a, "filename") ?? "",
+                        Size = a.TryGetProperty("size", out var sz) && sz.ValueKind == JsonValueKind.Number ? sz.GetInt64() : 0,
+                        Sha256 = GetStr(a, "sha256") ?? "",
+                        DownloadPath = dp,
+                    });
+                }
+            }
+
+            return new UpdateInfo
+            {
+                Version = GetStr(m, "version") ?? "",
+                ReleaseSeq = releaseSeq,
+                Mandatory = m.TryGetProperty("mandatory", out var md) && md.ValueKind == JsonValueKind.True,
+                NotesUrl = GetStr(m, "notes_url"),
+                Artifacts = artifacts,
+            };
+        }
+
+        /// <summary>
+        /// Download one artifact of an update and verify its bytes against the
+        /// manifest SHA-256, then write it to <paramref name="destPath"/>. Returns
+        /// the chosen artifact. Does NOT apply or execute anything — verification
+        /// and installation are the host application's responsibility.
+        /// </summary>
+        public async Task<UpdateArtifact> DownloadUpdateAsync(
+            UpdateInfo info, string destPath, UpdateArtifact? artifact = null, CancellationToken ct = default)
+        {
+            RequireActivated();
+            UpdateArtifact? chosen = artifact ?? PickArtifact(info.Artifacts);
+            if (chosen == null) throw new TalosException("no artifact matches this platform");
+            if (string.IsNullOrEmpty(chosen.DownloadPath)) throw new TalosException("artifact has no download path");
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, _options.ServerUrl.TrimEnd('/') + chosen.DownloadPath);
+            req.Headers.TryAddWithoutValidation("x-talos-product-token", _options.ProductToken);
+            req.Headers.TryAddWithoutValidation("x-talos-license-key", _licenseKey);
+            req.Headers.TryAddWithoutValidation("x-talos-activation-secret", _activationSecret);
+            req.Headers.TryAddWithoutValidation("x-talos-fingerprint", _fingerprint);
+            using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
+                throw new TalosApiException((int)resp.StatusCode, null);
+
+            // The download channel is untrusted (could stream an unbounded body to
+            // exhaust memory before the hash check). Cap the read at the manifest's
+            // trusted Size, then verify the SHA-256 from the signed manifest.
+            if (resp.Content.Headers.ContentLength is long cl && cl > chosen.Size)
+                throw new TalosSignatureException("artifact exceeds manifest size");
+            using var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
+            byte[] bytes = await ReadCappedAsync(stream, chosen.Size, ct).ConfigureAwait(false);
+
+            string actual = Sha256Hex(bytes);
+            if (!string.Equals(actual, chosen.Sha256, StringComparison.Ordinal))
+                throw new TalosSignatureException("artifact hash mismatch (tampered or wrong bytes)");
+
+#if NET5_0_OR_GREATER
+            await File.WriteAllBytesAsync(destPath, bytes, ct).ConfigureAwait(false);
+#else
+            using (var fs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                await fs.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
+#endif
+            return chosen;
+        }
+
+        private static async Task<byte[]> ReadCappedAsync(Stream stream, long cap, CancellationToken ct)
+        {
+            using var ms = new MemoryStream();
+            byte[] buf = new byte[81920];
+            long total = 0;
+            int n;
+            while ((n = await stream.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false)) > 0)
+            {
+                total += n;
+                if (total > cap)
+                    throw new TalosSignatureException("artifact exceeds manifest size");
+                ms.Write(buf, 0, n);
+            }
+            return ms.ToArray();
+        }
+
+        private static string? GetStr(JsonElement e, string name) =>
+            e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+        private static string SelKey(string? platform, string? arch, string? kind) =>
+            $"{platform}/{arch}/{kind}";
+
+        private static string Sha256Hex(byte[] bytes)
+        {
+            using var sha = SHA256.Create();
+            byte[] hash = sha.ComputeHash(bytes);
+            var sb = new StringBuilder(hash.Length * 2);
+            foreach (byte b in hash) sb.Append(b.ToString("x2"));
+            return sb.ToString();
+        }
+
+        private static UpdateArtifact? PickArtifact(IReadOnlyList<UpdateArtifact> artifacts)
+        {
+            string platform =
+                RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows" :
+                RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macos" :
+                RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "linux" : "unknown";
+            string arch = RuntimeInformation.OSArchitecture.ToString().ToLowerInvariant();
+            var matches = artifacts.Where(a => a.Platform == platform && a.Arch == arch).ToList();
+            return matches.FirstOrDefault(a => a.Kind == "installer") ?? matches.FirstOrDefault();
         }
 
         private void RequireActivated()

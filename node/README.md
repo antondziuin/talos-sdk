@@ -34,6 +34,32 @@ renderer over IPC.
 Anti-tamper honesty: JS is patchable — gate premium value on server-returned
 *data* (entitlements/config), not client booleans.
 
+## Updates
+
+```ts
+const talos = new TalosClient({
+  productToken: "tpt_…",
+  publicKey: "…",             // license key (activation/validation tokens)
+  releasePublicKey: "…",      // release key (update manifests) — separate custody
+  serverUrl: "https://api.talos.dev",
+});
+await talos.activate(licenseKey);
+
+const upd = await talos.checkForUpdate({ currentVersion: "1.0.0", currentReleaseSeq: 41 });
+if (upd) {
+  // `upd` is built from a manifest signed by the pinned release key. Metadata
+  // (version, sha256, size, filename) is trusted; the download URL is not.
+  const dest = `/tmp/${upd.artifacts[0].filename}`;
+  await talos.downloadUpdate(upd, dest, upd.artifacts[0]); // verifies SHA-256, does NOT apply
+  // Hand `dest` to your installer / electron-updater. Applying is the app's job.
+}
+```
+
+The manifest carries a monotonic `releaseSeq`; pass your installed high-water
+mark as `currentReleaseSeq` and the SDK refuses to surface an older-or-equal
+release (**anti-downgrade**). Downloaded bytes are verified against the signed
+manifest's SHA-256, so the CDN/mirror serving them is untrusted infrastructure.
+
 ## Tests
 
 - `npm test` runs the client-side verification tests (no server needed).
