@@ -39,4 +39,8 @@ export TALOS_PRODUCT_TOKEN="$(echo "$DEMO" | python -c "import json,sys;print(js
 export TALOS_PUBLIC_KEY="$(echo "$DEMO" | python -c "import json,sys;print(json.load(sys.stdin)['public_key'])")"
 export TALOS_LICENSE_KEY="$(echo "$DEMO" | python -c "import json,sys;print(json.load(sys.stdin)['license_key'])")"
 
+echo "== C# contract =="
 dotnet test sdks/csharp/Talos.Sdk.Tests/Talos.Sdk.Tests.csproj
+
+echo "== Node contract =="
+( cd sdks/node && npm ci --no-audit --no-fund && npm test )
