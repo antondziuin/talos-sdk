@@ -4,7 +4,7 @@ import os from "node:os";
 import { type KeyObject } from "node:crypto";
 
 import { TalosApiError, TalosError, TalosSignatureError } from "./errors.js";
-import { computeFingerprint } from "./fingerprint.js";
+import { collectFingerprint, type FingerprintData } from "./fingerprint.js";
 import {
   b64urlEncode,
   publicKeyFromBase64,
@@ -48,6 +48,19 @@ export interface TalosOptions {
   appVersion?: string;
   /** Optional fetch implementation (defaults to the global `fetch`). */
   fetch?: FetchLike;
+  /**
+   * Extra fingerprint components, merged over the ones the SDK collects.
+   *
+   * Node cannot read hardware identifiers on Windows or macOS without native
+   * modules, so on those hosts the server falls back to exact matching and a
+   * NIC change forces a re-activation. If your app can supply a stable
+   * identifier — an Electron native module, or a value you already hold — pass
+   * it here (e.g. `{ machine_guid: "<value>" }`) and the server can keep the
+   * seat across hardware changes instead. Values are hashed like any other
+   * component, so raw identifiers never leave the machine. See
+   * `docs/FINGERPRINT.md` for the recognised ids and their weights.
+   */
+  fingerprintComponents?: Record<string, string>;
 }
 
 /** One downloadable artifact of an available update (from a verified manifest). */
@@ -148,6 +161,7 @@ export class TalosClient {
   private readonly publicKey: KeyObject | null;
   private readonly releaseKey: KeyObject | null;
   private readonly fingerprint: string;
+  private readonly fp: FingerprintData;
   private readonly doFetch: FetchLike;
 
   // Learned from the anchor-signed keyset; take precedence over the direct pins.
@@ -179,7 +193,8 @@ export class TalosClient {
     this.releaseKey = options.releasePublicKey
       ? publicKeyFromBase64(options.releasePublicKey)
       : this.publicKey;
-    this.fingerprint = computeFingerprint();
+    this.fp = collectFingerprint(options.productToken, options.fingerprintComponents);
+    this.fingerprint = this.fp.composite;
     this.doFetch = options.fetch ?? (globalThis.fetch as unknown as FetchLike);
     if (!this.doFetch) throw new TalosError("no fetch available (need Node 18+ or options.fetch)");
   }
@@ -238,7 +253,7 @@ export class TalosClient {
     const body = await this.post("/v1/client/activate", {
       product_token: this.options.productToken,
       license_key: licenseKey,
-      fingerprint: { composite: this.fingerprint, components: {} },
+      fingerprint: { composite: this.fingerprint, components: this.fp.components },
       nonce,
       os: `${os.type()} ${os.release()}`,
       arch: os.arch(),
@@ -268,7 +283,7 @@ export class TalosClient {
     const body = await this.post("/v1/client/validate", {
       product_token: this.options.productToken,
       license_key: this.licenseKey,
-      fingerprint: { composite: this.fingerprint, components: {} },
+      fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       nonce,
     });
@@ -289,7 +304,7 @@ export class TalosClient {
     await this.post("/v1/client/deactivate", {
       product_token: this.options.productToken,
       license_key: this.licenseKey,
-      fingerprint: { composite: this.fingerprint, components: {} },
+      fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
     });
     this.current = null;
@@ -311,7 +326,7 @@ export class TalosClient {
     const body = await this.post("/v1/client/heartbeat", {
       product_token: this.options.productToken,
       license_key: this.licenseKey,
-      fingerprint: { composite: this.fingerprint, components: {} },
+      fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       nonce,
       app_version: this.options.appVersion,
@@ -356,7 +371,7 @@ export class TalosClient {
     const body = await this.post("/v1/client/leases", {
       product_token: this.options.productToken,
       license_key: this.licenseKey,
-      fingerprint: { composite: this.fingerprint, components: {} },
+      fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       instance_id: instanceId,
       nonce,
@@ -416,7 +431,7 @@ export class TalosClient {
     await this.request("DELETE", "/v1/client/leases", {
       product_token: this.options.productToken,
       license_key: this.licenseKey,
-      fingerprint: { composite: this.fingerprint, components: {} },
+      fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       instance_id: instanceId,
     });
@@ -482,7 +497,7 @@ export class TalosClient {
     const body = await this.post("/v1/client/updates/check", {
       product_token: this.options.productToken,
       license_key: this.licenseKey,
-      fingerprint: { composite: this.fingerprint, components: {} },
+      fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       current_version: opts.currentVersion ?? this.options.appVersion,
       current_release_seq: opts.currentReleaseSeq,

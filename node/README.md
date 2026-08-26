@@ -52,6 +52,33 @@ A heartbeat refreshes this machine's last-seen state, returns the current
 feeds the developer portal's monitoring — active installs and version adoption.
 It reports only the app version and OS/arch; no IP address is stored.
 
+## Hardware changes
+
+The SDK identifies the machine by a set of component hashes (never the raw
+identifiers — each is HMAC'd with a product-scoped key before it is sent). If
+the policy uses tolerant matching, a machine that replaces a disk or reinstalls
+the OS keeps its seat instead of forcing the user through a re-activation.
+
+**Node's reach is limited.** With no native dependencies and no subprocesses,
+this SDK can read a stable machine identity on Linux but not on Windows or
+macOS, so those hosts fall back to exact matching: change a NIC and the user
+re-activates. If your application can do better — an Electron native module, or
+an id you already hold — pass it in and the server will use it:
+
+```ts
+const talos = new TalosClient({
+  productToken: "tpt_…",
+  anchorPublicKey: "…",
+  serverUrl: "https://api.talos.dev",
+  fingerprintComponents: { machine_guid: myNativeModule.machineId() },
+});
+```
+
+The value must be stable for the life of the install — one that changes per
+launch reports a hardware change on every launch. See
+[docs/FINGERPRINT.md](../../docs/FINGERPRINT.md) for the recognised ids, the
+per-platform coverage table, and the drift budget that bounds all of this.
+
 ## Floating (concurrent) licenses
 
 ```ts

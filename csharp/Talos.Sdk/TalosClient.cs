@@ -49,6 +49,18 @@ namespace Talos.Sdk
 
         /// <summary>Optional shared <see cref="System.Net.Http.HttpClient"/>.</summary>
         public HttpClient? HttpClient { get; set; }
+
+        /// <summary>
+        /// Extra fingerprint components, merged over the ones the SDK collects.
+        /// Use this where the BCL cannot reach the hardware (notably macOS, and
+        /// Unity/mobile hosts) and your app can: supply e.g.
+        /// <c>{"smbios_uuid", "&lt;value&gt;"}</c> and the server gains the
+        /// evidence it needs to keep a seat across a hardware change instead of
+        /// forcing a re-activation. Values are hashed like any other component,
+        /// so raw identifiers never leave the machine. See
+        /// <c>docs/FINGERPRINT.md</c> for the recognised ids and their weights.
+        /// </summary>
+        public IReadOnlyDictionary<string, string>? ExtraFingerprintComponents { get; set; }
     }
 
     /// <summary>
@@ -65,6 +77,7 @@ namespace Talos.Sdk
         private readonly byte[]? _publicKey;
         private readonly byte[]? _releaseKey;
         private readonly string _fingerprint;
+        private readonly FingerprintData _fp;
         private readonly bool _ownsHttp;
 
         // Learned from the anchor-signed keyset; take precedence over the pins.
@@ -95,7 +108,8 @@ namespace Talos.Sdk
                 : Decode32(options.ReleasePublicKey, "ReleasePublicKey");
             _http = options.HttpClient ?? new HttpClient();
             _ownsHttp = options.HttpClient == null;
-            _fingerprint = Fingerprint.Compute();
+            _fp = Fingerprint.Collect(options.ProductToken, options.ExtraFingerprintComponents);
+            _fingerprint = _fp.Composite;
         }
 
         private static byte[]? Decode32(string? b64, string name)
@@ -172,7 +186,7 @@ namespace Talos.Sdk
             {
                 product_token = _options.ProductToken,
                 license_key = licenseKey,
-                fingerprint = new { composite = _fingerprint, components = new { } },
+                fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 nonce,
                 os = RuntimeInformation.OSDescription,
                 arch = RuntimeInformation.OSArchitecture.ToString(),
@@ -207,7 +221,7 @@ namespace Talos.Sdk
             {
                 product_token = _options.ProductToken,
                 license_key = _licenseKey,
-                fingerprint = new { composite = _fingerprint, components = new { } },
+                fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
                 nonce,
             };
@@ -237,7 +251,7 @@ namespace Talos.Sdk
             {
                 product_token = _options.ProductToken,
                 license_key = _licenseKey,
-                fingerprint = new { composite = _fingerprint, components = new { } },
+                fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
                 nonce,
                 app_version = _options.AppVersion,
@@ -269,7 +283,7 @@ namespace Talos.Sdk
             {
                 product_token = _options.ProductToken,
                 license_key = _licenseKey,
-                fingerprint = new { composite = _fingerprint, components = new { } },
+                fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
             };
             using var _ = await PostAsync("/v1/client/deactivate", body, ct).ConfigureAwait(false);
@@ -299,7 +313,7 @@ namespace Talos.Sdk
             {
                 product_token = _options.ProductToken,
                 license_key = _licenseKey,
-                fingerprint = new { composite = _fingerprint, components = new { } },
+                fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
                 instance_id = instanceId,
                 nonce,
@@ -364,7 +378,7 @@ namespace Talos.Sdk
             {
                 product_token = _options.ProductToken,
                 license_key = _licenseKey,
-                fingerprint = new { composite = _fingerprint, components = new { } },
+                fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
                 instance_id = instanceId,
             };
@@ -469,7 +483,7 @@ namespace Talos.Sdk
             {
                 product_token = _options.ProductToken,
                 license_key = _licenseKey,
-                fingerprint = new { composite = _fingerprint, components = new { } },
+                fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
                 current_version = opts.CurrentVersion ?? _options.AppVersion,
                 current_release_seq = opts.CurrentReleaseSeq,
