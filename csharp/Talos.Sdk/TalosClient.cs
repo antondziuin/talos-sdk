@@ -47,6 +47,20 @@ namespace Talos.Sdk
         /// <summary>Optional app version reported in telemetry/heartbeats.</summary>
         public string? AppVersion { get; set; }
 
+        /// <summary>
+        /// The name shown for this seat in the developer's portal. Defaults to
+        /// <see cref="Environment.MachineName"/>.
+        /// </summary>
+        /// <remarks>
+        /// Unlike the hostname folded into the fingerprint, this one is stored
+        /// and displayed as written — it is what a support agent reads when a
+        /// customer says "release the one on my old laptop", and without it
+        /// every seat on a licence is an indistinguishable hash prefix. Set it
+        /// to <c>""</c> to send nothing if a machine name would be more
+        /// identifying than your users expect.
+        /// </remarks>
+        public string? Hostname { get; set; }
+
         /// <summary>Optional shared <see cref="System.Net.Http.HttpClient"/>.</summary>
         public HttpClient? HttpClient { get; set; }
 
@@ -344,10 +358,11 @@ namespace Talos.Sdk
                 license_key = licenseKey,
                 fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 nonce,
+                hostname = ReportedHostname(),
                 os = RuntimeInformation.OSDescription,
                 arch = RuntimeInformation.OSArchitecture.ToString(),
                 app_version = _options.AppVersion,
-                sdk_version = "csharp/0.0.0",
+                sdk_version = SdkVersion.Id,
             };
             using var doc = await PostAsync("/v1/client/activate", body, ct).ConfigureAwait(false);
             JsonElement root = doc.RootElement;
@@ -648,6 +663,7 @@ namespace Talos.Sdk
                 app_version = _options.AppVersion,
                 os = RuntimeInformation.OSDescription,
                 arch = RuntimeInformation.OSArchitecture.ToString(),
+                sdk_version = SdkVersion.Id,
             };
             using var doc = await PostAsync("/v1/client/heartbeat", body, ct).ConfigureAwait(false);
             JsonElement claims = TalosCompact.Verify(
@@ -1103,6 +1119,29 @@ namespace Talos.Sdk
             {
                 return null;
             }
+        }
+
+        /// <summary>
+        /// The machine name to report, or null to report none.
+        /// </summary>
+        /// <remarks>
+        /// An explicit <c>""</c> means "do not send". Omitting the field leaves
+        /// whatever the server already holds, because the server coalesces — so
+        /// sending an empty string would not clear it either, and suppression
+        /// has to happen here.
+        /// </remarks>
+        private string? ReportedHostname()
+        {
+            string? h = _options.Hostname ?? SafeMachineName();
+            return string.IsNullOrEmpty(h) ? null : h;
+        }
+
+        private static string? SafeMachineName()
+        {
+            try { return Environment.MachineName; }
+            // Locked-down hosts can refuse this. A missing name is a blank
+            // column, never a failed activation.
+            catch { return null; }
         }
 
         private static string NewNonce()

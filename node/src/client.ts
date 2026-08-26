@@ -11,6 +11,7 @@ import {
   stateKeyMaterial,
   type StoredBinding,
 } from "./state.js";
+import { SDK_ID } from "./version.js";
 import {
   b64urlEncode,
   publicKeyFromBase64,
@@ -66,6 +67,17 @@ export interface TalosOptions {
   serverUrl: string;
   /** Optional app version reported in telemetry/heartbeats. */
   appVersion?: string;
+  /**
+   * The name shown for this seat in the developer's portal. Defaults to
+   * `os.hostname()`.
+   *
+   * Unlike the hostname the SDK folds into the fingerprint, this one is stored
+   * and displayed as written — it is what a support agent reads when a customer
+   * says "release the one on my old laptop", and without it every seat on a
+   * licence is an indistinguishable hash prefix. Pass `""` to send nothing if a
+   * machine name would be more identifying than your users expect.
+   */
+  hostname?: string;
   /** Optional fetch implementation (defaults to the global `fetch`). */
   fetch?: FetchLike;
   /**
@@ -439,10 +451,11 @@ export class TalosClient {
       license_key: licenseKey,
       fingerprint: { composite: this.fingerprint, components: this.fp.components },
       nonce,
+      hostname: this.reportedHostname(),
       os: `${os.type()} ${os.release()}`,
       arch: os.arch(),
       app_version: this.options.appVersion,
-      sdk_version: "node/0.0.0",
+      sdk_version: SDK_ID,
     });
 
     // Adopt the keyset delivered with activation, then verify the activation
@@ -706,6 +719,18 @@ export class TalosClient {
    * The response is a signed `typ=heartbeat` token, so a MITM cannot forge the
    * status or lengthen the interval.
    */
+  /**
+   * The machine name to report, or `undefined` to report none.
+   *
+   * An explicit `""` means "do not send": omitting the field leaves whatever
+   * the server already holds, because the server coalesces, so sending an empty
+   * string would not clear it either — suppression has to happen here.
+   */
+  private reportedHostname(): string | undefined {
+    const h = this.options.hostname ?? os.hostname();
+    return h === "" ? undefined : h;
+  }
+
   async heartbeat(): Promise<LicenseState> {
     this.requireActivated();
     await this.ensureKeyset();
@@ -719,6 +744,7 @@ export class TalosClient {
       app_version: this.options.appVersion,
       os: `${os.type()} ${os.release()}`,
       arch: os.arch(),
+      sdk_version: SDK_ID,
     });
     const claims = verifyToken(
       this.licenseVerifyKeys(),
