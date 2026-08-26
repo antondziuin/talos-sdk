@@ -51,6 +51,37 @@ namespace Talos.Sdk
         }
 
         /// <summary>
+        /// Verify a token restored from the local cache, for use while offline.
+        /// <para>
+        /// Two checks from <see cref="Verify(IReadOnlyList{byte[]}, string, string, string, string)"/>
+        /// deliberately do not apply. The nonce belonged to the request that
+        /// fetched this token, and <c>exp</c> is the short window in which it
+        /// counts as <i>fresh</i> — a cached decision is by definition being used
+        /// after that. What bounds offline use instead is the <c>grace_until</c>
+        /// claim, which the caller enforces, together with the persisted
+        /// server-time high-water mark that stops the system clock being wound
+        /// back to extend it.
+        /// </para>
+        /// <para>
+        /// Everything binding the token to this machine still holds: the
+        /// signature under a pinned key, <c>typ</c>, <c>aud</c>, <c>nbf</c>, and
+        /// the caller's fingerprint check.
+        /// </para>
+        /// </summary>
+        public static JsonElement VerifyCached(
+            IReadOnlyList<byte[]> keys, string expectedTyp, string expectedAud, string token)
+        {
+            JsonElement claims = ParseAndVerify(keys, expectedTyp, token);
+            if (GetString(claims, "aud") != expectedAud)
+                throw new TalosSignatureException("audience mismatch");
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            if (claims.TryGetProperty("nbf", out var nbf) && nbf.ValueKind == JsonValueKind.Number
+                && now + ClockSkewSeconds < nbf.GetInt64())
+                throw new TalosSignatureException("cached token not yet valid");
+            return claims;
+        }
+
+        /// <summary>
         /// Verify a signed update <b>manifest</b> (<c>typ=manifest</c>) against the
         /// pinned release key(s). No nonce and no short <c>exp</c> (a manifest is a
         /// static artifact); enforces the signature, <c>aud</c>, and <c>not_before</c>.

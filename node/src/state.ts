@@ -29,6 +29,30 @@ export interface StoredBinding {
    * the support ticket the drift budget was built to prevent.
    */
   fingerprint: string;
+  /**
+   * The last anchor-signed keyset token.
+   *
+   * Cached because an anchor-only client — the pinning that survives key
+   * rotation — otherwise has no verification key at all until it can reach the
+   * server, which is exactly the situation the offline path exists for. The
+   * anchor is compiled into the app, the keyset is signed by it, and the
+   * validation token is signed by a key it lists: the whole chain verifies
+   * offline against a root the network cannot influence.
+   */
+  keyset?: string;
+  /** The last verified `typ=validation` token — the offline verdict. */
+  validation?: string;
+  /**
+   * The highest server clock ever seen, in unix seconds, taken from a signed
+   * claim.
+   *
+   * This is what makes offline grace bounded. Grace is evaluated against the
+   * local clock, which the user controls; with no mark that only moves forward,
+   * winding the clock back would renew a 72-hour window indefinitely. A
+   * monotonic timer is not a substitute — it resets on reboot and on a VM
+   * snapshot restore, which is the case that matters.
+   */
+  timeHighWater?: number;
 }
 
 const MAGIC = Buffer.from("TLS1");
@@ -141,6 +165,9 @@ export class StateStore {
         machineId: String(o["machineId"] ?? ""),
         fingerprint: String(o["fingerprint"] ?? ""),
       };
+      if (typeof o["keyset"] === "string") b.keyset = o["keyset"];
+      if (typeof o["validation"] === "string") b.validation = o["validation"];
+      if (typeof o["timeHighWater"] === "number") b.timeHighWater = o["timeHighWater"];
       return b.licenseKey && b.activationSecret ? b : null;
     } catch {
       return null;

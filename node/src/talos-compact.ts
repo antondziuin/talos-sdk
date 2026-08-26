@@ -81,6 +81,34 @@ export function verifyToken(
 }
 
 /**
+ * Verify a token restored from the local cache, for use while offline.
+ *
+ * Two checks from {@link verifyToken} deliberately do not apply. The nonce
+ * belonged to the request that fetched this token, and `exp` is the short window
+ * in which it counts as *fresh* — a cached decision is by definition being used
+ * after that. What bounds offline use instead is the `grace_until` claim, which
+ * the caller enforces, together with the persisted server-time high-water mark
+ * that stops the system clock being wound back to extend it.
+ *
+ * Everything binding the token to this machine still holds: the signature under
+ * a pinned key, `typ`, `aud`, `nbf`, and the caller's fingerprint check.
+ */
+export function verifyCachedToken(
+  keys: Keys,
+  expectedTyp: string,
+  expectedAud: string,
+  token: string,
+): Record<string, unknown> {
+  const claims = parseAndVerify(keys, token, expectedTyp);
+  if (claims["aud"] !== expectedAud) throw new TalosSignatureError("audience mismatch");
+  const nbf = claims["nbf"];
+  if (typeof nbf === "number" && Math.floor(Date.now() / 1000) + CLOCK_SKEW_SECONDS < nbf) {
+    throw new TalosSignatureError("cached token not yet valid");
+  }
+  return claims;
+}
+
+/**
  * Verify a signed update **manifest** (`typ=manifest`) against the pinned
  * release key(s). Unlike per-request tokens a manifest is a long-lived, static
  * artifact, so there is no nonce and no short `exp`; instead it carries a

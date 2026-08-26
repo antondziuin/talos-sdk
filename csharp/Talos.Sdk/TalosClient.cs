@@ -90,6 +90,13 @@ namespace Talos.Sdk
     /// </summary>
     public sealed class TalosClient
     {
+        /// <summary>
+        /// Tolerance for a slow or slightly-off clock, in seconds. Matches the
+        /// token verifier's; the point is to be forgiving about drift while
+        /// still catching a clock that has been moved.
+        /// </summary>
+        private const long ClockSkewSeconds = 60;
+
         private readonly TalosOptions _options;
         private readonly HttpClient _http;
         private readonly byte[]? _anchorKey;
@@ -107,6 +114,14 @@ namespace Talos.Sdk
         private string? _activationSecret;
         private string? _machineId;
         private readonly StateStore? _store;
+        /// <summary>Everything persisted for this product; written back as one file.</summary>
+        private StoredBinding? _binding;
+        /// <summary>
+        /// True while the adopted keyset came off disk. One refresh per process
+        /// upgrades it, so a rotation is picked up, but a client that cannot
+        /// reach the server keeps verifying with what it already trusts.
+        /// </summary>
+        private bool _keysetFromCache;
         private CancellationTokenSource? _renewCts;
         /// <summary>Bumped on release so an in-flight renewal cannot resurrect the seat.</summary>
         private volatile int _leaseGeneration;
@@ -143,9 +158,27 @@ namespace Talos.Sdk
             StoredBinding? stored = _store?.Load();
             if (stored != null)
             {
+                _binding = stored;
                 _licenseKey = stored.LicenseKey;
                 _activationSecret = stored.ActivationSecret;
                 _machineId = stored.MachineId;
+                // Adopt the cached keyset before anything asks for a
+                // verification key. Without it an anchor-only client has nothing
+                // to verify a cached decision with, and the offline path is
+                // unreachable in exactly the situation it exists for.
+                if (!string.IsNullOrEmpty(stored.Keyset))
+                {
+                    try
+                    {
+                        AdoptKeyset(stored.Keyset);
+                        _keysetFromCache = _keysetLicenseKeys.Count > 0;
+                    }
+                    catch (TalosException)
+                    {
+                        // A keyset that no longer verifies under the pinned
+                        // anchor is not a startup failure: fetch a fresh one.
+                    }
+                }
             }
         }
 
@@ -179,7 +212,11 @@ namespace Talos.Sdk
             var body = new { product_token = _options.ProductToken };
             using var doc = await PostAsync("/v1/client/keyset", body, ct).ConfigureAwait(false);
             if (doc.RootElement.TryGetProperty("keyset", out var ks) && ks.ValueKind == JsonValueKind.String)
+            {
                 AdoptKeyset(ks.GetString());
+                _keysetFromCache = false;
+                Persist(b => b.Keyset = ks.GetString());
+            }
         }
 
         /// <summary>
@@ -202,7 +239,8 @@ namespace Talos.Sdk
         /// </summary>
         private async Task EnsureKeysetAsync(CancellationToken ct)
         {
-            if (_anchorKey == null || _keysetLicenseKeys.Count > 0) return;
+            if (_anchorKey == null) return;
+            if (_keysetLicenseKeys.Count > 0 && !_keysetFromCache) return;
             await RefreshKeysetAsync(ct).ConfigureAwait(false);
         }
 
@@ -317,15 +355,22 @@ namespace Talos.Sdk
             _licenseKey = licenseKey;
             _activationSecret = root.GetProperty("activation_secret").GetString();
             _machineId = root.GetProperty("machine_id").GetString();
-            _store?.Save(new StoredBinding
+            _binding = new StoredBinding
             {
                 LicenseKey = licenseKey,
                 ActivationSecret = _activationSecret ?? "",
                 MachineId = _machineId ?? "",
                 Fingerprint = _fingerprint,
-            });
+                // A fresh activation invalidates any cached verdict for the
+                // previous binding; keep only the keyset, which is per product,
+                // not per machine.
+                Keyset = ks.ValueKind == JsonValueKind.String ? ks.GetString() : _binding?.Keyset,
+                TimeHighWater = _binding?.TimeHighWater ?? 0,
+            };
+            AdvanceClock(claims);
+            _store?.Save(_binding);
 
-            Current = StateFromClaims(claims, "valid");
+            Current = StateFromClaims(claims, "valid", false);
             return Current;
         }
 
@@ -336,31 +381,154 @@ namespace Talos.Sdk
             _activationSecret = null;
             _machineId = null;
             Current = null;
+            _binding = null;
             _store?.Clear();
         }
 
-        /// <summary>Re-validate the license (machine-bound, no seat consumed).</summary>
+        /// <summary>Mutate the persisted binding and write it back.</summary>
+        private void Persist(Action<StoredBinding> patch)
+        {
+            if (_store == null || _binding == null) return;
+            patch(_binding);
+            _store.Save(_binding);
+        }
+
+        /// <summary>
+        /// Advance the server-time high-water mark from a signed claim.
+        /// <para>
+        /// Only ever forward: this is the mark that keeps offline grace bounded
+        /// when the user owns the clock. <c>iat</c> is used when a token carries
+        /// no explicit <c>server_time</c> (activation does not) — both are the
+        /// server's clock, signed.
+        /// </para>
+        /// </summary>
+        private void AdvanceClock(JsonElement claims)
+        {
+            long? seen = Num(claims, "server_time") ?? Num(claims, "iat");
+            if (seen == null || _binding == null) return;
+            if (seen.Value > _binding.TimeHighWater) _binding.TimeHighWater = seen.Value;
+        }
+
+        private static long? Num(JsonElement o, string name) =>
+            o.ValueKind == JsonValueKind.Object
+            && o.TryGetProperty(name, out var v)
+            && v.ValueKind == JsonValueKind.Number
+            && v.TryGetInt64(out long n)
+                ? n
+                : (long?)null;
+
+        /// <summary>
+        /// Re-validate the license (machine-bound, no seat consumed).
+        /// <para>
+        /// Online-first, and offline-tolerant: if the server cannot be reached
+        /// the last verified verdict is honoured until the policy's
+        /// <c>grace_until</c>, so a laptop on a plane keeps working. An HTTP
+        /// status is an <i>answer</i> and is never masked by the cache.
+        /// </para>
+        /// </summary>
         public async Task<LicenseState> ValidateAsync(CancellationToken ct = default)
         {
             RequireActivated();
-            await EnsureKeysetAsync(ct).ConfigureAwait(false);
-            string nonce = NewNonce();
-            var body = new
+            try
             {
-                product_token = _options.ProductToken,
-                license_key = _licenseKey,
-                fingerprint = new { composite = _fingerprint, components = _fp.Components },
-                activation_secret = _activationSecret,
-                nonce,
-            };
-            using var doc = await PostAsync("/v1/client/validate", body, ct).ConfigureAwait(false);
-            string token = doc.RootElement.GetProperty("validation_token").GetString()!;
-            JsonElement claims = TalosCompact.Verify(
-                LicenseVerifyKeys(), "validation", _options.ProductToken, nonce, token);
+                await EnsureKeysetAsync(ct).ConfigureAwait(false);
+                string nonce = NewNonce();
+                var body = new
+                {
+                    product_token = _options.ProductToken,
+                    license_key = _licenseKey,
+                    fingerprint = new { composite = _fingerprint, components = _fp.Components },
+                    activation_secret = _activationSecret,
+                    nonce,
+                };
+                using var doc = await PostAsync("/v1/client/validate", body, ct).ConfigureAwait(false);
+                string token = doc.RootElement.GetProperty("validation_token").GetString()!;
+                JsonElement claims = TalosCompact.Verify(
+                    LicenseVerifyKeys(), "validation", _options.ProductToken, nonce, token);
 
-            string decision = claims.TryGetProperty("decision", out var d) ? d.GetString() ?? "invalid" : "invalid";
-            Current = StateFromClaims(claims, decision);
-            return Current;
+                string decision = claims.TryGetProperty("decision", out var d)
+                    ? d.GetString() ?? "invalid"
+                    : "invalid";
+                AdvanceClock(claims);
+                Persist(b => b.Validation = token);
+                Current = StateFromClaims(claims, decision, false);
+                return Current;
+            }
+            catch (Exception e) when (!(e is TalosApiException) && !(e is OperationCanceledException))
+            {
+                // An HTTP status is an *answer* — "revoked", "no such machine",
+                // "tenant suspended". Honouring a cached verdict over one would
+                // turn every negative answer into hours of grace, which is the
+                // opposite of what grace is for. Only the absence of an answer
+                // falls back: a dead network, or a response that fails
+                // verification (a garbled or forged reply tells us nothing, so
+                // per the trust model it is treated as unreachable, never as
+                // valid). A cancellation is the caller's decision, not the
+                // network's, so it propagates untouched.
+                LicenseState? offline = OfflineDecision();
+                if (offline == null) throw;
+                Current = offline;
+                return offline;
+            }
+        }
+
+        /// <summary>
+        /// The verdict from the local cache, or null when there is nothing
+        /// usable.
+        /// <para>
+        /// This is the whole offline story, and every check here is
+        /// load-bearing: the token is re-verified under the pinned key, so a
+        /// cache edited on disk is worthless; <c>fph</c> must be this machine,
+        /// so copying a state file to a second computer and pulling the network
+        /// cable does not licence it; <c>grace_until</c> — the policy's
+        /// <c>offline_grace_hours</c>, signed — bounds how long a verdict may
+        /// outlive its issuance; the licence's own expiry is re-checked, because
+        /// a cached "valid" must not outlive the subscription it was issued
+        /// under; and the clock is checked against a mark that only moves
+        /// forward, since every deadline above is evaluated against a clock the
+        /// user controls.
+        /// </para>
+        /// </summary>
+        private LicenseState? OfflineDecision()
+        {
+            string? token = _binding?.Validation;
+            if (string.IsNullOrEmpty(token)) return null;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            long highWater = _binding!.TimeHighWater;
+            if (highWater > 0 && now + ClockSkewSeconds < highWater)
+            {
+                // Distinct from "expired": nothing has run out, the machine is
+                // lying about the time. Say so, rather than reporting a licence
+                // problem the user cannot act on.
+                return new LicenseState { Decision = "clock_tampered", IsOffline = true };
+            }
+
+            JsonElement claims;
+            try
+            {
+                claims = TalosCompact.VerifyCached(
+                    LicenseVerifyKeys(), "validation", _options.ProductToken, token!);
+            }
+            catch (TalosException)
+            {
+                return null;
+            }
+            if (GetStr(claims, "fph") != _fingerprint) return null;
+
+            long? graceUntil = Num(claims, "grace_until");
+            string decision = GetStr(claims, "decision") ?? "invalid";
+            LicenseState cached = StateFromClaims(claims, decision, true);
+            if (graceUntil == null || now > graceUntil.Value)
+            {
+                cached.Decision = "grace_expired";
+                return cached;
+            }
+            if (cached.LicenseExpiresAt != null && now > cached.LicenseExpiresAt.Value)
+            {
+                cached.Decision = "expired";
+            }
+            return cached;
         }
 
         /// <summary>
@@ -393,6 +561,11 @@ namespace Talos.Sdk
                 doc.RootElement.GetProperty("heartbeat_token").GetString()!);
 
             string decision = GetStr(claims, "decision") ?? "invalid";
+            // Every signed server clock we see pushes the high-water mark
+            // forward, not just validation's — a heartbeat is the most frequent
+            // call there is.
+            AdvanceClock(claims);
+            Persist(_ => { });
             // A heartbeat carries the decision but not the entitlement bag; keep
             // the features from the last activate/validate.
             Current = new LicenseState
@@ -400,6 +573,8 @@ namespace Talos.Sdk
                 Decision = decision,
                 Features = Current?.Features ?? default,
                 LicenseExpiresAt = Current?.LicenseExpiresAt,
+                RevalidateAfter = Current?.RevalidateAfter,
+                GraceUntil = Current?.GraceUntil,
             };
             return Current;
         }
@@ -770,16 +945,29 @@ namespace Talos.Sdk
                 throw new TalosException("not activated: call ActivateAsync first");
         }
 
-        private LicenseState StateFromClaims(JsonElement claims, string decision)
+        private LicenseState StateFromClaims(JsonElement claims, string decision, bool isOffline)
         {
-            var state = new LicenseState { Decision = decision };
+            var state = new LicenseState { Decision = decision, IsOffline = isOffline };
+            long? revalHours = null;
+            long? graceHours = null;
             if (claims.TryGetProperty("lic", out var lic) && lic.ValueKind == JsonValueKind.Object)
             {
                 if (lic.TryGetProperty("features", out var feats))
                     state.Features = feats.Clone();
                 if (lic.TryGetProperty("lic_exp", out var exp) && exp.ValueKind == JsonValueKind.Number)
                     state.LicenseExpiresAt = exp.GetInt64();
+                revalHours = Num(lic, "reval_h");
+                graceHours = Num(lic, "grace_h");
             }
+            // Validation carries absolute deadlines; activation carries the same
+            // policy as hours beside its `iat`. Prefer the absolute form and
+            // derive the other, so both tokens answer "when should I come back?"
+            // the same way.
+            long iat = Num(claims, "iat") ?? DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            state.RevalidateAfter = Num(claims, "reval_after")
+                ?? (revalHours == null ? (long?)null : iat + revalHours.Value * 3600);
+            state.GraceUntil = Num(claims, "grace_until")
+                ?? (graceHours == null ? (long?)null : iat + graceHours.Value * 3600);
             return state;
         }
 

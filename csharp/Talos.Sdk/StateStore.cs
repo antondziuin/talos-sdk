@@ -38,6 +38,36 @@ namespace Talos.Sdk
         /// budget was built to prevent.
         /// </summary>
         public string Fingerprint { get; set; } = "";
+
+        /// <summary>
+        /// The last anchor-signed keyset token.
+        /// <para>
+        /// Cached because an anchor-only client — the pinning that survives key
+        /// rotation — otherwise has no verification key at all until it can
+        /// reach the server, which is exactly the situation the offline path
+        /// exists for. The anchor is compiled into the app, the keyset is signed
+        /// by it, and the validation token is signed by a key it lists: the
+        /// whole chain verifies offline against a root the network cannot
+        /// influence.
+        /// </para>
+        /// </summary>
+        public string? Keyset { get; set; }
+
+        /// <summary>The last verified <c>typ=validation</c> token — the offline verdict.</summary>
+        public string? Validation { get; set; }
+
+        /// <summary>
+        /// The highest server clock ever seen, in unix seconds, taken from a
+        /// signed claim.
+        /// <para>
+        /// This is what makes offline grace bounded. Grace is evaluated against
+        /// the local clock, which the user controls; with no mark that only
+        /// moves forward, winding the clock back would renew a 72-hour window
+        /// indefinitely. A monotonic timer is not a substitute — it resets on
+        /// reboot and on a VM snapshot restore, which is the case that matters.
+        /// </para>
+        /// </summary>
+        public long TimeHighWater { get; set; }
     }
 
     /// <summary>Reads and writes one product's machine binding.</summary>
@@ -153,6 +183,13 @@ namespace Talos.Sdk
                     ActivationSecret = Str(root, "activationSecret"),
                     MachineId = Str(root, "machineId"),
                     Fingerprint = Str(root, "fingerprint"),
+                    Keyset = Str(root, "keyset") is { Length: > 0 } k ? k : null,
+                    Validation = Str(root, "validation") is { Length: > 0 } v2 ? v2 : null,
+                    TimeHighWater =
+                        root.TryGetProperty("timeHighWater", out var hw)
+                        && hw.ValueKind == JsonValueKind.Number
+                            ? hw.GetInt64()
+                            : 0,
                 };
                 return b.LicenseKey.Length > 0 && b.ActivationSecret.Length > 0 ? b : null;
             }
@@ -178,6 +215,9 @@ namespace Talos.Sdk
                     activationSecret = b.ActivationSecret,
                     machineId = b.MachineId,
                     fingerprint = b.Fingerprint,
+                    keyset = b.Keyset,
+                    validation = b.Validation,
+                    timeHighWater = b.TimeHighWater,
                 });
                 var iv = new byte[IvLen];
                 using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(iv);

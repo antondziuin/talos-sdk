@@ -58,6 +58,54 @@ activation secret, so the file does not work on a different computer. A corrupt
 or unreadable file is treated as "not activated yet", never as an error: a
 damaged cache costs a re-activation, not a failed launch.
 
+## Offline and grace
+
+`validate()` is online-first and offline-tolerant. When the server answers, that
+answer wins and is cached. When it cannot be reached, the last verified verdict
+is honoured until the policy's `offline_grace_hours` runs out, so a laptop on a
+plane keeps working instead of losing the licensed application the moment the
+network does.
+
+```ts
+const state = await talos.validate();
+if (state.isOffline) showBanner("Working offline — checked in " + ago(state.graceUntil));
+switch (state.decision) {
+  case "valid": break;
+  case "grace_expired": requireConnection(); break;   // offline too long
+  case "clock_tampered": requireConnection(); break;  // the clock moved back
+  default: showLicenceProblem(state.decision);
+}
+```
+
+What is *not* cached matters as much. **A status code from the server is an
+answer** — "revoked", "no such machine", "tenant suspended" — and is never
+masked by the cache; falling back there would turn every negative verdict into
+hours of grace, which is the opposite of its purpose. Only the absence of an
+answer falls back: a dead network, or a reply that fails signature verification
+(a garbled or forged response tells you nothing, so it is treated as
+unreachable — never as valid).
+
+Four things bound the cached verdict, and each closes a specific hole:
+
+- it is **re-verified under the pinned key** on every use, so editing the state
+  file achieves nothing;
+- its `fph` claim must be *this* machine, so copying the file to a second
+  computer and pulling the network cable does not licence it;
+- the licence's own expiry is re-checked, so a cached "valid" cannot outlive
+  the subscription it was issued under;
+- and a **persistent server-time high-water mark** — the highest signed server
+  clock ever seen — is compared against the local clock. Without it, winding the
+  system clock back would renew the grace window forever. A monotonic timer is
+  not a substitute: it resets on reboot and on a VM snapshot restore, which is
+  exactly the case that matters. A clock behind the mark reports
+  `clock_tampered`, which is deliberately distinct from `expired` — nothing has
+  run out, the machine is lying about the time.
+
+The anchor-signed keyset is cached alongside it, so the whole chain verifies
+offline against a root the network cannot influence: the anchor is compiled into
+your app, the keyset is signed by it, and the validation token is signed by a key
+it lists.
+
 Every server response is a Talos-compact token signed by the product key and
 verified against the pinned key, so a fake/MITM server cannot forge an acceptable
 answer. The SDK ignores any `kid` and enforces `typ`/`aud`/nonce/`exp`/`nbf`. In
