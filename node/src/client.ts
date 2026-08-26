@@ -34,11 +34,29 @@ const CLOCK_SKEW_SECONDS = 60;
  */
 const DEFAULT_HEARTBEAT_SECONDS = 600;
 
+/**
+ * What a response has to offer this SDK.
+ *
+ * `headers` and `body` are optional because a test double need not implement a
+ * `ReadableStream`; `arrayBuffer` is not, because the artifact download has to
+ * read bytes and an optional method there just moves the failure to run time —
+ * which is exactly what this shape is being widened to prevent.
+ */
+export interface FetchResponseLike {
+  status: number;
+  text(): Promise<string>;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  headers?: { get(name: string): string | null };
+  /** A streaming body, when the implementation has one (the global `fetch`
+   *  does). Used to enforce the size cap without buffering first. */
+  body?: { getReader(): { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<unknown> } } | null;
+}
+
 /** Minimal fetch signature (Node 18+ global fetch, or an injected one). */
 export type FetchLike = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
-) => Promise<{ status: number; text(): Promise<string> }>;
+  init: { method: string; headers: Record<string, string>; body?: string },
+) => Promise<FetchResponseLike>;
 
 export interface TalosOptions {
   /** The product's public token (`tpt_…`) from the portal. */
@@ -78,7 +96,15 @@ export interface TalosOptions {
    * machine name would be more identifying than your users expect.
    */
   hostname?: string;
-  /** Optional fetch implementation (defaults to the global `fetch`). */
+  /**
+   * Optional fetch implementation (defaults to the global `fetch`).
+   *
+   * Used for **every** network call, artifact downloads included. It did not
+   * used to be: `downloadUpdate` reached for `globalThis.fetch` directly, so a
+   * proxy, a custom CA bundle, request logging or a test double applied to
+   * every licensing call and was silently bypassed by the one call that pulls a
+   * multi-megabyte binary and is likeliest to need it.
+   */
   fetch?: FetchLike;
   /**
    * Extra fingerprint components, merged over the ones the SDK collects.
@@ -994,7 +1020,7 @@ export class TalosClient {
     if (!chosen.downloadPath) throw new TalosError("artifact has no download path");
 
     const url = this.options.serverUrl.replace(/\/+$/, "") + chosen.downloadPath;
-    const res = await (globalThis.fetch as typeof fetch)(url, {
+    const res = await this.doFetch(url, {
       method: "GET",
       headers: {
         "x-talos-product-token": this.options.productToken,
@@ -1003,7 +1029,7 @@ export class TalosClient {
         "x-talos-fingerprint": this.fingerprint,
       },
     });
-    if (!res.ok) throw new TalosApiError(res.status, undefined);
+    if (res.status < 200 || res.status >= 300) throw new TalosApiError(res.status, undefined);
 
     // The download channel is untrusted (could stream an unbounded body to
     // exhaust memory before the hash check). Cap the read at the manifest's
@@ -1090,13 +1116,15 @@ function newNonce(): string {
  * bytes (the manifest's trusted size). Guards against an untrusted download host
  * streaming an unbounded body to exhaust memory before the hash check.
  */
-async function readCapped(res: Response, cap: number): Promise<Buffer> {
-  const contentLength = res.headers.get("content-length");
+async function readCapped(res: FetchResponseLike, cap: number): Promise<Buffer> {
+  const contentLength = res.headers?.get("content-length");
   if (contentLength && Number(contentLength) > cap) {
     throw new TalosSignatureError("artifact exceeds manifest size");
   }
   const body = res.body;
   if (!body) {
+    // No stream to meter, so the cap can only be checked after the read. Real
+    // `fetch` always has one; this is the path a supplied implementation takes.
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.length > cap) throw new TalosSignatureError("artifact exceeds manifest size");
     return buf;
@@ -1106,7 +1134,7 @@ async function readCapped(res: Response, cap: number): Promise<Buffer> {
   let total = 0;
   for (;;) {
     const { done, value } = await reader.read();
-    if (done) break;
+    if (done || !value) break;
     total += value.byteLength;
     if (total > cap) {
       await reader.cancel();

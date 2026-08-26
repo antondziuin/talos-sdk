@@ -26,6 +26,15 @@ if (talos.isFeatureEnabled("pdf-export")) enablePdfMenu();
 const seats = Number(talos.current?.getEntitlement("seats") ?? 1);
 ```
 
+## Supplying your own `fetch`
+
+`options.fetch` replaces the global one for **every** network call, artifact
+downloads included — so a corporate proxy, a custom CA bundle, request logging
+or a test double applies uniformly. It must return `{ status, text(),
+arrayBuffer() }`; `headers` and `body` are optional, and when the implementation
+provides a streaming `body` the artifact download meters it against the signed
+manifest's size instead of buffering first.
+
 ## The machine binding is persistent
 
 `activate` binds this machine and the SDK writes that binding to a per-product

@@ -9,7 +9,9 @@ Ed25519 verification via BouncyCastle (pure managed — no native binaries).
 ```csharp
 using Talos.Sdk;
 
-var talos = new TalosClient(new TalosOptions {
+// `using`: the client disposes the HttpClient it created for itself. Supply
+// your own via TalosOptions.HttpClient and it is left alone — you own it.
+using var talos = new TalosClient(new TalosOptions {
     ProductToken = "tpt_…",              // from the portal's Integration page
     PublicKey    = "base64-ed25519-key", // pinned at build time
     ServerUrl    = "https://api.talos.dev",

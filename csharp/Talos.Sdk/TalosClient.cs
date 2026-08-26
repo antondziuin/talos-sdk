@@ -102,7 +102,7 @@ namespace Talos.Sdk
     /// acceptable answer. One instance per product; holds the per-machine
     /// activation secret after <see cref="ActivateAsync"/>.
     /// </summary>
-    public sealed class TalosClient
+    public sealed class TalosClient : IDisposable
     {
         /// <summary>
         /// Tolerance for a slow or slightly-off clock, in seconds. Matches the
@@ -126,6 +126,7 @@ namespace Talos.Sdk
         private readonly string _fingerprint;
         private readonly FingerprintData _fp;
         private readonly bool _ownsHttp;
+        private bool _disposed;
 
         // Learned from the anchor-signed keyset; take precedence over the pins.
         private List<byte[]> _keysetLicenseKeys = new List<byte[]>();
@@ -481,6 +482,40 @@ namespace Talos.Sdk
             // Cancel but do NOT dispose here — the loop disposes its own CTS.
             _checkInCts?.Cancel();
             _checkInCts = null;
+        }
+
+        /// <summary>
+        /// Stop the background loops and release the <see cref="HttpClient"/>
+        /// this client created for itself.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The field recording whether the client owns its <c>HttpClient</c>
+        /// has existed since the constructor did, read by nothing: the disposal
+        /// it was declared for was never written. So the documented quickstart
+        /// shape — construct a client without supplying one — leaked a
+        /// socket-holding <c>HttpClient</c> per instance, and
+        /// <c>using (var talos = new TalosClient(...))</c> did not compile. A
+        /// host that builds one per product or reloads plugins accumulates them
+        /// until it runs out of ports.
+        /// </para>
+        /// <para>
+        /// A supplied <c>HttpClient</c> is left alone: the caller owns it, very
+        /// likely shares it, and disposing someone else's is a worse bug than
+        /// leaking your own. Idempotent, so a <c>using</c> block around an
+        /// explicit dispose is safe.
+        /// </para>
+        /// </remarks>
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            // Cancel before disposing: the loops own their CTS objects and
+            // observe cancellation to unwind, so cancelling is what actually
+            // stops them.
+            StopRenew();
+            StopCheckIns();
+            if (_ownsHttp) _http.Dispose();
         }
 
         /// <summary>Drop the machine binding, in memory and on disk.</summary>

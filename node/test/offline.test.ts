@@ -166,7 +166,8 @@ describe("offline grace", () => {
     const answers: FetchLike = () =>
       Promise.resolve({
         status: 404,
-        text: () => Promise.resolve(JSON.stringify({ error: "machine_not_found" })),
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+      text: () => Promise.resolve(JSON.stringify({ error: "machine_not_found" })),
       });
     await expect(client(pubB64, file, answers).validate()).rejects.toBeInstanceOf(TalosApiError);
   });
@@ -178,7 +179,7 @@ describe("offline grace", () => {
 
     // A server that echoes the nonce the client actually generated.
     const live: FetchLike = (_url, init) => {
-      const sent = JSON.parse(init.body) as { nonce: string };
+      const sent = JSON.parse(init.body ?? "{}") as { nonce: string };
       const token = mint(
         privateKey,
         "validation",
@@ -186,7 +187,8 @@ describe("offline grace", () => {
       );
       return Promise.resolve({
         status: 200,
-        text: () => Promise.resolve(JSON.stringify({ validation_token: token })),
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+      text: () => Promise.resolve(JSON.stringify({ validation_token: token })),
       });
     };
 
@@ -207,7 +209,7 @@ describe("offline grace", () => {
     const { pubB64, privateKey } = keypair();
     const file = seed(privateKey, validationClaims());
     const live: FetchLike = (_url, init) => {
-      const sent = JSON.parse(init.body) as { nonce: string };
+      const sent = JSON.parse(init.body ?? "{}") as { nonce: string };
       const now = NOW();
       const token = mint(privateKey, "heartbeat", {
         aud: PRODUCT,
@@ -222,6 +224,7 @@ describe("offline grace", () => {
       });
       return Promise.resolve({
         status: 200,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
         text: () =>
           Promise.resolve(
             JSON.stringify({

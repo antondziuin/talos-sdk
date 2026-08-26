@@ -3,6 +3,7 @@ export {
   LicenseState,
   type TalosOptions,
   type FetchLike,
+  type FetchResponseLike,
   type UpdateInfo,
   type UpdateArtifact,
   type CheckForUpdateOptions,
