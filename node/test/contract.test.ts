@@ -18,12 +18,18 @@ describe("contract", () => {
     // Pin ONLY the anchor: the demo rotated both signing keys, so the SDK has no
     // direct key and MUST learn the (rotated) license/release keys from the
     // anchor-signed keyset. Verifying at all proves keyset-consume / anti-lock-in.
-    const client = new TalosClient({
+    // A per-run state file: the point of the persistence is that it outlives
+    // the client object, so it must not be the developer's real one.
+    const statePath = path.join(os.tmpdir(), `talos-state-${process.pid}.bin`);
+    const opts = {
       productToken: env("TALOS_PRODUCT_TOKEN"),
       anchorPublicKey: env("TALOS_ANCHOR_PUBLIC_KEY"),
       serverUrl: env("TALOS_SERVER_URL"),
       appVersion: "1.0.0",
-    });
+      statePath,
+    };
+    const client = new TalosClient(opts);
+    expect(client.isActivated).toBe(false);
 
     const activated = await client.activate(env("TALOS_LICENSE_KEY"));
     expect(activated.isValid).toBe(true);
@@ -38,6 +44,25 @@ describe("contract", () => {
 
     const again = await client.validate();
     expect(again.isValid).toBe(true);
+
+    // --- the machine binding outlives the process ---------------------------
+    // A second client that never calls activate(): this is the app's next
+    // launch. Before the binding was persisted every start had to activate
+    // again — burning a round trip the protocol exists to avoid, rotating the
+    // secret out from under any other running copy, and (because activate is
+    // the one client route refused for a suspended tenant) taking the
+    // developer's own paying users offline the moment their vendor's account
+    // was suspended.
+    const restarted = new TalosClient(opts);
+    expect(restarted.isActivated).toBe(true);
+    expect(restarted.currentMachineId).toBe(client.currentMachineId);
+    expect((await restarted.validate()).decision).toBe("valid");
+
+    // activate() on an existing binding re-validates instead of re-activating.
+    // The proof is the FIRST client: a real activation would have rotated the
+    // secret and left it holding a dead one.
+    expect((await restarted.activate(env("TALOS_LICENSE_KEY"))).decision).toBe("valid");
+    expect((await client.validate()).decision).toBe("valid");
 
     // Updates: check → verified manifest → download → SHA-256 verification.
     const upd = await client.checkForUpdate({ currentVersion: env("TALOS_CURRENT_VERSION") });
@@ -82,6 +107,9 @@ describe("contract", () => {
 
     await client.deactivate();
     await expect(client.validate()).rejects.toBeInstanceOf(TalosError);
+    // Deactivation forgets the binding on disk too, or the next launch would
+    // restore a seat the user just gave back.
+    expect(new TalosClient(opts).isActivated).toBe(false);
   });
 });
 

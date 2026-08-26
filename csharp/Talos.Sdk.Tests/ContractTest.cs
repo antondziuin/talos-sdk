@@ -23,15 +23,20 @@ namespace Talos.Sdk.Tests
             // Pin ONLY the anchor: the demo rotated both signing keys, so the SDK
             // has no direct key and MUST learn the (rotated) license/release keys
             // from the anchor-signed keyset. Verifying proves keyset-consume.
-            var options = new TalosOptions
+            // A per-run state file: the point of the persistence is that it
+            // outlives the client object, so it must not be the developer's own.
+            string statePath = Path.Combine(Path.GetTempPath(), $"talos-state-{Guid.NewGuid():N}.bin");
+            Func<TalosOptions> options = () => new TalosOptions
             {
                 ProductToken = Env("TALOS_PRODUCT_TOKEN"),
                 AnchorPublicKey = Env("TALOS_ANCHOR_PUBLIC_KEY"),
                 ServerUrl = Env("TALOS_SERVER_URL"),
                 AppVersion = "1.0.0",
+                StatePath = statePath,
             };
             string licenseKey = Env("TALOS_LICENSE_KEY");
-            var client = new TalosClient(options);
+            var client = new TalosClient(options());
+            Assert.False(client.IsActivated, "nothing is stored before the first activation");
 
             // Activate: the activation token verifies under a keyset-learned key.
             LicenseState activated = await client.ActivateAsync(licenseKey);
@@ -48,6 +53,25 @@ namespace Talos.Sdk.Tests
             // A second re-validate still works (idempotent, seat retained).
             LicenseState again = await client.ValidateAsync();
             Assert.True(again.IsValid);
+
+            // --- the machine binding outlives the process ---------------------
+            // A second client that never calls Activate: this is the app's next
+            // launch. Before the binding was persisted every start had to
+            // activate again - burning a round trip the protocol exists to
+            // avoid, rotating the secret out from under any other running copy,
+            // and (because activate is the one client route refused for a
+            // suspended tenant) taking the developer's own paying users offline
+            // the moment their vendor's account was suspended.
+            var restarted = new TalosClient(options());
+            Assert.True(restarted.IsActivated, "the binding was restored from disk");
+            Assert.Equal(client.MachineId, restarted.MachineId);
+            Assert.Equal("valid", (await restarted.ValidateAsync()).Decision);
+
+            // Activate on an existing binding re-validates instead of
+            // re-activating. The proof is the FIRST client: a real activation
+            // would have rotated the secret and left it holding a dead one.
+            Assert.Equal("valid", (await restarted.ActivateAsync(licenseKey)).Decision);
+            Assert.Equal("valid", (await client.ValidateAsync()).Decision);
 
             // Updates: check → verified manifest → download → SHA-256 verification.
             UpdateInfo? upd = await client.CheckForUpdateAsync(
@@ -99,6 +123,9 @@ namespace Talos.Sdk.Tests
             // (machine no longer found / secret cleared).
             await client.DeactivateAsync();
             await Assert.ThrowsAsync<TalosException>(() => client.ValidateAsync());
+            // Deactivation forgets the binding on disk too, or the next launch
+            // would restore a seat the user just gave back.
+            Assert.False(new TalosClient(options()).IsActivated);
         }
 
         private static string Env(string name)

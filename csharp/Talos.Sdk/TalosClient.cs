@@ -61,6 +61,25 @@ namespace Talos.Sdk
         /// <c>docs/FINGERPRINT.md</c> for the recognised ids and their weights.
         /// </summary>
         public IReadOnlyDictionary<string, string>? ExtraFingerprintComponents { get; set; }
+
+        /// <summary>
+        /// Where to keep this machine's activation across restarts. Defaults to
+        /// a per-product file under the OS user-data directory (see
+        /// <see cref="StateStore.DefaultPath"/>).
+        /// </summary>
+        public string? StatePath { get; set; }
+
+        /// <summary>
+        /// Persist the machine binding (default <c>true</c>).
+        /// <para>
+        /// Turn it off only for a process that should not leave a licence on
+        /// disk — a test, or a short-lived worker. The cost is that every start
+        /// must activate again, which rotates the activation secret and is
+        /// refused while the tenant is suspended, so a long-lived desktop app
+        /// wants this on.
+        /// </para>
+        /// </summary>
+        public bool PersistState { get; set; } = true;
     }
 
     /// <summary>
@@ -87,6 +106,7 @@ namespace Talos.Sdk
         private string? _licenseKey;
         private string? _activationSecret;
         private string? _machineId;
+        private readonly StateStore? _store;
         private CancellationTokenSource? _renewCts;
         /// <summary>Bumped on release so an in-flight renewal cannot resurrect the seat.</summary>
         private volatile int _leaseGeneration;
@@ -110,7 +130,34 @@ namespace Talos.Sdk
             _ownsHttp = options.HttpClient == null;
             _fp = Fingerprint.Collect(options.ProductToken, options.ExtraFingerprintComponents);
             _fingerprint = _fp.Composite;
+
+            // Restore the machine binding in the constructor, so a client built
+            // at startup is already usable: ValidateAsync works with no
+            // ActivateAsync call and no prompt for the licence key.
+            _store = options.PersistState
+                ? new StateStore(
+                    options.StatePath ?? StateStore.DefaultPath(options.ProductToken),
+                    options.ProductToken,
+                    StateStore.KeyMaterial(_fp.Components))
+                : null;
+            StoredBinding? stored = _store?.Load();
+            if (stored != null)
+            {
+                _licenseKey = stored.LicenseKey;
+                _activationSecret = stored.ActivationSecret;
+                _machineId = stored.MachineId;
+            }
         }
+
+        /// <summary>
+        /// Whether this machine already holds an activation — restored from disk
+        /// on construction, so this is the startup question: prompt for a licence
+        /// key, or go straight to <see cref="ValidateAsync"/>?
+        /// </summary>
+        public bool IsActivated => _activationSecret != null && _licenseKey != null;
+
+        /// <summary>The server's id for this machine, once activated.</summary>
+        public string? MachineId => _machineId;
 
         private static byte[]? Decode32(string? b64, string name)
         {
@@ -133,6 +180,30 @@ namespace Talos.Sdk
             using var doc = await PostAsync("/v1/client/keyset", body, ct).ConfigureAwait(false);
             if (doc.RootElement.TryGetProperty("keyset", out var ks) && ks.ValueKind == JsonValueKind.String)
                 AdoptKeyset(ks.GetString());
+        }
+
+        /// <summary>
+        /// Make sure a verification key exists before a response has to be
+        /// verified.
+        /// <para>
+        /// A restored binding goes straight to Validate, skipping Activate —
+        /// which is the only place the keyset used to be adopted. An anchor-only
+        /// client (the recommended pinning, and the one that survives key
+        /// rotation) therefore had nothing to verify with on the app's
+        /// <i>second</i> launch, and every call failed with "keyset
+        /// unavailable". Only persistence made that reachable: before it,
+        /// Activate always ran first.
+        /// </para>
+        /// <para>
+        /// Fetching it lazily rather than storing it also keeps trust material
+        /// out of the state file: the keys are re-derived from the pinned anchor
+        /// once per process and never cached across one.
+        /// </para>
+        /// </summary>
+        private async Task EnsureKeysetAsync(CancellationToken ct)
+        {
+            if (_anchorKey == null || _keysetLicenseKeys.Count > 0) return;
+            await RefreshKeysetAsync(ct).ConfigureAwait(false);
         }
 
         private void AdoptKeyset(string? token)
@@ -178,9 +249,48 @@ namespace Talos.Sdk
         /// <summary>Whether a feature is enabled per the last verified state.</summary>
         public bool IsFeatureEnabled(string name) => Current?.IsFeatureEnabled(name) ?? false;
 
-        /// <summary>Activate a license on this machine.</summary>
+        /// <summary>
+        /// Ensure this machine is activated on <paramref name="licenseKey"/>, and
+        /// return the verified state. Safe to call on every start.
+        /// <para>
+        /// When a binding for the same key is already held, this
+        /// <b>re-validates</b> instead of re-activating. Same one round trip,
+        /// three different outcomes: the activation secret is not rotated (so a
+        /// second copy of the app on the same machine does not knock the first
+        /// one out), no seat accounting is touched, and — because activate is the
+        /// only client route refused for a suspended tenant — the developer's own
+        /// paying users keep working while their vendor's account is suspended,
+        /// which is what "graduated suspension" was supposed to mean.
+        /// </para>
+        /// <para>
+        /// It falls back to a real activation when the stored binding is no
+        /// longer usable: the seat was released from the portal, or the secret
+        /// was rotated elsewhere.
+        /// </para>
+        /// </summary>
         public async Task<LicenseState> ActivateAsync(string licenseKey, CancellationToken ct = default)
         {
+            if (IsActivated && _licenseKey == licenseKey)
+            {
+                try
+                {
+                    LicenseState state = await ValidateAsync(ct).ConfigureAwait(false);
+                    // `deactivated` means the developer released the seat; taking
+                    // it again is exactly what re-activating is for. Every other
+                    // verdict — including machine_revoked — is the server's
+                    // answer, and re-activating would only replace it with a less
+                    // specific error.
+                    if (state.Decision != "deactivated") return state;
+                }
+                catch (TalosApiException e) when (e.StatusCode == 401 || e.StatusCode == 404)
+                {
+                    // 401: the secret was rotated elsewhere. 404: the machine (or
+                    // licence) is gone. Anything else is a real failure and must
+                    // not be papered over by silently spending a seat.
+                }
+                ForgetBinding();
+            }
+
             string nonce = NewNonce();
             var body = new
             {
@@ -207,15 +317,33 @@ namespace Talos.Sdk
             _licenseKey = licenseKey;
             _activationSecret = root.GetProperty("activation_secret").GetString();
             _machineId = root.GetProperty("machine_id").GetString();
+            _store?.Save(new StoredBinding
+            {
+                LicenseKey = licenseKey,
+                ActivationSecret = _activationSecret ?? "",
+                MachineId = _machineId ?? "",
+                Fingerprint = _fingerprint,
+            });
 
             Current = StateFromClaims(claims, "valid");
             return Current;
+        }
+
+        /// <summary>Drop the machine binding, in memory and on disk.</summary>
+        private void ForgetBinding()
+        {
+            _licenseKey = null;
+            _activationSecret = null;
+            _machineId = null;
+            Current = null;
+            _store?.Clear();
         }
 
         /// <summary>Re-validate the license (machine-bound, no seat consumed).</summary>
         public async Task<LicenseState> ValidateAsync(CancellationToken ct = default)
         {
             RequireActivated();
+            await EnsureKeysetAsync(ct).ConfigureAwait(false);
             string nonce = NewNonce();
             var body = new
             {
@@ -246,6 +374,7 @@ namespace Talos.Sdk
         public async Task<LicenseState> HeartbeatAsync(CancellationToken ct = default)
         {
             RequireActivated();
+            await EnsureKeysetAsync(ct).ConfigureAwait(false);
             string nonce = NewNonce();
             var body = new
             {
@@ -287,9 +416,7 @@ namespace Talos.Sdk
                 activation_secret = _activationSecret,
             };
             using var _ = await PostAsync("/v1/client/deactivate", body, ct).ConfigureAwait(false);
-            Current = null;
-            _activationSecret = null;
-            _machineId = null;
+            ForgetBinding();
         }
 
         /// <summary>
@@ -303,6 +430,7 @@ namespace Talos.Sdk
             AcquireLeaseOptions? opts = null, CancellationToken ct = default)
         {
             RequireActivated();
+            await EnsureKeysetAsync(ct).ConfigureAwait(false);
             opts ??= new AcquireLeaseOptions();
             string instanceId = opts.InstanceId ?? _instanceId;
             // Snapshot the generation: if ReleaseLeaseAsync runs while this request
@@ -478,6 +606,7 @@ namespace Talos.Sdk
             CheckForUpdateOptions? opts = null, CancellationToken ct = default)
         {
             RequireActivated();
+            await EnsureKeysetAsync(ct).ConfigureAwait(false);
             opts ??= new CheckForUpdateOptions();
             var body = new
             {

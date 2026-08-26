@@ -5,6 +5,7 @@ import { type KeyObject } from "node:crypto";
 
 import { TalosApiError, TalosError, TalosSignatureError } from "./errors.js";
 import { collectFingerprint, type FingerprintData } from "./fingerprint.js";
+import { StateStore, defaultStatePath, stateKeyMaterial } from "./state.js";
 import {
   b64urlEncode,
   publicKeyFromBase64,
@@ -61,6 +62,21 @@ export interface TalosOptions {
    * `docs/FINGERPRINT.md` for the recognised ids and their weights.
    */
   fingerprintComponents?: Record<string, string>;
+  /**
+   * Where to keep this machine's activation across restarts. Defaults to a
+   * per-product file under the OS user-data directory (see
+   * {@link defaultStatePath}).
+   */
+  statePath?: string;
+  /**
+   * Persist the machine binding (default `true`).
+   *
+   * Turn it off only for a process that should not leave a licence on disk — a
+   * test, or a short-lived worker. The cost is that every start must
+   * `activate` again, which rotates the activation secret and is refused while
+   * the tenant is suspended, so a long-lived desktop app wants this on.
+   */
+  persistState?: boolean;
 }
 
 /** One downloadable artifact of an available update (from a verified manifest). */
@@ -170,6 +186,8 @@ export class TalosClient {
 
   private licenseKey: string | null = null;
   private activationSecret: string | null = null;
+  private machineId: string | null = null;
+  private readonly store: StateStore | null;
   private lease: Lease | null = null;
   private renewTimer: ReturnType<typeof setTimeout> | null = null;
   /** Bumped on release so an in-flight renewal cannot resurrect the seat. */
@@ -197,6 +215,38 @@ export class TalosClient {
     this.fingerprint = this.fp.composite;
     this.doFetch = options.fetch ?? (globalThis.fetch as unknown as FetchLike);
     if (!this.doFetch) throw new TalosError("no fetch available (need Node 18+ or options.fetch)");
+
+    // Restore the machine binding synchronously, so a client constructed at
+    // startup is already usable: `validate()` works with no `activate()` call
+    // and no user prompt for the licence key.
+    this.store =
+      options.persistState === false
+        ? null
+        : new StateStore(
+            options.statePath ?? defaultStatePath(options.productToken),
+            options.productToken,
+            stateKeyMaterial(this.fp),
+          );
+    const stored = this.store?.load();
+    if (stored) {
+      this.licenseKey = stored.licenseKey;
+      this.activationSecret = stored.activationSecret;
+      this.machineId = stored.machineId;
+    }
+  }
+
+  /**
+   * Whether this machine already holds an activation — restored from disk on
+   * construction, so this is the startup question: prompt for a licence key, or
+   * go straight to {@link validate}?
+   */
+  get isActivated(): boolean {
+    return this.activationSecret !== null && this.licenseKey !== null;
+  }
+
+  /** The server's id for this machine, once activated. */
+  get currentMachineId(): string | null {
+    return this.machineId;
   }
 
   isFeatureEnabled(name: string): boolean {
@@ -215,6 +265,25 @@ export class TalosClient {
       product_token: this.options.productToken,
     });
     this.adoptKeyset(body["keyset"]);
+  }
+
+  /**
+   * Make sure a verification key exists before a response has to be verified.
+   *
+   * A restored binding goes straight to `validate`, skipping `activate` — which
+   * is the only place the keyset used to be adopted. An anchor-only client (the
+   * recommended pinning, and the one that survives key rotation) therefore had
+   * nothing to verify with on the app's *second* launch, and every call failed
+   * with "keyset unavailable". Only persistence made that reachable: before it,
+   * `activate` always ran first.
+   *
+   * Fetching it lazily rather than storing it also keeps trust material out of
+   * the state file: the keys are re-derived from the pinned anchor once per
+   * process and never cached across one.
+   */
+  private async ensureKeyset(): Promise<void> {
+    if (!this.anchorKey || this.keysetLicenseKeys.length > 0) return;
+    await this.refreshKeyset();
   }
 
   /** Verify a keyset token against the anchor and adopt its keys. */
@@ -248,7 +317,42 @@ export class TalosClient {
     throw new TalosSignatureError("no release verification key (keyset unavailable)");
   }
 
+  /**
+   * Ensure this machine is activated on `licenseKey`, and return the verified
+   * state. Safe to call on every start.
+   *
+   * When a binding for the same key is already held, this **re-validates**
+   * instead of re-activating. Same one round trip, three different outcomes:
+   * the activation secret is not rotated (so a second copy of the app on the
+   * same machine does not knock the first one out), no seat accounting is
+   * touched, and — because `activate` is the only client route refused for a
+   * suspended tenant — the developer's own paying users keep working while
+   * their vendor's account is suspended, which is what "graduated suspension"
+   * was supposed to mean.
+   *
+   * It falls back to a real activation when the stored binding is no longer
+   * usable: the seat was released from the portal, or the secret was rotated
+   * elsewhere.
+   */
   async activate(licenseKey: string): Promise<LicenseState> {
+    if (this.isActivated && this.licenseKey === licenseKey) {
+      try {
+        const state = await this.validate();
+        // `deactivated` means the developer released the seat; taking it again
+        // is exactly what re-activating is for. Every other verdict —
+        // including `machine_revoked` — is the server's answer, and re-
+        // activating would only replace it with a less specific error.
+        if (state.decision !== "deactivated") return state;
+      } catch (e) {
+        // 401: the secret was rotated elsewhere. 404: the machine (or licence)
+        // is gone. Anything else is a real failure and must not be papered
+        // over by silently spending a seat.
+        const stale =
+          e instanceof TalosApiError && (e.statusCode === 401 || e.statusCode === 404);
+        if (!stale) throw e;
+      }
+      this.forgetBinding();
+    }
     const nonce = newNonce();
     const body = await this.post("/v1/client/activate", {
       product_token: this.options.productToken,
@@ -273,12 +377,29 @@ export class TalosClient {
     );
     this.licenseKey = licenseKey;
     this.activationSecret = body["activation_secret"] as string;
+    this.machineId = (body["machine_id"] as string) ?? null;
+    this.store?.save({
+      licenseKey,
+      activationSecret: this.activationSecret,
+      machineId: this.machineId ?? "",
+      fingerprint: this.fingerprint,
+    });
     this.current = stateFromClaims(claims, "valid");
     return this.current;
   }
 
+  /** Drop the machine binding, in memory and on disk. */
+  private forgetBinding(): void {
+    this.licenseKey = null;
+    this.activationSecret = null;
+    this.machineId = null;
+    this.current = null;
+    this.store?.clear();
+  }
+
   async validate(): Promise<LicenseState> {
     this.requireActivated();
+    await this.ensureKeyset();
     const nonce = newNonce();
     const body = await this.post("/v1/client/validate", {
       product_token: this.options.productToken,
@@ -307,8 +428,7 @@ export class TalosClient {
       fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
     });
-    this.current = null;
-    this.activationSecret = null;
+    this.forgetBinding();
   }
 
   /**
@@ -322,6 +442,7 @@ export class TalosClient {
    */
   async heartbeat(): Promise<LicenseState> {
     this.requireActivated();
+    await this.ensureKeyset();
     const nonce = newNonce();
     const body = await this.post("/v1/client/heartbeat", {
       product_token: this.options.productToken,
@@ -363,6 +484,7 @@ export class TalosClient {
    */
   async acquireLease(opts: AcquireLeaseOptions = {}): Promise<Lease> {
     this.requireActivated();
+    await this.ensureKeyset();
     const instanceId = opts.instanceId ?? this.instanceId;
     // Snapshot the generation: if releaseLease() runs while this request is in
     // flight, we must not adopt the seat we just took (and should hand it back).
@@ -494,6 +616,7 @@ export class TalosClient {
    */
   async checkForUpdate(opts: CheckForUpdateOptions = {}): Promise<UpdateInfo | null> {
     this.requireActivated();
+    await this.ensureKeyset();
     const body = await this.post("/v1/client/updates/check", {
       product_token: this.options.productToken,
       license_key: this.licenseKey,
