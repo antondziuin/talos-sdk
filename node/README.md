@@ -40,6 +40,18 @@ pins, but they break on the first rotation — prefer the anchor.)
 Anti-tamper honesty: JS is patchable — gate premium value on server-returned
 *data* (entitlements/config), not client booleans.
 
+## Heartbeats & monitoring
+
+```ts
+// Periodically while the app runs (default cadence is policy-driven, ~10 min):
+setInterval(() => void talos.heartbeat().catch(() => {}), 10 * 60_000);
+```
+
+A heartbeat refreshes this machine's last-seen state, returns the current
+**signed** decision (so a revocation reaches the app within one interval), and
+feeds the developer portal's monitoring — active installs and version adoption.
+It reports only the app version and OS/arch; no IP address is stored.
+
 ## Floating (concurrent) licenses
 
 ```ts

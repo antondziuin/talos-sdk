@@ -297,6 +297,47 @@ export class TalosClient {
   }
 
   /**
+   * Send a heartbeat: refreshes this machine's last-seen state, feeds the
+   * developer's monitoring (version adoption / active installs), and returns the
+   * current signed decision — so a revocation reaches the app within one
+   * heartbeat interval. Call it periodically while the app runs.
+   *
+   * The response is a signed `typ=heartbeat` token, so a MITM cannot forge the
+   * status or lengthen the interval.
+   */
+  async heartbeat(): Promise<LicenseState> {
+    this.requireActivated();
+    const nonce = newNonce();
+    const body = await this.post("/v1/client/heartbeat", {
+      product_token: this.options.productToken,
+      license_key: this.licenseKey,
+      fingerprint: { composite: this.fingerprint, components: {} },
+      activation_secret: this.activationSecret,
+      nonce,
+      app_version: this.options.appVersion,
+      os: `${os.type()} ${os.release()}`,
+      arch: os.arch(),
+    });
+    const claims = verifyToken(
+      this.licenseVerifyKeys(),
+      "heartbeat",
+      this.options.productToken,
+      nonce,
+      body["heartbeat_token"] as string,
+    );
+    const decision =
+      typeof claims["decision"] === "string" ? (claims["decision"] as string) : "invalid";
+    // A heartbeat carries the decision but not the entitlement bag; keep the
+    // features from the last activate/validate.
+    this.current = new LicenseState(
+      decision,
+      this.current?.features ?? {},
+      this.current?.licenseExpiresAt ?? null,
+    );
+    return this.current;
+  }
+
+  /**
    * Acquire a floating seat (concurrent-use license). The server arbitrates the
    * cap atomically, so this either returns a seat or throws
    * {@link TalosApiError} with `seat_limit_reached` (HTTP 409).

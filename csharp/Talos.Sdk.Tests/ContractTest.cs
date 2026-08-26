@@ -67,6 +67,10 @@ namespace Talos.Sdk.Tests
                 new CheckForUpdateOptions { CurrentReleaseSeq = upd.ReleaseSeq });
             Assert.Null(none);
 
+            // Heartbeat: signed decision + the telemetry source for monitoring.
+            LicenseState beat = await client.HeartbeatAsync();
+            Assert.Equal("valid", beat.Decision);
+
             // Floating seats (the demo policy has max_concurrent_seats = 1).
             Lease lease = await client.AcquireLeaseAsync(
                 new AcquireLeaseOptions { InstanceId = "inst-1", AutoRenew = false });

@@ -56,6 +56,10 @@ describe("contract", () => {
     const none = await client.checkForUpdate({ currentReleaseSeq: upd!.releaseSeq });
     expect(none).toBeNull();
 
+    // Heartbeat: signed decision + the telemetry source for monitoring.
+    const beat = await client.heartbeat();
+    expect(beat.decision).toBe("valid");
+
     // Floating seats (the demo policy has max_concurrent_seats = 1).
     const lease = await client.acquireLease({ instanceId: "inst-1", autoRenew: false });
     expect(lease.maxSeats).toBe(1);

@@ -221,6 +221,46 @@ namespace Talos.Sdk
             return Current;
         }
 
+        /// <summary>
+        /// Send a heartbeat: refreshes this machine's last-seen state, feeds the
+        /// developer's monitoring (version adoption / active installs), and
+        /// returns the current signed decision — so a revocation reaches the app
+        /// within one heartbeat interval. Call periodically while the app runs.
+        /// The response is a signed <c>typ=heartbeat</c> token, so a MITM cannot
+        /// forge the status or lengthen the interval.
+        /// </summary>
+        public async Task<LicenseState> HeartbeatAsync(CancellationToken ct = default)
+        {
+            RequireActivated();
+            string nonce = NewNonce();
+            var body = new
+            {
+                product_token = _options.ProductToken,
+                license_key = _licenseKey,
+                fingerprint = new { composite = _fingerprint, components = new { } },
+                activation_secret = _activationSecret,
+                nonce,
+                app_version = _options.AppVersion,
+                os = RuntimeInformation.OSDescription,
+                arch = RuntimeInformation.OSArchitecture.ToString(),
+            };
+            using var doc = await PostAsync("/v1/client/heartbeat", body, ct).ConfigureAwait(false);
+            JsonElement claims = TalosCompact.Verify(
+                LicenseVerifyKeys(), "heartbeat", _options.ProductToken, nonce,
+                doc.RootElement.GetProperty("heartbeat_token").GetString()!);
+
+            string decision = GetStr(claims, "decision") ?? "invalid";
+            // A heartbeat carries the decision but not the entitlement bag; keep
+            // the features from the last activate/validate.
+            Current = new LicenseState
+            {
+                Decision = decision,
+                Features = Current?.Features ?? default,
+                LicenseExpiresAt = Current?.LicenseExpiresAt,
+            };
+            return Current;
+        }
+
         /// <summary>Release this machine's seat.</summary>
         public async Task DeactivateAsync(CancellationToken ct = default)
         {
