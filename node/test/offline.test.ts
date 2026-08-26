@@ -200,6 +200,44 @@ describe("offline grace", () => {
     expect(offline.isOffline).toBe(true);
   });
 
+  it("takes the check-in cadence from the signed claims, not the envelope", async () => {
+    // The interval decides telemetry volume and how long a revocation takes to
+    // reach an install. Reading it from the unsigned envelope would let anyone
+    // in the middle tell a fleet to check in less often.
+    const { pubB64, privateKey } = keypair();
+    const file = seed(privateKey, validationClaims());
+    const live: FetchLike = (_url, init) => {
+      const sent = JSON.parse(init.body) as { nonce: string };
+      const now = NOW();
+      const token = mint(privateKey, "heartbeat", {
+        aud: PRODUCT,
+        typ: "heartbeat",
+        iat: now,
+        nbf: now - 5,
+        exp: now + 600,
+        non: sent.nonce,
+        decision: "valid",
+        server_time: now,
+        heartbeat_interval_s: 42,
+      });
+      return Promise.resolve({
+        status: 200,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              heartbeat_token: token,
+              heartbeat_interval_s: 999, // the envelope lies
+              license_status: "valid",
+            }),
+          ),
+      });
+    };
+    const c = client(pubB64, file, live);
+    expect(c.heartbeatIntervalSeconds).toBeNull();
+    await c.heartbeat();
+    expect(c.heartbeatIntervalSeconds).toBe(42);
+  });
+
   it("has nothing to fall back on before the first validation", async () => {
     const { pubB64, privateKey } = keypair();
     const file = seed(privateKey, validationClaims(), { validation: undefined });

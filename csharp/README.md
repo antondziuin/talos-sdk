@@ -115,6 +115,34 @@ acceptable answer. The SDK ignores any `kid` in the token and enforces
 gate premium value on server-returned *data* (entitlements/config), not client
 booleans, and ship an obfuscator / NativeAOT for release builds.
 
+## Heartbeats, monitoring, and cadence
+
+```csharp
+talos.StartCheckIns(
+    onState: s => UpdateUi(s),
+    onError: e => Log.Warn(e, "check-in failed"));
+// On shutdown:
+talos.StopCheckIns();
+```
+
+One background loop, driven by the **policy** rather than by a number you pick:
+each tick re-validates once the signed `reval_after` has passed, and otherwise
+sends a heartbeat at the signed `heartbeat_interval_s`. Change the policy in the
+portal and deployed apps follow — which is the point, because that interval is
+both the telemetry rate and the upper bound on how long a revocation takes to
+reach an install. Both values come from the signed claims, never the response
+envelope, so nobody in the middle can tell a fleet to check in less often.
+
+Running the loop is also what keeps the offline cache fresh, so an app that
+starts it stays inside its grace window without scheduling anything itself.
+
+A heartbeat refreshes this machine's last-seen state, returns the current
+**signed** decision, and feeds the developer portal's monitoring — active
+installs and version adoption. It reports only the app version and OS/arch; no
+IP address is stored. Call `HeartbeatAsync()` directly if you would rather own
+the schedule; `HeartbeatIntervalSeconds` is the policy's answer once the first
+one has been sent.
+
 ## Hardware changes
 
 The SDK identifies the machine by a set of component hashes (never the raw

@@ -27,6 +27,12 @@ import {
  */
 const CLOCK_SKEW_SECONDS = 60;
 
+/**
+ * Fallback check-in cadence, used only until the first heartbeat reports the
+ * policy's own. Matches the server's `policies.heartbeat_interval_s` default.
+ */
+const DEFAULT_HEARTBEAT_SECONDS = 600;
+
 /** Minimal fetch signature (Node 18+ global fetch, or an injected one). */
 export type FetchLike = (
   url: string,
@@ -141,6 +147,16 @@ export interface AcquireLeaseOptions {
   onLeaseLost?: (reason: string) => void;
 }
 
+export interface CheckInOptions {
+  /** Called after every successful check-in, with the fresh verdict. */
+  onState?: (state: LicenseState) => void;
+  /**
+   * Called when a check-in fails outright — the server answered with an error,
+   * or the network is down *and* there is nothing left to fall back on.
+   */
+  onError?: (error: unknown) => void;
+}
+
 export interface CheckForUpdateOptions {
   /** Currently installed version (informational). */
   currentVersion?: string;
@@ -229,6 +245,11 @@ export class TalosClient {
    * server keeps verifying with what it already trusts.
    */
   private keysetFromCache = false;
+  /** The policy's heartbeat cadence, from the last heartbeat's signed claims. */
+  private heartbeatInterval: number | null = null;
+  private checkInTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Bumped on stop so an in-flight tick cannot re-arm a cancelled loop. */
+  private checkInGeneration = 0;
   private lease: Lease | null = null;
   private renewTimer: ReturnType<typeof setTimeout> | null = null;
   /** Bumped on release so an in-flight renewal cannot resurrect the seat. */
@@ -453,6 +474,72 @@ export class TalosClient {
     return this.current;
   }
 
+  /**
+   * The heartbeat cadence the server's policy asks for, in seconds, taken from
+   * the last heartbeat's **signed** claims — so it cannot be lengthened in
+   * transit by anyone wanting a fleet to check in less often.
+   *
+   * `null` until the first heartbeat of this process.
+   */
+  get heartbeatIntervalSeconds(): number | null {
+    return this.heartbeatInterval;
+  }
+
+  /**
+   * Run the check-ins the server's policy asks for, in the background.
+   *
+   * Two knobs have existed on the wire since Phase 1 and reached no client:
+   * `heartbeat_interval_s` (how often an install reports in — the telemetry
+   * rate, and the upper bound on how long a revocation takes to arrive) and
+   * `reval_after` (when the entitlement bag and the offline cache should be
+   * refreshed). Both are signed. This loop is what makes them a lever the
+   * developer can actually pull: change the policy, and deployed apps follow.
+   *
+   * One timer serves both. Each tick re-validates if the signed `reval_after`
+   * has passed, and otherwise sends a heartbeat — which is also what renews the
+   * cached verdict that {@link validate} falls back on, so an app that runs
+   * this stays inside its grace window without the host writing any scheduling
+   * of its own.
+   *
+   * Opt-in, and idempotent: calling it again replaces the running loop.
+   */
+  startCheckIns(opts: CheckInOptions = {}): void {
+    this.stopCheckIns();
+    const generation = ++this.checkInGeneration;
+    const tick = async (): Promise<void> => {
+      try {
+        const due = this.current?.revalidateAfter;
+        const state =
+          due === null || due === undefined || nowSeconds() >= due
+            ? await this.validate()
+            : await this.heartbeat();
+        if (generation !== this.checkInGeneration) return;
+        opts.onState?.(state);
+      } catch (e) {
+        if (generation !== this.checkInGeneration) return;
+        opts.onError?.(e);
+      }
+      // Re-arm even after a failure: a network outage must not silently end
+      // the loop, or the app would never notice the connection coming back.
+      if (generation === this.checkInGeneration) schedule();
+    };
+    const schedule = (): void => {
+      const secs = Math.max(60, this.heartbeatInterval ?? DEFAULT_HEARTBEAT_SECONDS);
+      this.checkInTimer = setTimeout(() => void tick(), secs * 1000);
+      this.checkInTimer.unref?.();
+    };
+    schedule();
+  }
+
+  /** Stop the background check-ins started by {@link startCheckIns}. */
+  stopCheckIns(): void {
+    this.checkInGeneration += 1;
+    if (this.checkInTimer) {
+      clearTimeout(this.checkInTimer);
+      this.checkInTimer = null;
+    }
+  }
+
   /** Drop the machine binding, in memory and on disk. */
   private forgetBinding(): void {
     this.licenseKey = null;
@@ -642,6 +729,11 @@ export class TalosClient {
     );
     const decision =
       typeof claims["decision"] === "string" ? (claims["decision"] as string) : "invalid";
+    // The cadence comes from the SIGNED claims, never the response envelope:
+    // the whole point of signing it is that nobody in the middle can tell a
+    // fleet to check in less often.
+    const interval = num(claims["heartbeat_interval_s"]);
+    if (interval !== null && interval > 0) this.heartbeatInterval = interval;
     // Every signed server clock we see pushes the high-water mark forward, not
     // just validation's — a heartbeat is the most frequent call there is.
     this.advanceClock(claims);

@@ -97,6 +97,13 @@ namespace Talos.Sdk
         /// </summary>
         private const long ClockSkewSeconds = 60;
 
+        /// <summary>
+        /// Fallback check-in cadence, used only until the first heartbeat
+        /// reports the policy's own. Matches the server's
+        /// <c>policies.heartbeat_interval_s</c> default.
+        /// </summary>
+        private const int DefaultHeartbeatSeconds = 600;
+
         private readonly TalosOptions _options;
         private readonly HttpClient _http;
         private readonly byte[]? _anchorKey;
@@ -123,6 +130,7 @@ namespace Talos.Sdk
         /// </summary>
         private bool _keysetFromCache;
         private CancellationTokenSource? _renewCts;
+        private CancellationTokenSource? _checkInCts;
         /// <summary>Bumped on release so an in-flight renewal cannot resurrect the seat.</summary>
         private volatile int _leaseGeneration;
         /// <summary>Default instance id for floating leases: one per client object.</summary>
@@ -374,6 +382,92 @@ namespace Talos.Sdk
             return Current;
         }
 
+        /// <summary>
+        /// The heartbeat cadence the server's policy asks for, in seconds, taken
+        /// from the last heartbeat's <b>signed</b> claims — so it cannot be
+        /// lengthened in transit by anyone wanting a fleet to check in less
+        /// often. Null until the first heartbeat of this process.
+        /// </summary>
+        public int? HeartbeatIntervalSeconds { get; private set; }
+
+        /// <summary>
+        /// Run the check-ins the server's policy asks for, in the background.
+        /// <para>
+        /// Two knobs have existed on the wire since Phase 1 and reached no
+        /// client: <c>heartbeat_interval_s</c> (how often an install reports in
+        /// — the telemetry rate, and the upper bound on how long a revocation
+        /// takes to arrive) and <c>reval_after</c> (when the entitlement bag and
+        /// the offline cache should be refreshed). Both are signed. This loop is
+        /// what makes them a lever the developer can actually pull: change the
+        /// policy, and deployed apps follow.
+        /// </para>
+        /// <para>
+        /// One loop serves both. Each tick re-validates if the signed
+        /// <c>reval_after</c> has passed, and otherwise sends a heartbeat —
+        /// which is also what renews the cached verdict that
+        /// <see cref="ValidateAsync"/> falls back on, so an app that runs this
+        /// stays inside its grace window with no scheduling of its own.
+        /// </para>
+        /// <para>Opt-in, and idempotent: calling it again replaces the loop.</para>
+        /// </summary>
+        public void StartCheckIns(
+            Action<LicenseState>? onState = null, Action<Exception>? onError = null)
+        {
+            StopCheckIns();
+            var cts = new CancellationTokenSource();
+            _checkInCts = cts;
+            CancellationToken token = cts.Token;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        int secs = Math.Max(60, HeartbeatIntervalSeconds ?? DefaultHeartbeatSeconds);
+                        await Task.Delay(TimeSpan.FromSeconds(secs), token).ConfigureAwait(false);
+                        if (token.IsCancellationRequested) return;
+                        try
+                        {
+                            long? due = Current?.RevalidateAfter;
+                            LicenseState state =
+                                due == null || DateTimeOffset.UtcNow.ToUnixTimeSeconds() >= due.Value
+                                    ? await ValidateAsync(token).ConfigureAwait(false)
+                                    : await HeartbeatAsync(token).ConfigureAwait(false);
+                            onState?.Invoke(state);
+                        }
+                        catch (OperationCanceledException) when (token.IsCancellationRequested)
+                        {
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            // Report and keep going: a network outage must not
+                            // silently end the loop, or the app would never
+                            // notice the connection coming back.
+                            onError?.Invoke(ex);
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    // Stopped — nothing to report.
+                }
+                finally
+                {
+                    if (ReferenceEquals(_checkInCts, cts)) _checkInCts = null;
+                    cts.Dispose();
+                }
+            });
+        }
+
+        /// <summary>Stop the background check-ins started by <see cref="StartCheckIns"/>.</summary>
+        public void StopCheckIns()
+        {
+            // Cancel but do NOT dispose here — the loop disposes its own CTS.
+            _checkInCts?.Cancel();
+            _checkInCts = null;
+        }
+
         /// <summary>Drop the machine binding, in memory and on disk.</summary>
         private void ForgetBinding()
         {
@@ -561,6 +655,12 @@ namespace Talos.Sdk
                 doc.RootElement.GetProperty("heartbeat_token").GetString()!);
 
             string decision = GetStr(claims, "decision") ?? "invalid";
+            // The cadence comes from the SIGNED claims, never the response
+            // envelope: the whole point of signing it is that nobody in the
+            // middle can tell a fleet to check in less often.
+            long? interval = Num(claims, "heartbeat_interval_s");
+            if (interval != null && interval.Value > 0)
+                HeartbeatIntervalSeconds = (int)interval.Value;
             // Every signed server clock we see pushes the high-water mark
             // forward, not just validation's — a heartbeat is the most frequent
             // call there is.

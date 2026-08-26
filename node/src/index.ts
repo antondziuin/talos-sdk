@@ -8,6 +8,7 @@ export {
   type CheckForUpdateOptions,
   type Lease,
   type AcquireLeaseOptions,
+  type CheckInOptions,
 } from "./client.js";
 export { TalosError, TalosSignatureError, TalosApiError } from "./errors.js";
 export { collectFingerprint, type FingerprintData } from "./fingerprint.js";

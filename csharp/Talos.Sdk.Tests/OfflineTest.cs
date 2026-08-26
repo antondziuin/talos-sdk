@@ -274,6 +274,52 @@ namespace Talos.Sdk.Tests
         }
 
         [Fact]
+        public async Task TakesTheCheckInCadenceFromTheSignedClaimsNotTheEnvelope()
+        {
+            // The interval decides telemetry volume and how long a revocation
+            // takes to reach an install. Reading it from the unsigned envelope
+            // would let anyone in the middle tell a fleet to check in less often.
+            var (pub, sk) = Keypair();
+            string file = Seed(sk, ValidationJson());
+            var live = new HttpClient(new Stub(body =>
+            {
+                using var doc = JsonDocument.Parse(body);
+                string nonce = doc.RootElement.GetProperty("nonce").GetString()!;
+                long now = Now();
+                string token = Mint(sk, "heartbeat", JsonSerializer.Serialize(
+                    new Dictionary<string, object?>
+                    {
+                        ["aud"] = Product,
+                        ["typ"] = "heartbeat",
+                        ["iat"] = now,
+                        ["nbf"] = now - 5,
+                        ["exp"] = now + 600,
+                        ["non"] = nonce,
+                        ["decision"] = "valid",
+                        ["server_time"] = now,
+                        ["heartbeat_interval_s"] = 42,
+                    }));
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        JsonSerializer.Serialize(new
+                        {
+                            heartbeat_token = token,
+                            heartbeat_interval_s = 999, // the envelope lies
+                            license_status = "valid",
+                        }),
+                        Encoding.UTF8,
+                        "application/json"),
+                };
+            }));
+
+            TalosClient c = Client(pub, file, live);
+            Assert.Null(c.HeartbeatIntervalSeconds);
+            await c.HeartbeatAsync();
+            Assert.Equal(42, c.HeartbeatIntervalSeconds);
+        }
+
+        [Fact]
         public async Task HasNothingToFallBackOnBeforeTheFirstValidation()
         {
             var (pub, sk) = Keypair();
