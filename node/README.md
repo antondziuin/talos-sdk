@@ -40,6 +40,28 @@ pins, but they break on the first rotation — prefer the anchor.)
 Anti-tamper honesty: JS is patchable — gate premium value on server-returned
 *data* (entitlements/config), not client booleans.
 
+## Floating (concurrent) licenses
+
+```ts
+// Policy kind "floating" with max_concurrent_seats = N.
+try {
+  const lease = await talos.acquireLease({
+    onLeaseLost: (why) => showBanner(`Seat lost: ${why}`),
+  });
+  console.log(`seat ${lease.seatsInUse}/${lease.maxSeats}`);
+} catch (e) {
+  if (e instanceof TalosApiError && e.statusCode === 409) showBusyDialog();
+}
+
+// On clean exit:
+await talos.releaseLease();
+```
+
+The server arbitrates seats atomically, so two instances can never both take the
+last one. The seat auto-renews in the background; a crash needs no cleanup —
+the lease simply expires and the seat returns to the pool. Re-acquiring with the
+same `instanceId` renews rather than consuming a second seat.
+
 ## Updates
 
 ```ts

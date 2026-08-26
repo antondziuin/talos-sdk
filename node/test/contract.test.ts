@@ -56,6 +56,26 @@ describe("contract", () => {
     const none = await client.checkForUpdate({ currentReleaseSeq: upd!.releaseSeq });
     expect(none).toBeNull();
 
+    // Floating seats (the demo policy has max_concurrent_seats = 1).
+    const lease = await client.acquireLease({ instanceId: "inst-1", autoRenew: false });
+    expect(lease.maxSeats).toBe(1);
+    expect(lease.seatsInUse).toBe(1);
+
+    // Re-acquiring the SAME instance renews rather than taking a second seat.
+    const renewed = await client.acquireLease({ instanceId: "inst-1", autoRenew: false });
+    expect(renewed.seatsInUse).toBe(1);
+
+    // A DIFFERENT instance is refused while the only seat is held.
+    await expect(
+      client.acquireLease({ instanceId: "inst-2", autoRenew: false }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    // Releasing frees the seat for the waiting instance.
+    await client.releaseLease();
+    const second = await client.acquireLease({ instanceId: "inst-2", autoRenew: false });
+    expect(second.seatsInUse).toBe(1);
+    await client.releaseLease();
+
     await client.deactivate();
     await expect(client.validate()).rejects.toBeInstanceOf(TalosError);
   });

@@ -73,6 +73,32 @@ export interface UpdateInfo {
   artifacts: UpdateArtifact[];
 }
 
+/** A held floating seat. Renew before {@link expiresAt} or it is reclaimed. */
+export interface Lease {
+  /** Server-side lease id (from the signed token). */
+  id: string;
+  /** This process's instance id. */
+  instanceId: string;
+  /** Unix seconds when the seat is reclaimed unless renewed. */
+  expiresAt: number;
+  /** Renew after this many seconds (server-chosen, ttl/3). */
+  renewAfterSeconds: number;
+  seatsInUse: number;
+  maxSeats: number;
+}
+
+export interface AcquireLeaseOptions {
+  /**
+   * Identifies this running process. Re-acquiring with the same value renews
+   * instead of taking a second seat. Defaults to a random per-client id.
+   */
+  instanceId?: string;
+  /** Auto-renew in the background (default true). Call {@link TalosClient.releaseLease} to stop. */
+  autoRenew?: boolean;
+  /** Called if a renewal fails and the seat is lost (e.g. revoked, server down). */
+  onLeaseLost?: (reason: string) => void;
+}
+
 export interface CheckForUpdateOptions {
   /** Currently installed version (informational). */
   currentVersion?: string;
@@ -130,6 +156,12 @@ export class TalosClient {
 
   private licenseKey: string | null = null;
   private activationSecret: string | null = null;
+  private lease: Lease | null = null;
+  private renewTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Bumped on release so an in-flight renewal cannot resurrect the seat. */
+  private leaseGeneration = 0;
+  /** Default instance id for floating leases: one per client object. */
+  private readonly instanceId: string = b64urlEncode(randomBytes(9));
   current: LicenseState | null = null;
 
   constructor(options: TalosOptions) {
@@ -265,6 +297,140 @@ export class TalosClient {
   }
 
   /**
+   * Acquire a floating seat (concurrent-use license). The server arbitrates the
+   * cap atomically, so this either returns a seat or throws
+   * {@link TalosApiError} with `seat_limit_reached` (HTTP 409).
+   *
+   * By default the seat is auto-renewed in the background at the server-chosen
+   * interval; a lost renewal invokes `onLeaseLost`. Always
+   * {@link releaseLease} on clean exit — a crash simply lets the seat expire.
+   */
+  async acquireLease(opts: AcquireLeaseOptions = {}): Promise<Lease> {
+    this.requireActivated();
+    const instanceId = opts.instanceId ?? this.instanceId;
+    // Snapshot the generation: if releaseLease() runs while this request is in
+    // flight, we must not adopt the seat we just took (and should hand it back).
+    const generation = this.leaseGeneration;
+    const nonce = newNonce();
+    const body = await this.post("/v1/client/leases", {
+      product_token: this.options.productToken,
+      license_key: this.licenseKey,
+      fingerprint: { composite: this.fingerprint, components: {} },
+      activation_secret: this.activationSecret,
+      instance_id: instanceId,
+      nonce,
+    });
+
+    // The lease token is signed: a MITM cannot fabricate a seat.
+    const claims = verifyToken(
+      this.licenseVerifyKeys(),
+      "lease",
+      this.options.productToken,
+      nonce,
+      body["lease_token"] as string,
+    );
+
+    // The signed grant must be for the instance and machine we asked about —
+    // otherwise a server could hand every process one shared seat's token.
+    if (claims["inst"] !== instanceId || claims["fph"] !== this.fingerprint) {
+      throw new TalosSignatureError("lease token does not match this instance");
+    }
+
+    // Seat facts come from the SIGNED claims, never the unsigned envelope, so a
+    // MITM cannot misreport occupancy. `renew_after_s` is only a scheduling
+    // hint; the budget is derived from the token's own clock (`exp` vs
+    // `server_time`) so a wrong local clock cannot collapse the renew loop.
+    const expiresAt = typeof claims["exp"] === "number" ? (claims["exp"] as number) : 0;
+    const serverNow =
+      typeof claims["server_time"] === "number"
+        ? (claims["server_time"] as number)
+        : Math.floor(Date.now() / 1000);
+    const budget = Math.max(1, expiresAt - serverNow);
+    const hinted = Number(body["renew_after_s"] ?? 0);
+    const lease: Lease = {
+      id: String(claims["lease"] ?? ""),
+      instanceId,
+      expiresAt,
+      renewAfterSeconds:
+        hinted > 0 && hinted <= budget ? hinted : Math.max(1, Math.floor(budget / 3)),
+      seatsInUse: Number(claims["seats_in_use"] ?? 0),
+      maxSeats: Number(claims["max_seats"] ?? 0),
+    };
+
+    if (generation !== this.leaseGeneration) {
+      // Released while this was in flight: hand the seat straight back instead
+      // of holding it until the TTL expires, and never re-adopt it locally.
+      void this.releaseInstance(instanceId).catch(() => {});
+      return lease;
+    }
+    this.lease = lease;
+
+    if (opts.autoRenew !== false) this.scheduleRenew(opts);
+    return lease;
+  }
+
+  /** Best-effort DELETE of one instance's seat (used for stale-renewal cleanup). */
+  private async releaseInstance(instanceId: string): Promise<void> {
+    if (!this.activationSecret || !this.licenseKey) return;
+    await this.request("DELETE", "/v1/client/leases", {
+      product_token: this.options.productToken,
+      license_key: this.licenseKey,
+      fingerprint: { composite: this.fingerprint, components: {} },
+      activation_secret: this.activationSecret,
+      instance_id: instanceId,
+    });
+  }
+
+  /** The currently held floating seat, if any. */
+  get currentLease(): Lease | null {
+    return this.lease;
+  }
+
+  /** Release the floating seat (clean exit) and stop auto-renewal. */
+  async releaseLease(): Promise<void> {
+    // Bump the generation FIRST: an already in-flight renewal will see that it
+    // is stale and neither re-adopt the seat nor re-arm the timer. Without this
+    // a renewal racing the release resurrects the lease for the process
+    // lifetime — the seat would stay held long after the app "released" it.
+    this.leaseGeneration += 1;
+    this.stopRenew();
+    const lease = this.lease;
+    this.lease = null;
+    if (!lease) return;
+    await this.releaseInstance(lease.instanceId);
+  }
+
+  private scheduleRenew(opts: AcquireLeaseOptions): void {
+    this.stopRenew();
+    const generation = this.leaseGeneration;
+    const instanceId = this.lease?.instanceId;
+    const delay = Math.max(1, this.lease?.renewAfterSeconds ?? 200) * 1000;
+    this.renewTimer = setTimeout(() => {
+      void (async () => {
+        try {
+          await this.acquireLease({ ...opts, instanceId, autoRenew: false });
+          // Released (or re-acquired) while we were awaiting → do not re-adopt.
+          if (generation !== this.leaseGeneration) return;
+          this.scheduleRenew(opts);
+        } catch (e) {
+          if (generation !== this.leaseGeneration) return;
+          this.lease = null;
+          opts.onLeaseLost?.(e instanceof Error ? e.message : "lease renewal failed");
+        }
+      })();
+    }, delay);
+    // Never hold the event loop open for a background renewal.
+    this.renewTimer.unref?.();
+  }
+
+  private stopRenew(): void {
+    if (this.renewTimer) {
+      clearTimeout(this.renewTimer);
+      this.renewTimer = null;
+    }
+  }
+
+  /**
    * Ask whether a newer release is available. Returns a verified {@link UpdateInfo}
    * (all metadata comes from the manifest signed by the pinned release key), or
    * `null` when up to date. Enforces anti-downgrade: a manifest whose
@@ -374,9 +540,17 @@ export class TalosClient {
     }
   }
 
-  private async post(path: string, body: unknown): Promise<Record<string, unknown>> {
+  private post(path: string, body: unknown): Promise<Record<string, unknown>> {
+    return this.request("POST", path, body);
+  }
+
+  private async request(
+    method: string,
+    path: string,
+    body: unknown,
+  ): Promise<Record<string, unknown>> {
     const res = await this.doFetch(this.options.serverUrl.replace(/\/+$/, "") + path, {
-      method: "POST",
+      method,
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });

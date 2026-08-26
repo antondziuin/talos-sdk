@@ -67,6 +67,30 @@ namespace Talos.Sdk.Tests
                 new CheckForUpdateOptions { CurrentReleaseSeq = upd.ReleaseSeq });
             Assert.Null(none);
 
+            // Floating seats (the demo policy has max_concurrent_seats = 1).
+            Lease lease = await client.AcquireLeaseAsync(
+                new AcquireLeaseOptions { InstanceId = "inst-1", AutoRenew = false });
+            Assert.Equal(1, lease.MaxSeats);
+            Assert.Equal(1, lease.SeatsInUse);
+
+            // Re-acquiring the SAME instance renews rather than taking a second seat.
+            Lease renewed = await client.AcquireLeaseAsync(
+                new AcquireLeaseOptions { InstanceId = "inst-1", AutoRenew = false });
+            Assert.Equal(1, renewed.SeatsInUse);
+
+            // A DIFFERENT instance is refused while the only seat is held.
+            var refused = await Assert.ThrowsAsync<TalosApiException>(() =>
+                client.AcquireLeaseAsync(
+                    new AcquireLeaseOptions { InstanceId = "inst-2", AutoRenew = false }));
+            Assert.Equal(409, refused.StatusCode);
+
+            // Releasing frees the seat for the waiting instance.
+            await client.ReleaseLeaseAsync();
+            Lease second = await client.AcquireLeaseAsync(
+                new AcquireLeaseOptions { InstanceId = "inst-2", AutoRenew = false });
+            Assert.Equal(1, second.SeatsInUse);
+            await client.ReleaseLeaseAsync();
+
             // Deactivate releases the seat; validating afterwards must fail
             // (machine no longer found / secret cleared).
             await client.DeactivateAsync();

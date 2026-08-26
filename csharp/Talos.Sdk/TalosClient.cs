@@ -74,6 +74,11 @@ namespace Talos.Sdk
         private string? _licenseKey;
         private string? _activationSecret;
         private string? _machineId;
+        private CancellationTokenSource? _renewCts;
+        /// <summary>Bumped on release so an in-flight renewal cannot resurrect the seat.</summary>
+        private volatile int _leaseGeneration;
+        /// <summary>Default instance id for floating leases: one per client object.</summary>
+        private readonly string _instanceId = Guid.NewGuid().ToString("N");
 
         public TalosClient(TalosOptions options)
         {
@@ -231,6 +236,181 @@ namespace Talos.Sdk
             Current = null;
             _activationSecret = null;
             _machineId = null;
+        }
+
+        /// <summary>
+        /// Acquire a floating seat (concurrent-use license). The server arbitrates
+        /// the cap atomically, so this either returns a seat or throws
+        /// <see cref="TalosApiException"/> with <c>seat_limit_reached</c> (409).
+        /// The seat is auto-renewed in the background unless disabled; always
+        /// <see cref="ReleaseLeaseAsync"/> on clean exit (a crash lets it expire).
+        /// </summary>
+        public async Task<Lease> AcquireLeaseAsync(
+            AcquireLeaseOptions? opts = null, CancellationToken ct = default)
+        {
+            RequireActivated();
+            opts ??= new AcquireLeaseOptions();
+            string instanceId = opts.InstanceId ?? _instanceId;
+            // Snapshot the generation: if ReleaseLeaseAsync runs while this request
+            // is in flight, we must not adopt the seat we just took.
+            int generation = _leaseGeneration;
+            string nonce = NewNonce();
+            var body = new
+            {
+                product_token = _options.ProductToken,
+                license_key = _licenseKey,
+                fingerprint = new { composite = _fingerprint, components = new { } },
+                activation_secret = _activationSecret,
+                instance_id = instanceId,
+                nonce,
+            };
+            using var doc = await PostAsync("/v1/client/leases", body, ct).ConfigureAwait(false);
+            JsonElement root = doc.RootElement;
+
+            // The lease token is signed: a MITM cannot fabricate a seat.
+            JsonElement claims = TalosCompact.Verify(
+                LicenseVerifyKeys(), "lease", _options.ProductToken, nonce,
+                root.GetProperty("lease_token").GetString()!);
+
+            // The signed grant must be for the instance and machine we asked
+            // about — otherwise a server could hand every process one seat's token.
+            if (GetStr(claims, "inst") != instanceId || GetStr(claims, "fph") != _fingerprint)
+                throw new TalosSignatureException("lease token does not match this instance");
+
+            // Seat facts come from the SIGNED claims, never the unsigned envelope,
+            // so a MITM cannot misreport occupancy. `renew_after_s` is only a
+            // scheduling hint; the budget comes from the token's OWN clock
+            // (exp vs server_time) so a wrong local clock cannot collapse the
+            // renew loop into a tight retry storm.
+            long expiresAt = claims.TryGetProperty("exp", out var e) && e.ValueKind == JsonValueKind.Number
+                ? e.GetInt64() : 0;
+            long serverNow = claims.TryGetProperty("server_time", out var st) && st.ValueKind == JsonValueKind.Number
+                ? st.GetInt64() : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            long budget = Math.Max(1, expiresAt - serverNow);
+            int hinted = root.TryGetProperty("renew_after_s", out var r) && r.ValueKind == JsonValueKind.Number
+                ? r.GetInt32() : 0;
+            var lease = new Lease
+            {
+                Id = GetStr(claims, "lease") ?? "",
+                InstanceId = instanceId,
+                ExpiresAt = expiresAt,
+                RenewAfterSeconds = hinted > 0 && hinted <= budget
+                    ? hinted
+                    : (int)Math.Max(1, budget / 3),
+                SeatsInUse = claims.TryGetProperty("seats_in_use", out var s) && s.ValueKind == JsonValueKind.Number
+                    ? s.GetInt64() : 0,
+                MaxSeats = claims.TryGetProperty("max_seats", out var m) && m.ValueKind == JsonValueKind.Number
+                    ? m.GetInt32() : 0,
+            };
+
+            if (generation != _leaseGeneration)
+            {
+                // Released while this was in flight: hand the seat back rather
+                // than holding it to TTL, and never re-adopt it locally.
+                _ = ReleaseInstanceAsync(instanceId, CancellationToken.None);
+                return lease;
+            }
+            CurrentLease = lease;
+
+            if (opts.AutoRenew) StartRenew(opts);
+            return lease;
+        }
+
+        /// <summary>Best-effort release of one instance's seat (stale-renewal cleanup).</summary>
+        private async Task ReleaseInstanceAsync(string instanceId, CancellationToken ct)
+        {
+            if (_activationSecret == null || _licenseKey == null) return;
+            var body = new
+            {
+                product_token = _options.ProductToken,
+                license_key = _licenseKey,
+                fingerprint = new { composite = _fingerprint, components = new { } },
+                activation_secret = _activationSecret,
+                instance_id = instanceId,
+            };
+            try
+            {
+                using var _ = await SendAsync(HttpMethod.Delete, "/v1/client/leases", body, ct)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // Best effort — the seat expires on its own if this cannot land.
+            }
+        }
+
+        /// <summary>The currently held floating seat, if any.</summary>
+        public Lease? CurrentLease { get; private set; }
+
+        /// <summary>Release the floating seat (clean exit) and stop auto-renewal.</summary>
+        public async Task ReleaseLeaseAsync(CancellationToken ct = default)
+        {
+            // Bump the generation FIRST so an in-flight renewal cannot resurrect
+            // the seat after we release it.
+            _leaseGeneration++;
+            StopRenew();
+            Lease? lease = CurrentLease;
+            CurrentLease = null;
+            if (lease == null) return;
+            await ReleaseInstanceAsync(lease.InstanceId, ct).ConfigureAwait(false);
+        }
+
+        private void StartRenew(AcquireLeaseOptions opts)
+        {
+            StopRenew();
+            var cts = new CancellationTokenSource();
+            _renewCts = cts;
+            // Capture the token once: StopRenew must never dispose a CTS this
+            // task is still reading (that would raise ObjectDisposedException
+            // and surface a clean release as a spurious OnLeaseLost).
+            CancellationToken token = cts.Token;
+            int generation = _leaseGeneration;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        int delay = Math.Max(1, CurrentLease?.RenewAfterSeconds ?? 200);
+                        await Task.Delay(TimeSpan.FromSeconds(delay), token).ConfigureAwait(false);
+                        if (token.IsCancellationRequested || generation != _leaseGeneration) return;
+                        await AcquireLeaseAsync(
+                            new AcquireLeaseOptions
+                            {
+                                InstanceId = CurrentLease?.InstanceId ?? _instanceId,
+                                AutoRenew = false,
+                            },
+                            token).ConfigureAwait(false);
+                    }
+                }
+                // ONLY our own cancellation is benign. An HttpClient timeout also
+                // raises TaskCanceledException; treating that as "released" would
+                // stop renewing silently and let the seat lapse while the app runs.
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    // Released or disposed — nothing to report.
+                }
+                catch (Exception ex)
+                {
+                    if (generation != _leaseGeneration) return;
+                    CurrentLease = null;
+                    opts.OnLeaseLost?.Invoke(ex.Message);
+                }
+                finally
+                {
+                    // Dispose from the task that owns it, and only if it is still
+                    // the current one.
+                    if (ReferenceEquals(_renewCts, cts)) _renewCts = null;
+                    cts.Dispose();
+                }
+            });
+        }
+
+        private void StopRenew()
+        {
+            // Cancel but do NOT dispose here — the renew task disposes its own CTS.
+            _renewCts?.Cancel();
+            _renewCts = null;
         }
 
         /// <summary>
@@ -420,12 +600,18 @@ namespace Talos.Sdk
             return state;
         }
 
-        private async Task<JsonDocument> PostAsync(string path, object body, CancellationToken ct)
+        private Task<JsonDocument> PostAsync(string path, object body, CancellationToken ct)
+            => SendAsync(HttpMethod.Post, path, body, ct);
+
+        private async Task<JsonDocument> SendAsync(
+            HttpMethod method, string path, object body, CancellationToken ct)
         {
             string json = JsonSerializer.Serialize(body);
-            using var content = new StringContent(json, Encoding.UTF8, "application/json");
-            using var resp = await _http.PostAsync(_options.ServerUrl.TrimEnd('/') + path, content, ct)
-                .ConfigureAwait(false);
+            using var req = new HttpRequestMessage(method, _options.ServerUrl.TrimEnd('/') + path)
+            {
+                Content = new StringContent(json, Encoding.UTF8, "application/json"),
+            };
+            using var resp = await _http.SendAsync(req, ct).ConfigureAwait(false);
             string text = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode)
             {

@@ -6,6 +6,8 @@ export {
   type UpdateInfo,
   type UpdateArtifact,
   type CheckForUpdateOptions,
+  type Lease,
+  type AcquireLeaseOptions,
 } from "./client.js";
 export { TalosError, TalosSignatureError, TalosApiError } from "./errors.js";
 export { computeFingerprint } from "./fingerprint.js";
