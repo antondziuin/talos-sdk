@@ -83,6 +83,7 @@ describe("downloadUpdate", () => {
     mandatory: false,
     notesUrl: null,
     artifacts: [a],
+    deltas: [],
   });
 
   it("uses the injected fetch, not the global one", async () => {

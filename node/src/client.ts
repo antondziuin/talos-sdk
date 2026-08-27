@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import os from "node:os";
 import { type KeyObject } from "node:crypto";
@@ -150,6 +151,47 @@ export interface UpdateArtifact {
   downloadPath?: string;
 }
 
+/** What applying a patch has to produce. */
+export interface UpdateDeltaTarget {
+  /** The `kind` of the full artifact this rebuilds (`installer`, `archive`, …). */
+  kind: string;
+  filename: string;
+  /** Expected size of the rebuilt file, in bytes (from the signed manifest). */
+  size: number;
+  /**
+   * Expected SHA-256 of the rebuilt file, lowercase hex (from the signed
+   * manifest). **Check it after applying** — see {@link verifyAppliedUpdate}.
+   * Verifying only the patch leaves whatever comes out of the patcher
+   * unverified, which is the whole thing the signed manifest exists to prevent.
+   */
+  sha256: string;
+}
+
+/**
+ * A patch that turns one already-installed version into this release, from the
+ * signed manifest.
+ *
+ * Talos hosts and signs patches; it does not produce or apply them. The diff
+ * format belongs to whatever applies it (Velopack, Squirrel, MSIX, bsdiff,
+ * `zstd --patch-from`), and this SDK deliberately does not run installers.
+ */
+export interface UpdateDelta {
+  platform: string;
+  arch: string;
+  /** The installed version this patch applies to, exactly as published. */
+  from: string;
+  /** `release_seq` of the version it applies to (always below this release's). */
+  fromSeq: number;
+  filename: string;
+  /** Expected size of the patch itself, in bytes. */
+  size: number;
+  /** Expected SHA-256 of the patch itself, lowercase hex. */
+  sha256: string;
+  target: UpdateDeltaTarget;
+  /** Untrusted transport path; the bytes are verified against `sha256`. */
+  downloadPath?: string;
+}
+
 /** A verified available update (its metadata all comes from the signed manifest). */
 export interface UpdateInfo {
   version: string;
@@ -157,6 +199,27 @@ export interface UpdateInfo {
   mandatory: boolean;
   notesUrl: string | null;
   artifacts: UpdateArtifact[];
+  /**
+   * Patches this release ships, if any. Never mixed into {@link artifacts}: a
+   * patch is not something a host can install, and an SDK that picks "the
+   * artifact for this platform" would hand one over as if it were a build.
+   */
+  deltas: UpdateDelta[];
+}
+
+/** Which patch to use, when a release ships more than one. */
+export interface DeltaOptions {
+  /**
+   * The version currently installed. Defaults to `appVersion` from the client
+   * options — the same value the update check reports.
+   */
+  from?: string;
+  /**
+   * Which shipped file to rebuild, when a release carries patches for several
+   * (an installer and a portable archive, say). Defaults to the only one, and
+   * is required when there is more than one.
+   */
+  targetKind?: string;
 }
 
 /** A held floating seat. Renew before {@link expiresAt} or it is reclaimed. */
@@ -1048,13 +1111,96 @@ export class TalosClient {
       };
     });
 
+    // Patches, keyed by what distinguishes them from each other: the version
+    // they apply to and the file they rebuild. A release that supports upgrading
+    // from three versions and ships two files carries six.
+    const deltaPaths = new Map<string, string>();
+    for (const d of asArray(body["deltas"])) {
+      const o = d as Record<string, unknown>;
+      if (typeof o["download_path"] === "string") {
+        deltaPaths.set(
+          deltaKey(o["platform"], o["arch"], o["from"], o["target_kind"]),
+          o["download_path"],
+        );
+      }
+    }
+
+    const deltas: UpdateDelta[] = asArray(m["deltas"]).map((d) => {
+      const o = d as Record<string, unknown>;
+      const t = (o["target"] ?? {}) as Record<string, unknown>;
+      const platform = String(o["platform"] ?? "");
+      const arch = String(o["arch"] ?? "");
+      const from = String(o["from"] ?? "");
+      const targetKind = String(t["kind"] ?? "");
+      return {
+        platform,
+        arch,
+        from,
+        fromSeq: typeof o["from_seq"] === "number" ? (o["from_seq"] as number) : 0,
+        filename: String(o["filename"] ?? ""),
+        size: typeof o["size"] === "number" ? (o["size"] as number) : 0,
+        sha256: String(o["sha256"] ?? ""),
+        target: {
+          kind: targetKind,
+          filename: String(t["filename"] ?? ""),
+          size: typeof t["size"] === "number" ? (t["size"] as number) : 0,
+          sha256: String(t["sha256"] ?? ""),
+        },
+        downloadPath: deltaPaths.get(deltaKey(platform, arch, from, targetKind)),
+      };
+    });
+
     return {
       version: String(m["version"] ?? ""),
       releaseSeq,
       mandatory: m["mandatory"] === true,
       notesUrl: typeof m["notes_url"] === "string" ? (m["notes_url"] as string) : null,
       artifacts,
+      deltas,
     };
+  }
+
+  /**
+   * The patch that upgrades this machine, or `null` if there is none.
+   *
+   * Matches on the *exact* published version string, not on version ordering: a
+   * patch applies to the bytes it was built against, and "close enough" produces
+   * a corrupt file rather than an error. So a machine whose installed version is
+   * not one the release ships a patch from simply downloads the full build.
+   */
+  selectDelta(info: UpdateInfo, opts: DeltaOptions = {}): UpdateDelta | null {
+    const from = opts.from ?? this.options.appVersion;
+    if (!from) return null;
+    const { platform, arch } = hostTarget();
+    const matches = info.deltas.filter(
+      (d) => d.platform === platform && d.arch === arch && d.from === from,
+    );
+    if (opts.targetKind) return matches.find((d) => d.target.kind === opts.targetKind) ?? null;
+    // Ambiguity is refused rather than guessed. Picking one of two patches for
+    // an installer and a portable archive would download megabytes and rebuild
+    // the file the host was not updating.
+    return matches.length === 1 ? matches[0]! : null;
+  }
+
+  /**
+   * Download a patch and verify its bytes against the manifest's SHA-256, then
+   * write it to `destPath`. Returns the patch, whose `target.sha256` is what the
+   * rebuilt file must hash to.
+   *
+   * Does NOT apply it. Applying is the host's job — and so is checking the
+   * result, which {@link verifyAppliedUpdate} does. A patch verified on the way
+   * in and a result nobody checks is a signed chain that stops one step short of
+   * the binary that runs.
+   */
+  async downloadDelta(
+    info: UpdateInfo,
+    destPath: string,
+    opts: DeltaOptions & { delta?: UpdateDelta } = {},
+  ): Promise<UpdateDelta> {
+    const chosen = opts.delta ?? this.selectDelta(info, opts);
+    if (!chosen) throw new TalosError("no patch applies to this install");
+    await this.fetchVerified(chosen.downloadPath, chosen.size, chosen.sha256, destPath);
+    return chosen;
   }
 
   /**
@@ -1071,9 +1217,24 @@ export class TalosClient {
     this.requireActivated();
     const chosen = artifact ?? pickArtifact(info.artifacts);
     if (!chosen) throw new TalosError("no artifact matches this platform");
-    if (!chosen.downloadPath) throw new TalosError("artifact has no download path");
+    await this.fetchVerified(chosen.downloadPath, chosen.size, chosen.sha256, destPath);
+    return chosen;
+  }
 
-    const url = this.options.serverUrl.replace(/\/+$/, "") + chosen.downloadPath;
+  /**
+   * Fetch one file over the entitled download route and write it only once its
+   * bytes match the size and hash the signed manifest names. Shared by full
+   * builds and patches, which differ in what they are for and not at all in how
+   * their bytes are checked.
+   */
+  private async fetchVerified(
+    downloadPath: string | undefined,
+    size: number,
+    sha256: string,
+    destPath: string,
+  ): Promise<void> {
+    if (!downloadPath) throw new TalosError("artifact has no download path");
+    const url = this.options.serverUrl.replace(/\/+$/, "") + downloadPath;
     const res = await this.doFetch(url, {
       method: "GET",
       headers: {
@@ -1088,13 +1249,12 @@ export class TalosClient {
     // The download channel is untrusted (could stream an unbounded body to
     // exhaust memory before the hash check). Cap the read at the manifest's
     // trusted `size`, then verify the SHA-256 from the signed manifest.
-    const bytes = await readCapped(res, chosen.size);
+    const bytes = await readCapped(res, size);
     const actual = createHash("sha256").update(bytes).digest("hex");
-    if (actual !== chosen.sha256) {
+    if (actual !== sha256) {
       throw new TalosSignatureError("artifact hash mismatch (tampered or wrong bytes)");
     }
     await writeFile(destPath, bytes);
-    return chosen;
   }
 
   private requireActivated(): void {
@@ -1207,11 +1367,48 @@ function selKey(platform: unknown, arch: unknown, kind: unknown): string {
   return `${String(platform)}/${String(arch)}/${String(kind)}`;
 }
 
+function deltaKey(platform: unknown, arch: unknown, from: unknown, targetKind: unknown): string {
+  return `${String(platform)}/${String(arch)}/${String(from)}/${String(targetKind)}`;
+}
+
+/** The platform and arch names this machine matches artifacts by. */
+function hostTarget(): { platform: string; arch: string } {
+  const map: Record<string, string> = { win32: "windows", darwin: "macos", linux: "linux" };
+  return { platform: map[os.platform()] ?? os.platform(), arch: os.arch() };
+}
+
 /** Best artifact for the current platform (installer preferred), or undefined. */
 function pickArtifact(artifacts: UpdateArtifact[]): UpdateArtifact | undefined {
-  const map: Record<string, string> = { win32: "windows", darwin: "macos", linux: "linux" };
-  const platform = map[os.platform()] ?? os.platform();
-  const arch = os.arch();
+  const { platform, arch } = hostTarget();
   const matches = artifacts.filter((a) => a.platform === platform && a.arch === arch);
   return matches.find((a) => a.kind === "installer") ?? matches[0];
+}
+
+/**
+ * Check that applying a patch produced the file the signed manifest said it
+ * would. Throws {@link TalosSignatureError} if not.
+ *
+ * This is the last link in the chain and the easiest one to leave out. The patch
+ * itself was verified on the way in, but a patcher can fail halfway, apply to
+ * the wrong base file, or be handed bytes from somewhere else entirely — and
+ * every one of those produces a file that nothing has vouched for. Reads the
+ * file in chunks, so a multi-gigabyte install is not brought into memory.
+ *
+ * Needs no licence and no activation: run it from the updater process, after the
+ * application it belongs to has exited.
+ */
+export async function verifyAppliedUpdate(filePath: string, delta: UpdateDelta): Promise<void> {
+  const hash = createHash("sha256");
+  const stream = createReadStream(filePath);
+  await new Promise<void>((resolve, reject) => {
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve());
+  });
+  const actual = hash.digest("hex");
+  if (actual !== delta.target.sha256) {
+    throw new TalosSignatureError(
+      `applied update does not match the signed manifest: expected ${delta.target.sha256}, got ${actual}`,
+    );
+  }
 }

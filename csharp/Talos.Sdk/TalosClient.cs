@@ -1052,6 +1052,52 @@ namespace Talos.Sdk
                 }
             }
 
+            // Patches, keyed by what distinguishes them from each other: the
+            // version they apply to and the file they rebuild. A release that
+            // supports upgrading from three versions and ships two files carries six.
+            var deltaPaths = new Dictionary<string, string>();
+            if (root.TryGetProperty("deltas", out var respDeltas) && respDeltas.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var d in respDeltas.EnumerateArray())
+                {
+                    string? path = GetStr(d, "download_path");
+                    if (path != null)
+                        deltaPaths[DeltaKey(GetStr(d, "platform"), GetStr(d, "arch"), GetStr(d, "from"), GetStr(d, "target_kind"))] = path;
+                }
+            }
+
+            var deltas = new List<UpdateDelta>();
+            if (m.TryGetProperty("deltas", out var manDeltas) && manDeltas.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var d in manDeltas.EnumerateArray())
+                {
+                    string platform = GetStr(d, "platform") ?? "";
+                    string arch = GetStr(d, "arch") ?? "";
+                    string from = GetStr(d, "from") ?? "";
+                    JsonElement t = d.TryGetProperty("target", out var tv) ? tv : default;
+                    string targetKind = GetStr(t, "kind") ?? "";
+                    deltaPaths.TryGetValue(DeltaKey(platform, arch, from, targetKind), out var dp);
+                    deltas.Add(new UpdateDelta
+                    {
+                        Platform = platform,
+                        Arch = arch,
+                        From = from,
+                        FromSeq = GetLong(d, "from_seq"),
+                        Filename = GetStr(d, "filename") ?? "",
+                        Size = GetLong(d, "size"),
+                        Sha256 = GetStr(d, "sha256") ?? "",
+                        Target = new UpdateDeltaTarget
+                        {
+                            Kind = targetKind,
+                            Filename = GetStr(t, "filename") ?? "",
+                            Size = GetLong(t, "size"),
+                            Sha256 = GetStr(t, "sha256") ?? "",
+                        },
+                        DownloadPath = dp,
+                    });
+                }
+            }
+
             return new UpdateInfo
             {
                 Version = GetStr(m, "version") ?? "",
@@ -1059,7 +1105,94 @@ namespace Talos.Sdk
                 Mandatory = m.TryGetProperty("mandatory", out var md) && md.ValueKind == JsonValueKind.True,
                 NotesUrl = GetStr(m, "notes_url"),
                 Artifacts = artifacts,
+                Deltas = deltas,
             };
+        }
+
+        /// <summary>
+        /// The patch that upgrades this machine, or <c>null</c> if there is none.
+        /// </summary>
+        /// <remarks>
+        /// Matches on the <b>exact</b> published version string, not on version
+        /// ordering: a patch applies to the bytes it was built against, and "close
+        /// enough" produces a corrupt file rather than an error. A machine whose
+        /// installed version is not one the release ships a patch from simply
+        /// downloads the full build.
+        /// <para>
+        /// <paramref name="targetKind"/> picks which shipped file to rebuild when a
+        /// release carries patches for several. With more than one candidate and no
+        /// kind given this returns <c>null</c> rather than guessing — choosing
+        /// wrongly would download megabytes and rebuild a file the host was not
+        /// updating.
+        /// </para>
+        /// </remarks>
+        public UpdateDelta? SelectDelta(UpdateInfo info, string? from = null, string? targetKind = null)
+        {
+            string? want = from ?? _options.AppVersion;
+            if (string.IsNullOrEmpty(want)) return null;
+            var (platform, arch) = HostTarget();
+            var matches = info.Deltas
+                .Where(d => d.Platform == platform && d.Arch == arch && d.From == want)
+                .ToList();
+            if (!string.IsNullOrEmpty(targetKind))
+                return matches.FirstOrDefault(d => d.Target.Kind == targetKind);
+            return matches.Count == 1 ? matches[0] : null;
+        }
+
+        /// <summary>
+        /// Download a patch and verify its bytes against the manifest's SHA-256,
+        /// then write it to <paramref name="destPath"/>. Returns the patch, whose
+        /// <c>Target.Sha256</c> is what the rebuilt file must hash to.
+        /// </summary>
+        /// <remarks>
+        /// Does NOT apply it. Applying is the host's job — and so is checking the
+        /// result, which <see cref="VerifyAppliedUpdate"/> does. A patch verified on
+        /// the way in and a result nobody checks is a signed chain that stops one
+        /// step short of the binary that runs.
+        /// </remarks>
+        public async Task<UpdateDelta> DownloadDeltaAsync(
+            UpdateInfo info, string destPath, UpdateDelta? delta = null,
+            string? from = null, string? targetKind = null, CancellationToken ct = default)
+        {
+            RequireActivated();
+            UpdateDelta? chosen = delta ?? SelectDelta(info, from, targetKind);
+            if (chosen == null) throw new TalosException("no patch applies to this install");
+            await FetchVerifiedAsync(chosen.DownloadPath, chosen.Size, chosen.Sha256, destPath, ct)
+                .ConfigureAwait(false);
+            return chosen;
+        }
+
+        /// <summary>
+        /// Check that applying a patch produced the file the signed manifest said
+        /// it would. Throws <see cref="TalosSignatureException"/> if not.
+        /// </summary>
+        /// <remarks>
+        /// This is the last link in the chain and the easiest one to leave out. The
+        /// patch itself was verified on the way in, but a patcher can fail halfway,
+        /// apply to the wrong base file, or be handed bytes from somewhere else
+        /// entirely — and every one of those produces a file that nothing has
+        /// vouched for. Hashes the file as a stream, so a multi-gigabyte install is
+        /// not brought into memory.
+        /// <para>
+        /// Static, and needs no licence or activation: run it from the updater
+        /// process, after the application it belongs to has exited.
+        /// </para>
+        /// </remarks>
+        public static void VerifyAppliedUpdate(string filePath, UpdateDelta delta)
+        {
+            string actual;
+            using (var sha = SHA256.Create())
+            using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                byte[] hash = sha.ComputeHash(fs);
+                var sb = new StringBuilder(hash.Length * 2);
+                foreach (byte b in hash) sb.Append(b.ToString("x2"));
+                actual = sb.ToString();
+            }
+            if (!string.Equals(actual, delta.Target.Sha256, StringComparison.Ordinal))
+                throw new TalosSignatureException(
+                    "applied update does not match the signed manifest: expected "
+                    + delta.Target.Sha256 + ", got " + actual);
         }
 
         /// <summary>
@@ -1074,9 +1207,23 @@ namespace Talos.Sdk
             RequireActivated();
             UpdateArtifact? chosen = artifact ?? PickArtifact(info.Artifacts);
             if (chosen == null) throw new TalosException("no artifact matches this platform");
-            if (string.IsNullOrEmpty(chosen.DownloadPath)) throw new TalosException("artifact has no download path");
+            await FetchVerifiedAsync(chosen.DownloadPath, chosen.Size, chosen.Sha256, destPath, ct)
+                .ConfigureAwait(false);
+            return chosen;
+        }
 
-            using var req = new HttpRequestMessage(HttpMethod.Get, _options.ServerUrl.TrimEnd('/') + chosen.DownloadPath);
+        /// <summary>
+        /// Fetch one file over the entitled download route and write it only once
+        /// its bytes match the size and hash the signed manifest names. Shared by
+        /// full builds and patches, which differ in what they are for and not at
+        /// all in how their bytes are checked.
+        /// </summary>
+        private async Task FetchVerifiedAsync(
+            string? downloadPath, long size, string sha256, string destPath, CancellationToken ct)
+        {
+            if (string.IsNullOrEmpty(downloadPath)) throw new TalosException("artifact has no download path");
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, _options.ServerUrl.TrimEnd('/') + downloadPath);
             req.Headers.TryAddWithoutValidation("x-talos-product-token", _options.ProductToken);
             req.Headers.TryAddWithoutValidation("x-talos-license-key", _licenseKey);
             req.Headers.TryAddWithoutValidation("x-talos-activation-secret", _activationSecret);
@@ -1089,13 +1236,13 @@ namespace Talos.Sdk
             // The download channel is untrusted (could stream an unbounded body to
             // exhaust memory before the hash check). Cap the read at the manifest's
             // trusted Size, then verify the SHA-256 from the signed manifest.
-            if (resp.Content.Headers.ContentLength is long cl && cl > chosen.Size)
+            if (resp.Content.Headers.ContentLength is long cl && cl > size)
                 throw new TalosSignatureException("artifact exceeds manifest size");
             using var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
-            byte[] bytes = await ReadCappedAsync(stream, chosen.Size, ct).ConfigureAwait(false);
+            byte[] bytes = await ReadCappedAsync(stream, size, ct).ConfigureAwait(false);
 
             string actual = Sha256Hex(bytes);
-            if (!string.Equals(actual, chosen.Sha256, StringComparison.Ordinal))
+            if (!string.Equals(actual, sha256, StringComparison.Ordinal))
                 throw new TalosSignatureException("artifact hash mismatch (tampered or wrong bytes)");
 
 #if NET5_0_OR_GREATER
@@ -1104,7 +1251,6 @@ namespace Talos.Sdk
             using (var fs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 await fs.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
 #endif
-            return chosen;
         }
 
         private static async Task<byte[]> ReadCappedAsync(Stream stream, long cap, CancellationToken ct)
@@ -1126,8 +1272,26 @@ namespace Talos.Sdk
         private static string? GetStr(JsonElement e, string name) =>
             e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
 
+        private static long GetLong(JsonElement e, string name) =>
+            e.ValueKind == JsonValueKind.Object
+            && e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number
+                ? v.GetInt64() : 0;
+
         private static string SelKey(string? platform, string? arch, string? kind) =>
             $"{platform}/{arch}/{kind}";
+
+        private static string DeltaKey(string? platform, string? arch, string? from, string? targetKind) =>
+            $"{platform}/{arch}/{from}/{targetKind}";
+
+        /// <summary>The platform and arch names this machine matches artifacts by.</summary>
+        private static (string Platform, string Arch) HostTarget()
+        {
+            string platform =
+                RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows" :
+                RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macos" :
+                RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "linux" : "unknown";
+            return (platform, RuntimeInformation.OSArchitecture.ToString().ToLowerInvariant());
+        }
 
         private static string Sha256Hex(byte[] bytes)
         {
@@ -1140,11 +1304,7 @@ namespace Talos.Sdk
 
         private static UpdateArtifact? PickArtifact(IReadOnlyList<UpdateArtifact> artifacts)
         {
-            string platform =
-                RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows" :
-                RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macos" :
-                RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "linux" : "unknown";
-            string arch = RuntimeInformation.OSArchitecture.ToString().ToLowerInvariant();
+            var (platform, arch) = HostTarget();
             var matches = artifacts.Where(a => a.Platform == platform && a.Arch == arch).ToList();
             return matches.FirstOrDefault(a => a.Kind == "installer") ?? matches.FirstOrDefault();
         }
