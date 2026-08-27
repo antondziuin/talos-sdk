@@ -258,6 +258,16 @@ export class LicenseState {
  * acceptable answer. One instance per product; holds the per-machine activation
  * secret after {@link TalosClient.activate}.
  */
+/**
+ * How long an adopted keyset is trusted before a refresh is attempted.
+ *
+ * The upper bound on how long a revoked signing key keeps being accepted by an
+ * install that stays online. A day is the trade: shorter multiplies load on a
+ * public endpoint serving a document that changes about once a year, longer
+ * widens the window in which a compromised key still works.
+ */
+const KEYSET_MAX_AGE_SECONDS = 24 * 60 * 60;
+
 export class TalosClient {
   private readonly options: TalosOptions;
   private readonly anchorKey: KeyObject | null;
@@ -283,6 +293,15 @@ export class TalosClient {
    * server keeps verifying with what it already trusts.
    */
   private keysetFromCache = false;
+  /**
+   * The `iat` of the adopted keyset, in unix seconds, or 0 if unknown.
+   *
+   * Kept so a keyset can go stale. Without it the refresh happens once per
+   * process, which is fine for a desktop app that restarts and useless for the
+   * process this SDK is most often *in* — a server or an Electron main that runs
+   * for weeks. A key revoked in the portal would never reach it.
+   */
+  private keysetIssuedAt = 0;
   /** The policy's heartbeat cadence, from the last heartbeat's signed claims. */
   private heartbeatInterval: number | null = null;
   private checkInTimer: ReturnType<typeof setTimeout> | null = null;
@@ -400,14 +419,49 @@ export class TalosClient {
    */
   private async ensureKeyset(): Promise<void> {
     if (!this.anchorKey) return;
-    if (this.keysetLicenseKeys.length > 0 && !this.keysetFromCache) return;
-    await this.refreshKeyset();
+    if (this.keysetLicenseKeys.length > 0 && !this.keysetFromCache && !this.keysetIsStale()) {
+      return;
+    }
+    try {
+      await this.refreshKeyset();
+    } catch (e) {
+      // A refresh that cannot reach the server must not break a client that
+      // already has keys it trusts — that would make a network problem look
+      // like a licensing failure, which is the one thing the whole grace design
+      // exists to avoid. With nothing adopted at all there is no fallback, so
+      // the failure is the caller's to see.
+      if (this.keysetLicenseKeys.length === 0) throw e;
+    }
+  }
+
+  /**
+   * Whether the adopted keyset is old enough to be worth re-fetching.
+   *
+   * This is what makes revoking a compromised signing key mean anything to an
+   * install: a revoked key is omitted from the keyset, so a client only stops
+   * trusting it once it fetches a newer one. Refreshing only on the first call
+   * of a process bounds that by "next restart", which for a long-running host is
+   * not a bound at all.
+   *
+   * A day, not an hour: the endpoint is public and unauthenticated, and every
+   * install on earth hitting it hourly is a self-inflicted load pattern for a
+   * document that changes about once a year. The honest description of the
+   * guarantee is in `docs/SECURITY.md` — revocation is bounded, not instant.
+   */
+  private keysetIsStale(): boolean {
+    if (!this.keysetIssuedAt) return true;
+    return Date.now() / 1000 - this.keysetIssuedAt > KEYSET_MAX_AGE_SECONDS;
   }
 
   /** Verify a keyset token against the anchor and adopt its keys. */
   private adoptKeyset(token: unknown): void {
     if (!this.anchorKey || typeof token !== "string") return;
     const claims = verifyKeyset(this.anchorKey, this.options.productToken, token);
+    // From the signed claims, not from a local clock reading taken when the
+    // fetch happened: a client whose clock is wrong would otherwise decide its
+    // keyset is fresh forever, or refetch on every call.
+    const iat = claims["iat"];
+    this.keysetIssuedAt = typeof iat === "number" ? iat : 0;
     const licenseKeys: KeyObject[] = [];
     const releaseKeys: KeyObject[] = [];
     for (const entry of asArray(claims["keys"])) {

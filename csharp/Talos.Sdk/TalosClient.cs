@@ -144,6 +144,29 @@ namespace Talos.Sdk
         /// reach the server keeps verifying with what it already trusts.
         /// </summary>
         private bool _keysetFromCache;
+
+        /// <summary>
+        /// The <c>iat</c> of the adopted keyset, unix seconds, or 0 if unknown.
+        /// <para>
+        /// Kept so a keyset can go stale. Without it the refresh happens once per
+        /// process, which is fine for a desktop app that restarts and useless for
+        /// a service host that runs for weeks — a signing key revoked in the
+        /// portal would never reach it.
+        /// </para>
+        /// </summary>
+        private long _keysetIssuedAt;
+
+        /// <summary>
+        /// How long an adopted keyset is trusted before a refresh is attempted:
+        /// the upper bound on how long a revoked signing key keeps being accepted
+        /// by an install that stays online.
+        /// <para>
+        /// A day is the trade. Shorter multiplies load on a public endpoint
+        /// serving a document that changes about once a year; longer widens the
+        /// window in which a compromised key still works.
+        /// </para>
+        /// </summary>
+        private const long KeysetMaxAgeSeconds = 24 * 60 * 60;
         private CancellationTokenSource? _renewCts;
         private CancellationTokenSource? _checkInCts;
         /// <summary>Bumped on release so an in-flight renewal cannot resurrect the seat.</summary>
@@ -263,14 +286,50 @@ namespace Talos.Sdk
         private async Task EnsureKeysetAsync(CancellationToken ct)
         {
             if (_anchorKey == null) return;
-            if (_keysetLicenseKeys.Count > 0 && !_keysetFromCache) return;
-            await RefreshKeysetAsync(ct).ConfigureAwait(false);
+            if (_keysetLicenseKeys.Count > 0 && !_keysetFromCache && !KeysetIsStale()) return;
+            try
+            {
+                await RefreshKeysetAsync(ct).ConfigureAwait(false);
+            }
+            catch when (_keysetLicenseKeys.Count > 0)
+            {
+                // A refresh that cannot reach the server must not break a client
+                // that already has keys it trusts: that turns a network problem
+                // into a licensing failure, which is the one outcome the whole
+                // grace design exists to avoid. With nothing adopted at all there
+                // is no fallback, and the exception is the caller's to see.
+            }
+        }
+
+        /// <summary>
+        /// Whether the adopted keyset is old enough to be worth re-fetching.
+        /// <para>
+        /// This is what makes revoking a compromised signing key mean anything to
+        /// an install: a revoked key is omitted from the keyset, so a client only
+        /// stops trusting it once it fetches a newer one. Refreshing only on the
+        /// first call of a process bounds that by "next restart", which for a
+        /// long-running host is not a bound at all.
+        /// </para>
+        /// </summary>
+        private bool KeysetIsStale()
+        {
+            if (_keysetIssuedAt == 0) return true;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            return now - _keysetIssuedAt > KeysetMaxAgeSeconds;
         }
 
         private void AdoptKeyset(string? token)
         {
             if (_anchorKey == null || string.IsNullOrEmpty(token)) return;
             JsonElement claims = TalosCompact.VerifyKeyset(_anchorKey, _options.ProductToken, token!);
+            // From the signed claims, not from a local clock reading taken when
+            // the fetch happened: a client whose clock is wrong would otherwise
+            // decide its keyset is fresh forever, or refetch on every call.
+            _keysetIssuedAt = claims.TryGetProperty("iat", out var iat)
+                && iat.ValueKind == JsonValueKind.Number
+                && iat.TryGetInt64(out long v)
+                ? v
+                : 0;
             var licenseKeys = new List<byte[]>();
             var releaseKeys = new List<byte[]>();
             if (claims.TryGetProperty("keys", out var keys) && keys.ValueKind == JsonValueKind.Array)
