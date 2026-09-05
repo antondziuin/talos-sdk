@@ -35,6 +35,26 @@ arrayBuffer() }`; `headers` and `body` are optional, and when the implementation
 provides a streaming `body` the artifact download meters it against the signed
 manifest's size instead of buffering first.
 
+## Licensing calls have a deadline
+
+`options.httpTimeoutMs` (default 10000, `0` disables) bounds every licensing
+call. Node's `fetch` has none of its own, so without it a server that accepts
+the connection and then says nothing leaves `activate()` or `validate()` pending
+forever — which in a desktop application is a splash screen that never goes
+away, on the one code path a user cannot skip.
+
+A timeout surfaces as a `TalosError`, deliberately: `validate()` treats network
+failure as the grace-period case, and an abort arriving as something else would
+stop the application instead of letting it keep running offline.
+
+It does **not** cap `downloadUpdate`. A total-duration limit on a
+multi-megabyte artifact is a size limit disguised as a safeguard — the same ten
+seconds that is generous for a licensing call fails every download on a slow
+connection. That one is bounded by the signed manifest's `size`.
+
+An injected `fetch` receives the `signal` and is expected to honour it; one that
+ignores it has no timeout.
+
 ## The machine binding is persistent
 
 `activate` binds this machine and the SDK writes that binding to a per-product

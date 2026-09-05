@@ -56,8 +56,29 @@ export interface FetchResponseLike {
 /** Minimal fetch signature (Node 18+ global fetch, or an injected one). */
 export type FetchLike = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body?: string },
+  init: {
+    method: string;
+    headers: Record<string, string>;
+    body?: string;
+    /**
+     * Aborts the request once {@link TalosOptions.httpTimeoutMs} elapses.
+     *
+     * Optional so an injected `fetch` that predates this field still satisfies
+     * the type — but one that ignores the signal has no timeout, and the
+     * licensing call it drops is on somebody's launch path.
+     */
+    signal?: AbortSignal;
+  },
 ) => Promise<FetchResponseLike>;
+
+/**
+ * Default cap on a licensing call, in milliseconds.
+ *
+ * Ten seconds: long enough that a slow network is not mistaken for a dead one,
+ * short enough that an application blocked on it still starts. Node's `fetch`
+ * has no default at all, which is the state this replaces.
+ */
+const DEFAULT_HTTP_TIMEOUT_MS = 10_000;
 
 export interface TalosOptions {
   /** The product's public token (`tpt_…`) from the portal. */
@@ -107,6 +128,23 @@ export interface TalosOptions {
    * multi-megabyte binary and is likeliest to need it.
    */
   fetch?: FetchLike;
+  /**
+   * How long a licensing call may take before it is abandoned, in milliseconds.
+   * Default 10000; `0` disables it.
+   *
+   * Node's `fetch` has **no** default timeout, so before this existed a server
+   * that accepted the connection and never answered left `validate()` pending
+   * forever — which in a desktop application is a splash screen that never goes
+   * away, on the one code path a user cannot skip. Passing a custom `fetch` was
+   * the only way to bound it, which is a lot of ceremony for one number.
+   *
+   * It does **not** apply to `downloadUpdate`. A total-duration cap on a
+   * multi-megabyte artifact is not a safeguard, it is a size limit disguised as
+   * one: the same 30 seconds that is generous for a licensing call fails every
+   * download on a slow connection. The download is bounded by the manifest's
+   * signed `size` instead, which is the bound that actually matters there.
+   */
+  httpTimeoutMs?: number;
   /**
    * Extra fingerprint components, merged over the ones the SDK collects.
    *
@@ -1339,16 +1377,47 @@ export class TalosClient {
     return this.request("POST", path, body);
   }
 
+  /**
+   * The abort signal for one licensing call, or `undefined` when disabled.
+   *
+   * A fresh one per request rather than one shared: `AbortSignal.timeout`
+   * starts counting when it is created, so a signal made once in the
+   * constructor would already have fired by the second call.
+   */
+  private timeoutSignal(): AbortSignal | undefined {
+    const ms = this.options.httpTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
+    if (!ms || ms <= 0) return undefined;
+    // Present since Node 17.3. Guarded rather than assumed because `fetch` may
+    // be injected in a runtime that has one and not the other, and a missing
+    // timeout is better than a crash on the launch path.
+    return typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(ms) : undefined;
+  }
+
   private async request(
     method: string,
     path: string,
     body: unknown,
   ): Promise<Record<string, unknown>> {
-    const res = await this.doFetch(this.options.serverUrl.replace(/\/+$/, "") + path, {
-      method,
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    let res: FetchResponseLike;
+    try {
+      res = await this.doFetch(this.options.serverUrl.replace(/\/+$/, "") + path, {
+        method,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: this.timeoutSignal(),
+      });
+    } catch (e) {
+      // An abort is a network failure, not a licensing verdict, and it has to
+      // read as one: `validate` turns a network failure into the grace-period
+      // path, and an unrecognised exception type there would take the
+      // application down instead of letting it keep running offline.
+      if (e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError")) {
+        throw new TalosError(
+          `request timed out after ${this.options.httpTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS}ms`,
+        );
+      }
+      throw e;
+    }
     const text = await res.text();
     if (res.status < 200 || res.status >= 300) {
       let errorCode: string | undefined;

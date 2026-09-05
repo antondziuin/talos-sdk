@@ -29,6 +29,27 @@ if (talos.IsFeatureEnabled("pdf-export")) EnablePdfMenu();
 int seats = (int)(talos.Current!.GetEntitlementInt("seats") ?? 1);
 ```
 
+## Licensing calls have a deadline
+
+`TalosOptions.HttpTimeoutMs` (default 10000, `0` disables) bounds every
+licensing call. `HttpClient`'s own default is 100 seconds, which is a very long
+time to hold a splash screen on the one code path a user cannot skip — and
+setting `HttpClient.Timeout` instead is not an option when the client is shared,
+because it belongs to you and would change every other request your application
+makes.
+
+A timeout surfaces as a `TalosException` rather than an
+`OperationCanceledException`, deliberately: `ValidateAsync` treats network
+failure as the grace-period case, and a cancellation arriving there would stop
+the application instead of letting it keep running offline. Your *own*
+cancellation still arrives as an `OperationCanceledException` — the two are told
+apart by whose token was signalled.
+
+It does **not** cap `DownloadUpdateAsync`, for the same reason it does not in
+the Node SDK: a total-duration limit on a multi-megabyte artifact is a size
+limit disguised as a safeguard. That one is bounded by the signed manifest's
+size.
+
 ## The machine binding is persistent
 
 `ActivateAsync` binds this machine and the SDK writes that binding to a

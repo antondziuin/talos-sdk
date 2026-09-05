@@ -65,6 +65,30 @@ namespace Talos.Sdk
         public HttpClient? HttpClient { get; set; }
 
         /// <summary>
+        /// How long a licensing call may take before it is abandoned, in
+        /// milliseconds. Default 10000; <c>0</c> disables it.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <c>HttpClient</c>'s own default is 100 seconds, which is a very long
+        /// time to hold a splash screen on the one code path a user cannot
+        /// skip. Setting <c>HttpClient.Timeout</c> instead was the alternative,
+        /// and it is not available when the client is shared: a
+        /// caller-supplied one belongs to the caller, and reaching into it
+        /// would change the timeout of every other request their application
+        /// makes.
+        /// </para>
+        /// <para>
+        /// It does <b>not</b> apply to <c>DownloadUpdateAsync</c>. A
+        /// total-duration cap on a multi-megabyte artifact is a size limit
+        /// disguised as a safeguard — the same thirty seconds that is generous
+        /// for a licensing call fails every download on a slow connection. That
+        /// one is bounded by the manifest's signed size instead.
+        /// </para>
+        /// </remarks>
+        public int? HttpTimeoutMs { get; set; }
+
+        /// <summary>
         /// Extra fingerprint components, merged over the ones the SDK collects.
         /// Use this where the BCL cannot reach the hardware (notably macOS, and
         /// Unity/mobile hosts) and your app can: supply e.g.
@@ -1424,6 +1448,16 @@ namespace Talos.Sdk
         private Task<JsonDocument> PostAsync(string path, object body, CancellationToken ct)
             => SendAsync(HttpMethod.Post, path, body, ct);
 
+        /// <summary>
+        /// Default cap on a licensing call, in milliseconds.
+        /// </summary>
+        /// <remarks>
+        /// Ten seconds: long enough that a slow network is not mistaken for a
+        /// dead one, short enough that an application blocked on it still
+        /// starts. <c>HttpClient</c>'s own default is 100 seconds.
+        /// </remarks>
+        private const int DefaultHttpTimeoutMs = 10_000;
+
         private async Task<JsonDocument> SendAsync(
             HttpMethod method, string path, object body, CancellationToken ct)
         {
@@ -1432,12 +1466,38 @@ namespace Talos.Sdk
             {
                 Content = new StringContent(json, Encoding.UTF8, "application/json"),
             };
-            using var resp = await _http.SendAsync(req, ct).ConfigureAwait(false);
-            string text = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
-            if (!resp.IsSuccessStatusCode)
+            // A linked source rather than `HttpClient.Timeout`, because a
+            // supplied client belongs to the caller and this must not change
+            // the timeout of every other request their application makes.
+            int ms = _options.HttpTimeoutMs ?? DefaultHttpTimeoutMs;
+            using var timeout = ms > 0
+                ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+                : null;
+            timeout?.CancelAfter(ms);
+            var token = timeout?.Token ?? ct;
+            HttpResponseMessage resp;
+            try
+            {
+                resp = await _http.SendAsync(req, token).ConfigureAwait(false);
+            }
+            // Our timeout, not the caller's cancellation — the caller's token is
+            // still unsignalled. It has to surface as a Talos exception rather
+            // than a cancellation, because `ValidateAsync` turns a network
+            // failure into the grace-period path and an OperationCanceledException
+            // there would take the application down instead of letting it keep
+            // running offline.
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                throw new TalosException($"request timed out after {ms}ms");
+            }
+            // Disposed here rather than by a `using` on the assignment, because
+            // the send is inside a try that has to name the exception it catches.
+            using var response = resp;
+            string text = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
             {
                 string? err = TryReadError(text);
-                throw new TalosApiException((int)resp.StatusCode, err);
+                throw new TalosApiException((int)response.StatusCode, err);
             }
             return string.IsNullOrEmpty(text) ? JsonDocument.Parse("{}") : JsonDocument.Parse(text);
         }
