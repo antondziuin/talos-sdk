@@ -782,6 +782,12 @@ export class TalosClient {
         fingerprint: { composite: this.fingerprint, components: this.fp.components },
         activation_secret: this.activationSecret,
         nonce,
+        // Sent here as well as on activation and heartbeat, because check-ins
+        // are opt-in and this call is not: an application that validates on
+        // launch and never calls `startCheckIns` would otherwise show, forever,
+        // whatever version it activated on.
+        app_version: this.options.appVersion,
+        sdk_version: SDK_ID,
       });
       const token = body["validation_token"] as string;
       const claims = verifyToken(

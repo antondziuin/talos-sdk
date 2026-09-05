@@ -711,6 +711,12 @@ namespace Talos.Sdk
                     fingerprint = new { composite = _fingerprint, components = _fp.Components },
                     activation_secret = _activationSecret,
                     nonce,
+                    // Sent here as well as on activation and heartbeat, because
+                    // check-ins are opt-in and this call is not: an application
+                    // that validates on launch and never starts them would
+                    // otherwise show, forever, whatever version it activated on.
+                    app_version = _options.AppVersion,
+                    sdk_version = SdkVersion.Id,
                 };
                 using var doc = await PostAsync("/v1/client/validate", body, ct).ConfigureAwait(false);
                 string token = doc.RootElement.GetProperty("validation_token").GetString()!;
