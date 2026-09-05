@@ -39,12 +39,21 @@ namespace Talos.Sdk
             if (non != expectedNonce)
                 throw new TalosSignatureException("nonce mismatch (possible replay)");
 
+            // Required, not "checked if present". Every live token the server
+            // mints carries both, so a token without them did not come from a
+            // server that knows what it is doing — and treating a missing
+            // `exp` as "no expiry" turns one server-side omission into a
+            // verdict that is valid forever on every install in the field.
+            // Cached tokens are a different path (see VerifyCached), where
+            // `exp` deliberately does not apply.
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            if (claims.TryGetProperty("nbf", out var nbf) && nbf.ValueKind == JsonValueKind.Number
-                && now + ClockSkewSeconds < nbf.GetInt64())
+            if (!claims.TryGetProperty("nbf", out var nbf) || nbf.ValueKind != JsonValueKind.Number)
+                throw new TalosSignatureException("token has no nbf");
+            if (now + ClockSkewSeconds < nbf.GetInt64())
                 throw new TalosSignatureException("token not yet valid");
-            if (claims.TryGetProperty("exp", out var exp) && exp.ValueKind == JsonValueKind.Number
-                && now - ClockSkewSeconds > exp.GetInt64())
+            if (!claims.TryGetProperty("exp", out var exp) || exp.ValueKind != JsonValueKind.Number)
+                throw new TalosSignatureException("token has no exp");
+            if (now - ClockSkewSeconds > exp.GetInt64())
                 throw new TalosSignatureException("token expired");
 
             return claims;

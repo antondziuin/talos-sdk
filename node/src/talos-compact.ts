@@ -68,13 +68,21 @@ export function verifyToken(
   if (claims["non"] !== expectedNonce) {
     throw new TalosSignatureError("nonce mismatch (possible replay)");
   }
+  // Required, not "checked if present". Every live token the server mints
+  // carries both, so a token without them did not come from a server that
+  // knows what it is doing — and treating a missing `exp` as "no expiry" turns
+  // one server-side omission into a verdict that is valid forever on every
+  // install in the field. Cached tokens are a different path (see
+  // `verifyCachedToken`), where `exp` deliberately does not apply.
   const now = Math.floor(Date.now() / 1000);
   const nbf = claims["nbf"];
-  if (typeof nbf === "number" && now + CLOCK_SKEW_SECONDS < nbf) {
+  if (typeof nbf !== "number") throw new TalosSignatureError("token has no nbf");
+  if (now + CLOCK_SKEW_SECONDS < nbf) {
     throw new TalosSignatureError("token not yet valid");
   }
   const exp = claims["exp"];
-  if (typeof exp === "number" && now - CLOCK_SKEW_SECONDS > exp) {
+  if (typeof exp !== "number") throw new TalosSignatureError("token has no exp");
+  if (now - CLOCK_SKEW_SECONDS > exp) {
     throw new TalosSignatureError("token expired");
   }
   return claims;

@@ -87,5 +87,64 @@ namespace Talos.Sdk.Tests
             Assert.Throws<TalosSignatureException>(() =>
                 TalosCompact.Verify(pub, "activation", "prod_x", "n1", forged));
         }
+        /// <summary>
+        /// <c>nbf</c>/<c>exp</c>, which §4 requires the SDK to check and which
+        /// nothing tested.
+        /// <para>
+        /// The signature is not what these are about: nobody mints these tokens
+        /// without the pinned key. They are about a <i>server</i> that emits a
+        /// token with no expiry, and a client whose clock has run past one. The
+        /// first is a bug that would otherwise produce a verdict valid forever
+        /// on every install that received it; the second is the ordinary case
+        /// the window exists for.
+        /// </para>
+        /// </summary>
+        private static void ExpectRefused(byte[] pub, Ed25519PrivateKeyParameters priv, string claims)
+        {
+            string token = Mint(priv, "validation", claims);
+            Assert.Throws<TalosSignatureException>(
+                () => TalosCompact.Verify(pub, "validation", "prod_x", "n1", token));
+        }
+
+        private static void ExpectAccepted(byte[] pub, Ed25519PrivateKeyParameters priv, string claims)
+        {
+            string token = Mint(priv, "validation", claims);
+            TalosCompact.Verify(pub, "validation", "prod_x", "n1", token);
+        }
+
+        private static string Claims(string extra) =>
+            "{\"aud\":\"prod_x\",\"non\":\"n1\"," + extra + "}";
+
+        [Fact]
+        public void Rejects_Expired_And_Not_Yet_Valid_Tokens()
+        {
+            var (pub, priv) = Keypair();
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            ExpectRefused(pub, priv, Claims($"\"nbf\":{now - 600},\"exp\":{now - 120}"));
+            ExpectRefused(pub, priv, Claims($"\"nbf\":{now + 600},\"exp\":{now + 1200}"));
+
+            // A minute of skew in either direction is tolerated: a desktop 30
+            // seconds off is the ordinary state of an unsynchronised machine,
+            // and refusing it would report a licensing failure for a clock
+            // nobody noticed.
+            ExpectAccepted(pub, priv, Claims($"\"nbf\":{now - 600},\"exp\":{now - 30}"));
+            ExpectAccepted(pub, priv, Claims($"\"nbf\":{now + 30},\"exp\":{now + 600}"));
+        }
+
+        [Fact]
+        public void Refuses_A_Token_That_Carries_No_Expiry()
+        {
+            var (pub, priv) = Keypair();
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            // Signed by the right key, and still refused: a missing `exp` used
+            // to read as "no expiry", so one server-side omission would have
+            // been a verdict that never went stale anywhere it landed.
+            ExpectRefused(pub, priv, Claims($"\"nbf\":{now - 10}"));
+            ExpectRefused(pub, priv, Claims($"\"exp\":{now + 600}"));
+            ExpectRefused(pub, priv, Claims("\"nbf\":\"soon\",\"exp\":\"later\""));
+        }
+
     }
 }
