@@ -68,6 +68,39 @@ namespace Talos.Sdk
         /// </para>
         /// </summary>
         public long TimeHighWater { get; set; }
+
+        /// <summary>
+        /// The highest <c>release_seq</c> this install is known to be running,
+        /// and the floor <c>CheckForUpdateAsync</c> refuses to go below.
+        /// <para>
+        /// Anti-downgrade only works against a mark that outlives the process,
+        /// and until this existed there was none: the floor came entirely from
+        /// <c>CurrentReleaseSeq</c>, which the host had to compute and pass, and
+        /// which no example passed. <c>docs/SECURITY.md</c> described a
+        /// high-water mark that did not exist, so "yanking a release does not
+        /// recall it from installs that already applied it" rested on the host
+        /// having implemented the mark itself.
+        /// </para>
+        /// </summary>
+        public long ReleaseSeqHighWater { get; set; }
+
+        /// <summary>
+        /// A release whose bytes were downloaded and verified but which is not
+        /// running yet: the version string from its signed manifest, and its
+        /// <c>release_seq</c>. Null when there is none pending.
+        /// <para>
+        /// The SDK downloads; the host installs, in its own way, on its own
+        /// schedule, usually after a restart. So "installed" is not an event the
+        /// SDK can see — but the result is, because the host tells it which
+        /// version it is on every time a client is constructed. When
+        /// <c>AppVersion</c> matches what was downloaded, the download became an
+        /// install and the mark advances.
+        /// </para>
+        /// </summary>
+        public string? PendingVersion { get; set; }
+
+        /// <summary>The <c>release_seq</c> of <see cref="PendingVersion"/>.</summary>
+        public long PendingReleaseSeq { get; set; }
     }
 
     /// <summary>Reads and writes one product's machine binding.</summary>
@@ -190,6 +223,21 @@ namespace Talos.Sdk
                         && hw.ValueKind == JsonValueKind.Number
                             ? hw.GetInt64()
                             : 0,
+                    ReleaseSeqHighWater =
+                        root.TryGetProperty("releaseSeqHighWater", out var rw)
+                        && rw.ValueKind == JsonValueKind.Number
+                            ? rw.GetInt64()
+                            : 0,
+                    // Read field by field rather than trusted wholesale: this
+                    // file is on a disk the user owns, so every value out of it
+                    // is input, and a pending release missing half of itself
+                    // must not become a floor.
+                    PendingVersion = Str(root, "pendingVersion") is { Length: > 0 } pv ? pv : null,
+                    PendingReleaseSeq =
+                        root.TryGetProperty("pendingReleaseSeq", out var pr)
+                        && pr.ValueKind == JsonValueKind.Number
+                            ? pr.GetInt64()
+                            : 0,
                 };
                 return b.LicenseKey.Length > 0 && b.ActivationSecret.Length > 0 ? b : null;
             }
@@ -218,6 +266,9 @@ namespace Talos.Sdk
                     keyset = b.Keyset,
                     validation = b.Validation,
                     timeHighWater = b.TimeHighWater,
+                    releaseSeqHighWater = b.ReleaseSeqHighWater,
+                    pendingVersion = b.PendingVersion,
+                    pendingReleaseSeq = b.PendingReleaseSeq,
                 });
                 var iv = new byte[IvLen];
                 using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(iv);

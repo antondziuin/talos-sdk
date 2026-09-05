@@ -261,7 +261,14 @@ export interface CheckInOptions {
 export interface CheckForUpdateOptions {
   /** Currently installed version (informational). */
   currentVersion?: string;
-  /** Installed manifest `release_seq` high-water mark (anti-downgrade). */
+  /**
+   * Override the anti-downgrade floor for this call.
+   *
+   * Optional, and normally omitted: the SDK persists the highest `release_seq`
+   * it has seen this install running and uses that. Pass one when the host
+   * knows something the SDK cannot — a build installed by a package manager, or
+   * a first run after adopting the SDK on an already-updated fleet.
+   */
   currentReleaseSeq?: number;
   /** Update channel; defaults to `stable`. */
   channel?: string;
@@ -428,7 +435,42 @@ export class TalosClient {
           // startup failure: fall back to fetching one.
         }
       }
+      this.promoteDownloadedRelease();
     }
+  }
+
+  /**
+   * A release that was downloaded and is now the version running: promote its
+   * `release_seq` to the anti-downgrade mark.
+   *
+   * This is the whole of "the SDK knows what is installed". The SDK downloads
+   * and verifies bytes; the host installs them, its own way, usually across a
+   * restart — so installation is not an event the SDK can observe. What it can
+   * observe is the result, because `appVersion` is the host saying which
+   * version it is. When that equals the version whose bytes were fetched, the
+   * download became an install.
+   *
+   * Only forward, and that is the point: yanking a release or lowering its
+   * rollout stops it being *offered*, and must not walk an install that already
+   * applied it back onto an older build.
+   */
+  private promoteDownloadedRelease(): void {
+    const pending = this.binding?.pendingRelease;
+    if (!pending || pending.version !== this.options.appVersion) return;
+    const mark = Math.max(this.binding?.releaseSeqHighWater ?? 0, pending.releaseSeq);
+    this.persist({ releaseSeqHighWater: mark, pendingRelease: undefined });
+  }
+
+  /**
+   * The `release_seq` no update may go at or below.
+   *
+   * The host's explicit value wins when it gives one — it knows things the SDK
+   * cannot, such as a build installed by a package manager — and the persisted
+   * mark is the default that makes anti-downgrade work for the hosts that give
+   * nothing, which is every example and most applications.
+   */
+  private releaseFloor(explicit?: number): number | undefined {
+    return explicit ?? this.binding?.releaseSeqHighWater;
   }
 
   /**
@@ -1058,8 +1100,12 @@ export class TalosClient {
   /**
    * Ask whether a newer release is available. Returns a verified {@link UpdateInfo}
    * (all metadata comes from the manifest signed by the pinned release key), or
-   * `null` when up to date. Enforces anti-downgrade: a manifest whose
-   * `release_seq` is at or below `currentReleaseSeq` is rejected as no update.
+   * `null` when up to date.
+   *
+   * Enforces anti-downgrade: a manifest whose `release_seq` is at or below the
+   * floor is rejected as no update. The floor is the persisted high-water mark
+   * — the highest `release_seq` this install has been seen running — unless
+   * {@link CheckForUpdateOptions.currentReleaseSeq} overrides it.
    */
   async checkForUpdate(opts: CheckForUpdateOptions = {}): Promise<UpdateInfo | null> {
     this.requireActivated();
@@ -1070,7 +1116,7 @@ export class TalosClient {
       fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       current_version: opts.currentVersion ?? this.options.appVersion,
-      current_release_seq: opts.currentReleaseSeq,
+      current_release_seq: this.releaseFloor(opts.currentReleaseSeq),
       channel: opts.channel,
     });
     if (body["update_available"] !== true) return null;
@@ -1082,8 +1128,12 @@ export class TalosClient {
     // Trust only the signed manifest for version/seq/artifact metadata.
     const m = verifyManifest(this.releaseVerifyKeys(), this.options.productToken, manifestToken);
     const releaseSeq = typeof m["release_seq"] === "number" ? (m["release_seq"] as number) : 0;
-    if (opts.currentReleaseSeq !== undefined && releaseSeq <= opts.currentReleaseSeq) {
-      return null; // anti-downgrade: never surface an older-or-equal manifest.
+    const floor = this.releaseFloor(opts.currentReleaseSeq);
+    if (floor !== undefined && releaseSeq <= floor) {
+      // Anti-downgrade, checked here as well as on the server: the server's
+      // answer is the one an attacker replaces, and this one is checked against
+      // a mark on this machine and a manifest signed by the pinned key.
+      return null;
     }
 
     // Untrusted transport map: platform/arch/kind → download path.
@@ -1200,6 +1250,7 @@ export class TalosClient {
     const chosen = opts.delta ?? this.selectDelta(info, opts);
     if (!chosen) throw new TalosError("no patch applies to this install");
     await this.fetchVerified(chosen.downloadPath, chosen.size, chosen.sha256, destPath);
+    this.rememberDownloaded(info);
     return chosen;
   }
 
@@ -1218,7 +1269,22 @@ export class TalosClient {
     const chosen = artifact ?? pickArtifact(info.artifacts);
     if (!chosen) throw new TalosError("no artifact matches this platform");
     await this.fetchVerified(chosen.downloadPath, chosen.size, chosen.sha256, destPath);
+    this.rememberDownloaded(info);
     return chosen;
+  }
+
+  /**
+   * Note which release's bytes are now on disk, so the next start can tell
+   * whether they were installed.
+   *
+   * Written after the hash check, never before: a download that failed
+   * verification is not a release this install is about to be running, and
+   * recording it would let a corrupt or substituted file raise the
+   * anti-downgrade floor past a good build.
+   */
+  private rememberDownloaded(info: UpdateInfo): void {
+    if (info.releaseSeq <= (this.binding?.releaseSeqHighWater ?? 0)) return;
+    this.persist({ pendingRelease: { version: info.version, releaseSeq: info.releaseSeq } });
   }
 
   /**

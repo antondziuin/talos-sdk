@@ -53,6 +53,34 @@ export interface StoredBinding {
    * snapshot restore, which is the case that matters.
    */
   timeHighWater?: number;
+  /**
+   * The highest `release_seq` this install is known to be running, and the
+   * floor `checkForUpdate` refuses to go below.
+   *
+   * Anti-downgrade only works against a mark that outlives the process, and
+   * until this existed there was none: the floor came entirely from
+   * `currentReleaseSeq`, which the host had to compute and pass, and which no
+   * example passed. `docs/SECURITY.md` described a high-water mark that did not
+   * exist, so "yanking a release does not recall it from installs that already
+   * applied it" rested on the host having implemented the mark itself.
+   */
+  releaseSeqHighWater?: number;
+  /**
+   * A release whose bytes were downloaded and verified but which is not
+   * running yet: the version string from its signed manifest, and its
+   * `release_seq`.
+   *
+   * The SDK downloads; the host installs, in its own way, on its own schedule,
+   * usually after a restart. So "installed" is not an event the SDK can see —
+   * but the *result* is, because the host tells it which version it is on every
+   * time a client is constructed. When `appVersion` matches what was downloaded,
+   * the download became an install and the mark advances.
+   *
+   * The alternative was a `markInstalled()` for the host to call, and the whole
+   * defect here is a mark that depended on the host doing something nobody
+   * documented and no example did.
+   */
+  pendingRelease?: { version: string; releaseSeq: number };
 }
 
 const MAGIC = Buffer.from("TLS1");
@@ -168,6 +196,21 @@ export class StateStore {
       if (typeof o["keyset"] === "string") b.keyset = o["keyset"];
       if (typeof o["validation"] === "string") b.validation = o["validation"];
       if (typeof o["timeHighWater"] === "number") b.timeHighWater = o["timeHighWater"];
+      if (typeof o["releaseSeqHighWater"] === "number") {
+        b.releaseSeqHighWater = o["releaseSeqHighWater"];
+      }
+      // Read field by field rather than trusted wholesale: this file is on a
+      // disk the user owns, so every value out of it is input. A `pendingRelease`
+      // with a string where a number belongs would make the anti-downgrade
+      // comparison silently lexicographic.
+      const pending = o["pendingRelease"] as Record<string, unknown> | undefined;
+      if (
+        pending &&
+        typeof pending["version"] === "string" &&
+        typeof pending["releaseSeq"] === "number"
+      ) {
+        b.pendingRelease = { version: pending["version"], releaseSeq: pending["releaseSeq"] };
+      }
       return b.licenseKey && b.activationSecret ? b : null;
     } catch {
       return null;

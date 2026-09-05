@@ -219,7 +219,7 @@ const talos = new TalosClient({
 });
 await talos.activate(licenseKey);
 
-const upd = await talos.checkForUpdate({ currentVersion: "1.0.0", currentReleaseSeq: 41 });
+const upd = await talos.checkForUpdate();
 if (upd) {
   // `upd` is built from a manifest signed by the pinned release key. Metadata
   // (version, sha256, size, filename) is trusted; the download URL is not.
@@ -229,10 +229,20 @@ if (upd) {
 }
 ```
 
-The manifest carries a monotonic `releaseSeq`; pass your installed high-water
-mark as `currentReleaseSeq` and the SDK refuses to surface an older-or-equal
-release (**anti-downgrade**). Downloaded bytes are verified against the signed
-manifest's SHA-256, so the CDN/mirror serving them is untrusted infrastructure.
+The manifest carries a monotonic `releaseSeq`, and the SDK refuses to surface a
+release at or below the highest one this install has been seen running
+(**anti-downgrade**). It keeps that mark itself, in the state file: when
+`downloadUpdate` fetches a release, the version is remembered, and the next time
+a client is constructed with `appVersion` equal to it the mark moves up. So a
+server that offers an older build — a rollback, a stale replica, or somebody in
+the middle — is answered with `null` and nothing else is needed from you.
+
+Pass `currentReleaseSeq` only when you know something the SDK cannot: a build
+installed by a package manager, or a first run after adopting the SDK on a fleet
+that is already updated.
+
+Downloaded bytes are verified against the signed manifest's SHA-256, so the
+CDN/mirror serving them is untrusted infrastructure.
 
 ## Tests
 

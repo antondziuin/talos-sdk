@@ -102,7 +102,16 @@ namespace Talos.Sdk
         /// <summary>Currently installed version (informational).</summary>
         public string? CurrentVersion { get; set; }
 
-        /// <summary>Installed manifest <c>release_seq</c> high-water mark (anti-downgrade).</summary>
+        /// <summary>
+        /// Override the anti-downgrade floor for this call.
+        /// <para>
+        /// Optional, and normally omitted: the SDK persists the highest
+        /// <c>release_seq</c> it has seen this install running and uses that.
+        /// Set it when the host knows something the SDK cannot — a build
+        /// installed by a package manager, or a first run after adopting the SDK
+        /// on an already-updated fleet.
+        /// </para>
+        /// </summary>
         public long? CurrentReleaseSeq { get; set; }
 
         /// <summary>Update channel; defaults to <c>stable</c>.</summary>

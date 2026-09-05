@@ -225,7 +225,75 @@ namespace Talos.Sdk
                         // anchor is not a startup failure: fetch a fresh one.
                     }
                 }
+
+                PromoteDownloadedRelease();
             }
+        }
+
+        /// <summary>
+        /// A release that was downloaded and is now the version running:
+        /// promote its <c>release_seq</c> to the anti-downgrade mark.
+        /// </summary>
+        /// <remarks>
+        /// This is the whole of "the SDK knows what is installed". The SDK
+        /// downloads and verifies bytes; the host installs them, its own way,
+        /// usually across a restart — so installation is not an event the SDK
+        /// can observe. What it can observe is the result, because
+        /// <c>AppVersion</c> is the host saying which version it is. When that
+        /// equals the version whose bytes were fetched, the download became an
+        /// install. Only forward: yanking a release stops it being offered and
+        /// must not walk an install that already applied it back onto an older
+        /// build.
+        /// </remarks>
+        private void PromoteDownloadedRelease()
+        {
+            if (_binding == null) return;
+            if (string.IsNullOrEmpty(_binding.PendingVersion)) return;
+            if (_binding.PendingVersion != _options.AppVersion) return;
+            long mark = Math.Max(_binding.ReleaseSeqHighWater, _binding.PendingReleaseSeq);
+            Persist(b =>
+            {
+                b.ReleaseSeqHighWater = mark;
+                b.PendingVersion = null;
+                b.PendingReleaseSeq = 0;
+            });
+        }
+
+        /// <summary>
+        /// The <c>release_seq</c> no update may go at or below.
+        /// </summary>
+        /// <remarks>
+        /// The host's explicit value wins when it gives one — it knows things
+        /// the SDK cannot, such as a build installed by a package manager — and
+        /// the persisted mark is the default that makes anti-downgrade work for
+        /// the hosts that give nothing, which is every example and most
+        /// applications.
+        /// </remarks>
+        private long? ReleaseFloor(long? explicitSeq)
+        {
+            if (explicitSeq is long given) return given;
+            long mark = _binding?.ReleaseSeqHighWater ?? 0;
+            return mark > 0 ? mark : null;
+        }
+
+        /// <summary>
+        /// Note which release's bytes are now on disk, so the next start can
+        /// tell whether they were installed.
+        /// </summary>
+        /// <remarks>
+        /// Called after the hash check, never before: a download that failed
+        /// verification is not a release this install is about to be running,
+        /// and recording it would let a corrupt or substituted file raise the
+        /// anti-downgrade floor past a good build.
+        /// </remarks>
+        private void RememberDownloaded(UpdateInfo info)
+        {
+            if (info.ReleaseSeq <= (_binding?.ReleaseSeqHighWater ?? 0)) return;
+            Persist(b =>
+            {
+                b.PendingVersion = info.Version;
+                b.PendingReleaseSeq = info.ReleaseSeq;
+            });
         }
 
         /// <summary>
@@ -1000,7 +1068,7 @@ namespace Talos.Sdk
                 fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
                 current_version = opts.CurrentVersion ?? _options.AppVersion,
-                current_release_seq = opts.CurrentReleaseSeq,
+                current_release_seq = ReleaseFloor(opts.CurrentReleaseSeq),
                 channel = opts.Channel,
             };
             using var doc = await PostAsync("/v1/client/updates/check", body, ct).ConfigureAwait(false);
@@ -1015,7 +1083,11 @@ namespace Talos.Sdk
 
             long releaseSeq = m.TryGetProperty("release_seq", out var rs) && rs.ValueKind == JsonValueKind.Number
                 ? rs.GetInt64() : 0;
-            if (opts.CurrentReleaseSeq is long cur && releaseSeq <= cur)
+            // Anti-downgrade, checked here as well as on the server: the
+            // server's answer is the one an attacker replaces, and this one is
+            // checked against a mark on this machine and a manifest signed by
+            // the pinned key.
+            if (ReleaseFloor(opts.CurrentReleaseSeq) is long cur && releaseSeq <= cur)
                 return null; // anti-downgrade: never surface an older-or-equal manifest.
 
             // Untrusted transport map: platform/arch/kind → download path.
@@ -1159,6 +1231,7 @@ namespace Talos.Sdk
             if (chosen == null) throw new TalosException("no patch applies to this install");
             await FetchVerifiedAsync(chosen.DownloadPath, chosen.Size, chosen.Sha256, destPath, ct)
                 .ConfigureAwait(false);
+            RememberDownloaded(info);
             return chosen;
         }
 
@@ -1209,6 +1282,7 @@ namespace Talos.Sdk
             if (chosen == null) throw new TalosException("no artifact matches this platform");
             await FetchVerifiedAsync(chosen.DownloadPath, chosen.Size, chosen.Sha256, destPath, ct)
                 .ConfigureAwait(false);
+            RememberDownloaded(info);
             return chosen;
         }
 
