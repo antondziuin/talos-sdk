@@ -7,6 +7,7 @@ Ed25519 verification via BouncyCastle (pure managed — no native binaries).
 ## Quickstart
 
 ```csharp
+using System.Text.Json;
 using Talos.Sdk;
 
 // `using`: the client disposes the HttpClient it created for itself. Supply
@@ -27,6 +28,10 @@ if (!state.IsValid) { /* prompt for a valid key */ }
 
 if (talos.IsFeatureEnabled("pdf-export")) EnablePdfMenu();
 int seats = (int)(talos.Current!.GetEntitlementInt("seats") ?? 1);
+string tier = talos.Current!.GetEntitlementString("tier") ?? "standard";
+// Anything the SDK did not anticipate — a list, an object — comes back as the
+// JsonElement it arrived as, rather than as a TryGetProperty call to write.
+JsonElement? modules = talos.Current!.GetEntitlement("modules");
 ```
 
 ## Licensing calls have a deadline
