@@ -96,6 +96,36 @@ namespace Talos.Sdk
         public IReadOnlyList<UpdateDelta> Deltas { get; internal set; } = new List<UpdateDelta>();
     }
 
+    /// <summary>
+    /// How far a download has got, reported to the <c>IProgress</c> handed to
+    /// <see cref="TalosClient.DownloadUpdateAsync"/> or
+    /// <see cref="TalosClient.DownloadDeltaAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="TotalBytes"/> is the size the <b>signed manifest</b> names, not
+    /// the server's <c>Content-Length</c>. The download host is untrusted, and a
+    /// bar driven by a header it controls can be parked at 100% while bytes are
+    /// still arriving. It is also the cap the read is bounded by, so
+    /// <see cref="BytesReceived"/> never exceeds it.
+    /// </remarks>
+    public readonly struct DownloadProgress
+    {
+        public DownloadProgress(long bytesReceived, long totalBytes)
+        {
+            BytesReceived = bytesReceived;
+            TotalBytes = totalBytes;
+        }
+
+        /// <summary>Bytes verified and written so far.</summary>
+        public long BytesReceived { get; }
+
+        /// <summary>Total size, in bytes, from the signed manifest.</summary>
+        public long TotalBytes { get; }
+
+        /// <summary>Fraction complete, 0.0-1.0 (0 when the manifest names no size).</summary>
+        public double Fraction => TotalBytes > 0 ? (double)BytesReceived / TotalBytes : 0d;
+    }
+
     /// <summary>Options for <see cref="TalosClient.CheckForUpdateAsync"/>.</summary>
     public sealed class CheckForUpdateOptions
     {

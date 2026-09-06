@@ -264,10 +264,20 @@ if (upd) {
   // `upd` is built from a manifest signed by the pinned release key. Metadata
   // (version, sha256, size, filename) is trusted; the download URL is not.
   const dest = `/tmp/${upd.artifacts[0].filename}`;
-  await talos.downloadUpdate(upd, dest, upd.artifacts[0]); // verifies SHA-256, does NOT apply
+  await talos.downloadUpdate(upd, dest, upd.artifacts[0], ({ bytesReceived, totalBytes }) => {
+    showProgress(bytesReceived / totalBytes); // optional; called as the bytes arrive
+  });
   // Hand `dest` to your installer / electron-updater. Applying is the app's job.
 }
 ```
+
+The bytes stream to a `.talos-part` file beside the destination, hashed as they
+arrive, and are renamed into place only once the hash matches — so a
+multi-gigabyte installer is never held in memory, and a download that fails
+verification leaves whatever was at `dest` before rather than a truncated file
+your updater might run. `totalBytes` is the signed manifest's size, never the
+server's `content-length`: a progress bar the download host can drive can be
+parked at 100% while bytes are still arriving.
 
 The manifest carries a monotonic `releaseSeq`, and the SDK refuses to surface a
 release at or below the highest one this install has been seen running

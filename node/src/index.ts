@@ -10,6 +10,8 @@ export {
   type UpdateDelta,
   type UpdateDeltaTarget,
   type DeltaOptions,
+  type DownloadProgress,
+  type DownloadProgressCallback,
   type CheckForUpdateOptions,
   type Lease,
   type AcquireLeaseOptions,

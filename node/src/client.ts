@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { open, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import { type KeyObject } from "node:crypto";
 
@@ -260,6 +260,25 @@ export interface DeltaOptions {
    */
   targetKind?: string;
 }
+
+/**
+ * How far a download has got, passed to the `onProgress` callback of
+ * {@link TalosClient.downloadUpdate} and {@link TalosClient.downloadDelta}.
+ *
+ * `totalBytes` is the size the **signed manifest** names, not the server's
+ * `content-length`. The download host is untrusted, and a bar driven by a header
+ * it controls can be parked at 100% while bytes are still arriving. It is also
+ * the cap the read is bounded by, so `bytesReceived` never exceeds it.
+ */
+export interface DownloadProgress {
+  /** Bytes verified and written so far. */
+  bytesReceived: number;
+  /** Total size, in bytes, from the signed manifest. */
+  totalBytes: number;
+}
+
+/** Called as an artifact download advances. */
+export type DownloadProgressCallback = (progress: DownloadProgress) => void;
 
 /** A held floating seat. Renew before {@link expiresAt} or it is reclaimed. */
 export interface Lease {
@@ -1295,11 +1314,17 @@ export class TalosClient {
   async downloadDelta(
     info: UpdateInfo,
     destPath: string,
-    opts: DeltaOptions & { delta?: UpdateDelta } = {},
+    opts: DeltaOptions & { delta?: UpdateDelta; onProgress?: DownloadProgressCallback } = {},
   ): Promise<UpdateDelta> {
     const chosen = opts.delta ?? this.selectDelta(info, opts);
     if (!chosen) throw new TalosError("no patch applies to this install");
-    await this.fetchVerified(chosen.downloadPath, chosen.size, chosen.sha256, destPath);
+    await this.fetchVerified(
+      chosen.downloadPath,
+      chosen.size,
+      chosen.sha256,
+      destPath,
+      opts.onProgress,
+    );
     this.rememberDownloaded(info);
     return chosen;
   }
@@ -1309,16 +1334,22 @@ export class TalosClient {
    * SHA-256, then write it to `destPath`. Returns the chosen artifact. Does NOT
    * apply or execute anything — verification and installation are the host app's
    * responsibility.
+   *
+   * `onProgress` is called as the bytes arrive, which is the only way a host can
+   * show a bar: an installer takes minutes on a domestic connection, and a
+   * promise that says nothing until it settles is indistinguishable from one that
+   * has hung. Totals come from the signed manifest — see {@link DownloadProgress}.
    */
   async downloadUpdate(
     info: UpdateInfo,
     destPath: string,
     artifact?: UpdateArtifact,
+    onProgress?: DownloadProgressCallback,
   ): Promise<UpdateArtifact> {
     this.requireActivated();
     const chosen = artifact ?? pickArtifact(info.artifacts);
     if (!chosen) throw new TalosError("no artifact matches this platform");
-    await this.fetchVerified(chosen.downloadPath, chosen.size, chosen.sha256, destPath);
+    await this.fetchVerified(chosen.downloadPath, chosen.size, chosen.sha256, destPath, onProgress);
     this.rememberDownloaded(info);
     return chosen;
   }
@@ -1338,16 +1369,26 @@ export class TalosClient {
   }
 
   /**
-   * Fetch one file over the entitled download route and write it only once its
-   * bytes match the size and hash the signed manifest names. Shared by full
-   * builds and patches, which differ in what they are for and not at all in how
-   * their bytes are checked.
+   * Fetch one file over the entitled download route and put it at `destPath`
+   * only once its bytes match the size and hash the signed manifest names.
+   * Shared by full builds and patches, which differ in what they are for and not
+   * at all in how their bytes are checked.
+   *
+   * The bytes go straight to a `.talos-part` file beside the destination, hashed
+   * as they arrive, and are renamed into place only once the hash matches. Two
+   * things follow. A multi-gigabyte installer is never held in memory — the whole
+   * body used to be buffered before it was checked, so the largest artifact a
+   * product could ship was bounded by the smallest machine it ran on. And
+   * `destPath` never holds unverified bytes, not even briefly: a download that
+   * fails leaves whatever was there before rather than a truncated file a host
+   * might run.
    */
   private async fetchVerified(
     downloadPath: string | undefined,
     size: number,
     sha256: string,
     destPath: string,
+    onProgress?: DownloadProgressCallback,
   ): Promise<void> {
     if (!downloadPath) throw new TalosError("artifact has no download path");
     const url = this.options.serverUrl.replace(/\/+$/, "") + downloadPath;
@@ -1364,12 +1405,57 @@ export class TalosClient {
     // The download channel is untrusted (could stream an unbounded body to
     // exhaust memory before the hash check). Cap the read at the manifest's
     // trusted `size`, then verify the SHA-256 from the signed manifest.
-    const bytes = await readCapped(res, size);
-    const actual = createHash("sha256").update(bytes).digest("hex");
-    if (actual !== sha256) {
-      throw new TalosSignatureError("artifact hash mismatch (tampered or wrong bytes)");
+    const contentLength = res.headers?.get("content-length");
+    if (contentLength && Number(contentLength) > size) {
+      throw new TalosSignatureError("artifact exceeds manifest size");
     }
-    await writeFile(destPath, bytes);
+
+    const partPath = destPath + ".talos-part";
+    const handle = await open(partPath, "w");
+    const hash = createHash("sha256");
+    let received = 0;
+    let closed = false;
+    const take = async (chunk: Uint8Array): Promise<void> => {
+      received += chunk.byteLength;
+      if (received > size) throw new TalosSignatureError("artifact exceeds manifest size");
+      hash.update(chunk);
+      await handle.write(chunk);
+      onProgress?.({ bytesReceived: received, totalBytes: size });
+    };
+    try {
+      const body = res.body;
+      if (body) {
+        const reader = body.getReader();
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done || !value) break;
+            await take(value);
+          }
+        } catch (e) {
+          await reader.cancel().catch(() => {});
+          throw e;
+        }
+      } else {
+        // Nothing to meter, so this one arrives whole. The real `fetch` always
+        // has a stream; this is the path an injected implementation takes.
+        await take(new Uint8Array(await res.arrayBuffer()));
+      }
+
+      if (hash.digest("hex") !== sha256) {
+        throw new TalosSignatureError("artifact hash mismatch (tampered or wrong bytes)");
+      }
+      // Closed before the rename: Windows will not move a file that is open.
+      await handle.close();
+      closed = true;
+      await rename(partPath, destPath);
+    } catch (e) {
+      if (!closed) await handle.close().catch(() => {});
+      // A part file left behind is one the next download has to reason about,
+      // and one nobody who finds it in an install directory can.
+      await rm(partPath, { force: true }).catch(() => {});
+      throw e;
+    }
   }
 
   private requireActivated(): void {
@@ -1469,40 +1555,6 @@ function nowSeconds(): number {
 
 function newNonce(): string {
   return b64urlEncode(randomBytes(16));
-}
-
-/**
- * Read a fetch Response body into a Buffer, refusing to buffer more than `cap`
- * bytes (the manifest's trusted size). Guards against an untrusted download host
- * streaming an unbounded body to exhaust memory before the hash check.
- */
-async function readCapped(res: FetchResponseLike, cap: number): Promise<Buffer> {
-  const contentLength = res.headers?.get("content-length");
-  if (contentLength && Number(contentLength) > cap) {
-    throw new TalosSignatureError("artifact exceeds manifest size");
-  }
-  const body = res.body;
-  if (!body) {
-    // No stream to meter, so the cap can only be checked after the read. Real
-    // `fetch` always has one; this is the path a supplied implementation takes.
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > cap) throw new TalosSignatureError("artifact exceeds manifest size");
-    return buf;
-  }
-  const reader = body.getReader();
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done || !value) break;
-    total += value.byteLength;
-    if (total > cap) {
-      await reader.cancel();
-      throw new TalosSignatureError("artifact exceeds manifest size");
-    }
-    chunks.push(Buffer.from(value));
-  }
-  return Buffer.concat(chunks);
 }
 
 function asArray(v: unknown): unknown[] {

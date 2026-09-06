@@ -55,6 +55,18 @@ the Node SDK: a total-duration limit on a multi-megabyte artifact is a size
 limit disguised as a safeguard. That one is bounded by the signed manifest's
 size.
 
+## Downloads stream, and report progress
+
+`DownloadUpdateAsync` and `DownloadDeltaAsync` take an
+`IProgress<DownloadProgress>`, and the bytes stream to a `.talos-part` file
+beside the destination, hashed as they arrive, renamed into place only once the
+hash matches. So a multi-gigabyte installer is never held in memory, a host has
+something to draw for the minutes a download takes, and a download that fails
+verification leaves whatever was at the destination before rather than a
+truncated file an updater might run. `TotalBytes` is the signed manifest's size,
+never the server's `Content-Length` — a bar the download host can drive can be
+parked at 100% while bytes are still arriving.
+
 ## The licence key is not kept
 
 After activation the SDK holds no licence key — not in memory, not in the state

@@ -142,6 +142,12 @@ namespace Talos.Sdk
         /// </summary>
         private const int DefaultHeartbeatSeconds = 600;
 
+        /// <summary>
+        /// Bytes read from an artifact download at a time. 80 KiB, the size
+        /// <c>Stream.CopyTo</c> uses; it also sets how often progress is reported.
+        /// </summary>
+        private const int DownloadBufferBytes = 81920;
+
         private readonly TalosOptions _options;
         private readonly HttpClient _http;
         private readonly byte[]? _anchorKey;
@@ -1256,12 +1262,13 @@ namespace Talos.Sdk
         /// </remarks>
         public async Task<UpdateDelta> DownloadDeltaAsync(
             UpdateInfo info, string destPath, UpdateDelta? delta = null,
-            string? from = null, string? targetKind = null, CancellationToken ct = default)
+            string? from = null, string? targetKind = null,
+            IProgress<DownloadProgress>? progress = null, CancellationToken ct = default)
         {
             RequireActivated();
             UpdateDelta? chosen = delta ?? SelectDelta(info, from, targetKind);
             if (chosen == null) throw new TalosException("no patch applies to this install");
-            await FetchVerifiedAsync(chosen.DownloadPath, chosen.Size, chosen.Sha256, destPath, ct)
+            await FetchVerifiedAsync(chosen.DownloadPath, chosen.Size, chosen.Sha256, destPath, progress, ct)
                 .ConfigureAwait(false);
             RememberDownloaded(info);
             return chosen;
@@ -1288,12 +1295,7 @@ namespace Talos.Sdk
             string actual;
             using (var sha = SHA256.Create())
             using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
-            {
-                byte[] hash = sha.ComputeHash(fs);
-                var sb = new StringBuilder(hash.Length * 2);
-                foreach (byte b in hash) sb.Append(b.ToString("x2"));
-                actual = sb.ToString();
-            }
+                actual = Hex(sha.ComputeHash(fs));
             if (!string.Equals(actual, delta.Target.Sha256, StringComparison.Ordinal))
                 throw new TalosSignatureException(
                     "applied update does not match the signed manifest: expected "
@@ -1306,26 +1308,46 @@ namespace Talos.Sdk
         /// the chosen artifact. Does NOT apply or execute anything — verification
         /// and installation are the host application's responsibility.
         /// </summary>
+        /// <remarks>
+        /// <paramref name="progress"/> is reported as the bytes arrive, which is
+        /// the only way a host can show a bar: an installer takes minutes on a
+        /// domestic connection, and a <c>Task</c> that says nothing until it
+        /// completes is indistinguishable from one that has hung. The totals come
+        /// from the signed manifest — see <see cref="DownloadProgress"/>.
+        /// </remarks>
         public async Task<UpdateArtifact> DownloadUpdateAsync(
-            UpdateInfo info, string destPath, UpdateArtifact? artifact = null, CancellationToken ct = default)
+            UpdateInfo info, string destPath, UpdateArtifact? artifact = null,
+            IProgress<DownloadProgress>? progress = null, CancellationToken ct = default)
         {
             RequireActivated();
             UpdateArtifact? chosen = artifact ?? PickArtifact(info.Artifacts);
             if (chosen == null) throw new TalosException("no artifact matches this platform");
-            await FetchVerifiedAsync(chosen.DownloadPath, chosen.Size, chosen.Sha256, destPath, ct)
+            await FetchVerifiedAsync(chosen.DownloadPath, chosen.Size, chosen.Sha256, destPath, progress, ct)
                 .ConfigureAwait(false);
             RememberDownloaded(info);
             return chosen;
         }
 
         /// <summary>
-        /// Fetch one file over the entitled download route and write it only once
-        /// its bytes match the size and hash the signed manifest names. Shared by
-        /// full builds and patches, which differ in what they are for and not at
-        /// all in how their bytes are checked.
+        /// Fetch one file over the entitled download route and put it at
+        /// <paramref name="destPath"/> only once its bytes match the size and hash
+        /// the signed manifest names. Shared by full builds and patches, which
+        /// differ in what they are for and not at all in how their bytes are
+        /// checked.
         /// </summary>
+        /// <remarks>
+        /// The bytes go straight to a <c>.talos-part</c> file beside the
+        /// destination, hashed as they arrive, and are moved into place only once
+        /// the hash matches. Two things follow. A multi-gigabyte installer is never
+        /// held in memory — the whole body used to be buffered before it was
+        /// checked, so the largest artifact a product could ship was bounded by the
+        /// smallest machine it ran on. And <paramref name="destPath"/> never holds
+        /// unverified bytes, not even briefly: a download that fails leaves
+        /// whatever was there before rather than a truncated file a host might run.
+        /// </remarks>
         private async Task FetchVerifiedAsync(
-            string? downloadPath, long size, string sha256, string destPath, CancellationToken ct)
+            string? downloadPath, long size, string sha256, string destPath,
+            IProgress<DownloadProgress>? progress, CancellationToken ct)
         {
             if (string.IsNullOrEmpty(downloadPath)) throw new TalosException("artifact has no download path");
 
@@ -1343,35 +1365,65 @@ namespace Talos.Sdk
             // trusted Size, then verify the SHA-256 from the signed manifest.
             if (resp.Content.Headers.ContentLength is long cl && cl > size)
                 throw new TalosSignatureException("artifact exceeds manifest size");
-            using var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
-            byte[] bytes = await ReadCappedAsync(stream, size, ct).ConfigureAwait(false);
 
-            string actual = Sha256Hex(bytes);
-            if (!string.Equals(actual, sha256, StringComparison.Ordinal))
-                throw new TalosSignatureException("artifact hash mismatch (tampered or wrong bytes)");
+            string partPath = destPath + ".talos-part";
+            try
+            {
+                using (var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                using (var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+                {
+                    using (var fs = new FileStream(
+                        partPath, FileMode.Create, FileAccess.Write, FileShare.None, DownloadBufferBytes, true))
+                    {
+                        byte[] buf = new byte[DownloadBufferBytes];
+                        long total = 0;
+                        int n;
+                        while ((n = await stream.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false)) > 0)
+                        {
+                            total += n;
+                            if (total > size)
+                                throw new TalosSignatureException("artifact exceeds manifest size");
+                            hasher.AppendData(buf, 0, n);
+                            await fs.WriteAsync(buf, 0, n, ct).ConfigureAwait(false);
+                            progress?.Report(new DownloadProgress(total, size));
+                        }
+                    }
 
+                    string actual = Hex(hasher.GetHashAndReset());
+                    if (!string.Equals(actual, sha256, StringComparison.Ordinal))
+                        throw new TalosSignatureException("artifact hash mismatch (tampered or wrong bytes)");
+                }
+
+                MoveInto(partPath, destPath);
+            }
+            catch
+            {
+                // A part file left behind is one the next download has to reason
+                // about, and one nobody who finds it in an install directory can.
+                TryDelete(partPath);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Put the verified file where the caller asked for it, replacing what is
+        /// there. Its own method because .NET Framework has no overwriting Move.
+        /// </summary>
+        private static void MoveInto(string partPath, string destPath)
+        {
 #if NET5_0_OR_GREATER
-            await File.WriteAllBytesAsync(destPath, bytes, ct).ConfigureAwait(false);
+            File.Move(partPath, destPath, true);
 #else
-            using (var fs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                await fs.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
+            if (File.Exists(destPath)) File.Delete(destPath);
+            File.Move(partPath, destPath);
 #endif
         }
 
-        private static async Task<byte[]> ReadCappedAsync(Stream stream, long cap, CancellationToken ct)
+        private static void TryDelete(string path)
         {
-            using var ms = new MemoryStream();
-            byte[] buf = new byte[81920];
-            long total = 0;
-            int n;
-            while ((n = await stream.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false)) > 0)
-            {
-                total += n;
-                if (total > cap)
-                    throw new TalosSignatureException("artifact exceeds manifest size");
-                ms.Write(buf, 0, n);
-            }
-            return ms.ToArray();
+            try { File.Delete(path); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
 
         private static string? GetStr(JsonElement e, string name) =>
@@ -1401,9 +1453,13 @@ namespace Talos.Sdk
         private static string Sha256Hex(byte[] bytes)
         {
             using var sha = SHA256.Create();
-            byte[] hash = sha.ComputeHash(bytes);
-            var sb = new StringBuilder(hash.Length * 2);
-            foreach (byte b in hash) sb.Append(b.ToString("x2"));
+            return Hex(sha.ComputeHash(bytes));
+        }
+
+        private static string Hex(byte[] bytes)
+        {
+            var sb = new StringBuilder(bytes.Length * 2);
+            foreach (byte b in bytes) sb.Append(b.ToString("x2"));
             return sb.ToString();
         }
 

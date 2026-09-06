@@ -1,5 +1,5 @@
 import { createHash, generateKeyPairSync, type KeyObject } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -59,6 +59,37 @@ function bytesResponse(body: Buffer): FetchResponseLike {
       new Uint8Array(out).set(body);
       return Promise.resolve(out);
     },
+  };
+}
+
+/**
+ * A body that arrives a few bytes at a time, the way a socket delivers one.
+ *
+ * `arrayBuffer` rejects: reaching for it means the whole body was pulled into
+ * memory, which is the thing the streaming path exists to stop.
+ */
+function streamResponse(body: Buffer, chunk = 7): FetchResponseLike & { cancelled: () => boolean } {
+  let pos = 0;
+  let cancelled = false;
+  return {
+    status: 200,
+    text: () => Promise.resolve(body.toString("utf8")),
+    arrayBuffer: () => Promise.reject(new Error("the body should have been streamed")),
+    body: {
+      getReader: () => ({
+        read: () => {
+          if (pos >= body.length) return Promise.resolve({ done: true });
+          const slice = body.subarray(pos, pos + chunk);
+          pos += slice.length;
+          return Promise.resolve({ done: false, value: new Uint8Array(slice) });
+        },
+        cancel: () => {
+          cancelled = true;
+          return Promise.resolve(undefined);
+        },
+      }),
+    },
+    cancelled: () => cancelled,
   };
 }
 
@@ -125,5 +156,88 @@ describe("downloadUpdate", () => {
     await expect(
       seededClient(pubB64, impl).downloadUpdate(info(), dest, artifact()),
     ).rejects.toThrow(/exceeds manifest size/);
+  });
+
+  /**
+   * The download used to buffer the whole body, hash it, and only then write —
+   * correct about the bytes and wrong about everything else. A two-gigabyte
+   * installer asked the smallest machine in the field for two gigabytes of RAM,
+   * and the host had nothing to show a user for the minutes it took: one
+   * promise, no output, indistinguishable from a hang.
+   */
+  it("reports progress while the bytes are still arriving", async () => {
+    const { pubB64 } = keypair();
+    const res = streamResponse(payload);
+    const dest = path.join(mkdtempSync(path.join(os.tmpdir(), "talos-dl-out-")), "app.bin");
+
+    const seen: { bytesReceived: number; totalBytes: number }[] = [];
+    await seededClient(pubB64, () => Promise.resolve(res)).downloadUpdate(
+      info(),
+      dest,
+      artifact(),
+      (p) => seen.push({ ...p }),
+    );
+
+    // The point of the change: a report from part-way through. Reporting once
+    // at the end satisfies "has an onProgress parameter" and gives a host
+    // nothing to draw, so that is what is asserted rather than the count.
+    expect(seen.some((p) => p.bytesReceived > 0 && p.bytesReceived < p.totalBytes)).toBe(true);
+    // Totals are the signed manifest's; this response carries no content-length.
+    expect(seen.every((p) => p.totalBytes === payload.length)).toBe(true);
+    expect(seen.map((p) => p.bytesReceived)).toEqual(
+      [...seen.map((p) => p.bytesReceived)].sort((a, b) => a - b),
+    );
+    expect(seen[seen.length - 1]).toEqual({
+      bytesReceived: payload.length,
+      totalBytes: payload.length,
+    });
+    expect(readFileSync(dest)).toEqual(payload);
+  });
+
+  it("leaves the destination alone when the bytes do not verify", async () => {
+    const { pubB64 } = keypair();
+    // Exactly as long as the real build, so what refuses it is the hash and not
+    // the size cap.
+    const wrong = Buffer.from("AN INSTALLER, MORE OR LESS");
+    expect(wrong.length).toBe(payload.length);
+
+    const dir = mkdtempSync(path.join(os.tmpdir(), "talos-dl-out-"));
+    const dest = path.join(dir, "app.bin");
+    const installed = Buffer.from("the build already installed here");
+    writeFileSync(dest, installed);
+
+    await expect(
+      seededClient(pubB64, () => Promise.resolve(streamResponse(wrong))).downloadUpdate(
+        info(),
+        dest,
+        artifact(),
+      ),
+    ).rejects.toThrow(/hash mismatch/);
+
+    // Streaming to disk is what makes this worth asserting: the bytes were
+    // written before anything vouched for them, and the only reason the host is
+    // not now holding an unverified file at the path it is about to run is that
+    // they went somewhere else first.
+    expect(readFileSync(dest)).toEqual(installed);
+    expect(readdirSync(dir)).toEqual(["app.bin"]);
+  });
+
+  it("stops reading and leaves nothing behind when the body runs past the manifest size", async () => {
+    const { pubB64 } = keypair();
+    const res = streamResponse(Buffer.concat([payload, Buffer.from(" and then some")]));
+    const dir = mkdtempSync(path.join(os.tmpdir(), "talos-dl-out-"));
+
+    await expect(
+      seededClient(pubB64, () => Promise.resolve(res)).downloadUpdate(
+        info(),
+        path.join(dir, "app.bin"),
+        artifact(),
+      ),
+    ).rejects.toThrow(/exceeds manifest size/);
+
+    // The cap now fires with a part file open and partly written, and with more
+    // body still coming that nobody wants.
+    expect(res.cancelled()).toBe(true);
+    expect(readdirSync(dir)).toEqual([]);
   });
 });
