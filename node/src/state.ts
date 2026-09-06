@@ -115,25 +115,33 @@ const SALT = Buffer.from("talos-state-v1");
  * token's alphabet, and two products never collide.
  */
 export function defaultStatePath(productToken: string): string {
+  return statePathFor(productToken, os.platform(), os.homedir(), process.env);
+}
+
+/**
+ * The path, from a host described rather than asked — so the layout on all three
+ * platforms is testable from any one of them, and the C# SDK has something to
+ * agree with. (Its `DefaultPathFor` is the same three branches; the same product
+ * on the same machine must not have two bindings in two places.)
+ *
+ * Not exported from the package: this exists for the tests on both sides.
+ */
+export function statePathFor(
+  productToken: string,
+  platform: string,
+  home: string,
+  env: Record<string, string | undefined>,
+): string {
   const slot = createHash("sha256").update(productToken).digest("hex").slice(0, 16);
-  const home = os.homedir();
-  switch (os.platform()) {
+  switch (platform) {
     case "win32":
-      return join(
-        process.env["LOCALAPPDATA"] ?? join(home, "AppData", "Local"),
-        "Talos",
-        slot,
-        "state.bin",
-      );
+      return join(env["LOCALAPPDATA"] || join(home, "AppData", "Local"), "Talos", slot, "state.bin");
     case "darwin":
       return join(home, "Library", "Application Support", "Talos", slot, "state.bin");
     default:
-      return join(
-        process.env["XDG_DATA_HOME"] ?? join(home, ".local", "share"),
-        "talos",
-        slot,
-        "state.bin",
-      );
+      // Lower-case, unlike the other two: this is the directory a Linux user's
+      // other applications keep company with.
+      return join(env["XDG_DATA_HOME"] || join(home, ".local", "share"), "talos", slot, "state.bin");
   }
 }
 

@@ -129,6 +129,12 @@ in its constructor, so `talos.IsActivated` answers the startup question —
 prompt for a key, or go straight to `ValidateAsync()` — and the user enters
 their key once, not once per launch.
 
+That file is `%LOCALAPPDATA%\Talos\<slot>\state.bin` on Windows,
+`~/Library/Application Support/Talos/<slot>/state.bin` on macOS,
+`$XDG_DATA_HOME/talos/<slot>/state.bin` (or `~/.local/share/...`) on Linux —
+where `<slot>` is a hash of the product token, and the same three paths the
+Node SDK uses, so one product cannot end up with two bindings in two places.
+
 `ActivateAsync` is safe to call on every start: when a binding for the same key
 is already held it **re-validates** instead of re-activating. That is not just
 an optimisation. Re-activating rotates the activation secret, so a second copy

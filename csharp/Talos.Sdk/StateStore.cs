@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -155,7 +156,35 @@ namespace Talos.Sdk
         /// token itself: filesystem-safe without assuming anything about the
         /// token's alphabet, and two products never collide.
         /// </remarks>
-        public static string DefaultPath(string productToken)
+        public static string DefaultPath(string productToken) => DefaultPathFor(
+            productToken,
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows"
+                : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macos" : "linux",
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            Environment.GetEnvironmentVariable("LOCALAPPDATA"),
+            Environment.GetEnvironmentVariable("XDG_DATA_HOME"));
+
+        /// <summary>
+        /// The path, from a host described rather than asked — so the layout on
+        /// all three platforms is testable from any one of them.
+        /// </summary>
+        /// <remarks>
+        /// This used to be one call to <c>SpecialFolder.LocalApplicationData</c>
+        /// with a comment saying it lands on <c>~/Library/Application Support</c>
+        /// on macOS. It does not: .NET returns <c>$XDG_DATA_HOME</c> or
+        /// <c>~/.local/share</c> everywhere on Unix, macOS included. So the file
+        /// went somewhere no Mac application keeps user data, and — since the
+        /// Node SDK does branch per platform — the two SDKs put the same
+        /// product's binding in two different places on macOS <i>and</i> on Linux,
+        /// where this one capitalised the directory.
+        /// <para>
+        /// The three layouts here are the Node SDK's, exactly; its
+        /// <c>defaultStatePath</c> and the tests on both sides pin the same
+        /// strings.
+        /// </para>
+        /// </remarks>
+        internal static string DefaultPathFor(
+            string productToken, string platform, string home, string? localAppData, string? xdgDataHome)
         {
             string slot;
             using (var sha = SHA256.Create())
@@ -165,13 +194,28 @@ namespace Talos.Sdk
                 for (int i = 0; i < 8; i++) sb.Append(h[i].ToString("x2"));
                 slot = sb.ToString();
             }
-            // LocalApplicationData is %LOCALAPPDATA% on Windows,
-            // ~/Library/Application Support on macOS, and $XDG_DATA_HOME (or
-            // ~/.local/share) on Linux — the convention on each host.
-            string root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            if (string.IsNullOrEmpty(root))
-                root = Path.Combine(Path.GetTempPath(), "talos");
-            return Path.Combine(root, "Talos", slot, "state.bin");
+            // A host with no home directory at all (a service account, a locked
+            // down container) still has to put the file somewhere it can write.
+            if (string.IsNullOrEmpty(home)) home = Path.GetTempPath();
+
+            switch (platform)
+            {
+                case "windows":
+                    string local = string.IsNullOrEmpty(localAppData)
+                        ? Path.Combine(home, "AppData", "Local")
+                        : localAppData!;
+                    return Path.Combine(local, "Talos", slot, "state.bin");
+                case "macos":
+                    return Path.Combine(
+                        home, "Library", "Application Support", "Talos", slot, "state.bin");
+                default:
+                    string data = string.IsNullOrEmpty(xdgDataHome)
+                        ? Path.Combine(home, ".local", "share")
+                        : xdgDataHome!;
+                    // Lower-case, unlike the other two: this is the directory a
+                    // Linux user's other applications keep company with.
+                    return Path.Combine(data, "talos", slot, "state.bin");
+            }
         }
 
         /// <summary>

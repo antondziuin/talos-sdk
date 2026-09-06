@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { StateStore, defaultStatePath, type StoredBinding, hashLicenseKey } from "../src/index.js";
+import { statePathFor } from "../src/state.js";
 
 const LICENSE_KEY_HASH = hashLicenseKey("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE");
 
@@ -104,6 +105,37 @@ describe("state store", () => {
 
     writeFileSync(p, Buffer.alloc(0));
     expect(store.load()).toBeNull();
+  });
+
+  /**
+   * The layouts the C# SDK's `DefaultPathFor` has to agree with, pinned on both
+   * sides. The same product on the same machine must not end up with two
+   * bindings in two places because two SDKs read the platform differently —
+   * which is exactly what happened, on macOS and on Linux, until the C# side
+   * stopped asking .NET for "local application data" and started branching.
+   */
+  it("puts the file where each platform keeps user data", () => {
+    // The slot is a hash prefix of the token; read it back rather than restate
+    // it, since what is being asserted is the layout around it.
+    const slot = path.basename(path.dirname(statePathFor("tpt_one", "linux", "/home/u", {})));
+
+    expect(statePathFor("tpt_one", "win32", "C:\\Users\\u", {})).toBe(
+      path.join("C:\\Users\\u", "AppData", "Local", "Talos", slot, "state.bin"),
+    );
+    expect(statePathFor("tpt_one", "darwin", "/Users/u", {})).toBe(
+      path.join("/Users/u", "Library", "Application Support", "Talos", slot, "state.bin"),
+    );
+    expect(statePathFor("tpt_one", "linux", "/home/u", {})).toBe(
+      path.join("/home/u", ".local", "share", "talos", slot, "state.bin"),
+    );
+
+    // The environment wins where the platform defines one.
+    expect(statePathFor("tpt_one", "linux", "/home/u", { XDG_DATA_HOME: "/data" })).toBe(
+      path.join("/data", "talos", slot, "state.bin"),
+    );
+    expect(statePathFor("tpt_one", "win32", "C:\\Users\\u", { LOCALAPPDATA: "D:\\local" })).toBe(
+      path.join("D:\\local", "Talos", slot, "state.bin"),
+    );
   });
 
   it("puts each product in its own slot under the OS user-data directory", () => {

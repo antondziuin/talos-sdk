@@ -129,6 +129,51 @@ namespace Talos.Sdk.Tests
             Assert.Null(store.Load());
         }
 
+        /// <summary>
+        /// Where the file goes on each platform, asserted from any of them.
+        /// <para>
+        /// This was one call to <c>SpecialFolder.LocalApplicationData</c> with a
+        /// comment claiming it meant <c>~/Library/Application Support</c> on
+        /// macOS. .NET returns <c>~/.local/share</c> there, so on a Mac the
+        /// licence went somewhere no application keeps user data — and the Node
+        /// SDK, which does branch per platform, put the same product's binding
+        /// somewhere else entirely on macOS and on Linux. Nothing failed; the
+        /// two SDKs simply did not share a machine binding, and neither test
+        /// looked at a path.
+        /// </para>
+        /// </summary>
+        [Fact]
+        public void PutsTheFileWhereEachPlatformKeepsUserData()
+        {
+            // The slot is a hash prefix of the token; read it back rather than
+            // restate it, since what is being asserted is the layout around it.
+            string slot = Path.GetFileName(Path.GetDirectoryName(
+                StateStore.DefaultPathFor("tpt_one", "linux", "/home/u", null, null))!);
+
+            Assert.Equal(
+                Path.Combine(@"C:\Users\u\AppData\Local", "Talos", slot, "state.bin"),
+                StateStore.DefaultPathFor("tpt_one", "windows", @"C:\Users\u", @"C:\Users\u\AppData\Local", null));
+            Assert.Equal(
+                Path.Combine("/Users/u", "Library", "Application Support", "Talos", slot, "state.bin"),
+                StateStore.DefaultPathFor("tpt_one", "macos", "/Users/u", null, null));
+            Assert.Equal(
+                Path.Combine("/home/u", ".local", "share", "talos", slot, "state.bin"),
+                StateStore.DefaultPathFor("tpt_one", "linux", "/home/u", null, null));
+
+            // The environment wins where the platform defines one.
+            Assert.Equal(
+                Path.Combine("/data", "talos", slot, "state.bin"),
+                StateStore.DefaultPathFor("tpt_one", "linux", "/home/u", null, "/data"));
+            Assert.Equal(
+                Path.Combine(@"D:\local", "Talos", slot, "state.bin"),
+                StateStore.DefaultPathFor("tpt_one", "windows", @"C:\Users\u", @"D:\local", null));
+
+            // And a host with no home at all still gets a writable path.
+            Assert.StartsWith(
+                Path.GetTempPath(),
+                StateStore.DefaultPathFor("tpt_one", "linux", "", null, null));
+        }
+
         [Fact]
         public void GivesEachProductItsOwnSlot()
         {
