@@ -75,6 +75,26 @@ A state file written by an older version is upgraded on first read, so nobody
 re-activates to get this. And `license_key` is still accepted by every route, so
 an application shipped against an older SDK keeps working unchanged.
 
+## Dependency injection
+
+There is no `AddTalos` extension and no `ITalosClient`, deliberately. The
+registration is one line, and the client already disposes correctly:
+
+```csharp
+services.AddSingleton(sp => new TalosClient(new TalosOptions { /* … */ }));
+```
+
+An extension package would add `Microsoft.Extensions.*` to a package that
+console and desktop applications also carry, to save that line. And an
+interface, in C#, breaks every implementer — every mock — the next time a member
+is added, which is a promise of stability this SDK is too young to make. If you
+want to test your licensing gate, wrap what *you* need behind your own
+one-method interface: it couples your tests to your decision rather than to our
+surface.
+
+Both are on the list to revisit once this SDK is published and its surface has
+settled — see `docs/AUDIT-BACKLOG.md`.
+
 ## The machine binding is persistent
 
 `ActivateAsync` binds this machine and the SDK writes that binding to a
