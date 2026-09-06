@@ -16,6 +16,8 @@ export {
   type Lease,
   type AcquireLeaseOptions,
   type CheckInOptions,
+  type TalosEventName,
+  type LicenseListener,
 } from "./client.js";
 export { TalosError, TalosSignatureError, TalosApiError } from "./errors.js";
 export { collectFingerprint, type FingerprintData } from "./fingerprint.js";

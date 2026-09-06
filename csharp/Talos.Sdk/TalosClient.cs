@@ -470,6 +470,108 @@ namespace Talos.Sdk
         /// <summary>The last verified license state, if any.</summary>
         public LicenseState? Current { get; private set; }
 
+        /// <summary>
+        /// The licence stopped being usable: <c>expired</c>, <c>revoked</c>,
+        /// <c>suspended</c>, <c>deactivated</c>, <c>machine_revoked</c> or
+        /// <c>invalid</c>. Raised again when the <i>reason</i> changes, since
+        /// that is a different thing to tell the user.
+        /// </summary>
+        /// <remarks>
+        /// These four are edges, not levels. <c>StartCheckIns</c>'s
+        /// <c>onState</c> already delivers the verdict on every tick, and an
+        /// application that wants "tell me when grace starts" has to diff those
+        /// itself — getting that right (not re-warning every ten minutes for a
+        /// week-long outage) is the bookkeeping a library should do once instead
+        /// of every host doing it slightly wrong. They are raised from every path
+        /// that adopts a verdict, not only from the check-in loop, so a host
+        /// running its own timer gets the same transitions. Handlers run
+        /// synchronously on the calling thread, and one that throws is ignored:
+        /// this fires from inside <see cref="ValidateAsync"/>, whose own catch
+        /// treats a throw as an unreachable server, and a broken banner must not
+        /// turn a live "revoked" answer into offline grace.
+        /// </remarks>
+        public event EventHandler<LicenseState>? LicenseInvalid;
+
+        /// <summary>
+        /// The application is now running on a cached verdict because the server
+        /// could not be reached. Raised once per outage, when grace begins.
+        /// </summary>
+        public event EventHandler<LicenseState>? GracePeriodStarted;
+
+        /// <summary>
+        /// The offline window closed: the cached verdict may no longer be
+        /// honoured (<c>grace_expired</c>).
+        /// </summary>
+        public event EventHandler<LicenseState>? GracePeriodExpired;
+
+        /// <summary>
+        /// The system clock moved back behind a signed server time already seen
+        /// (<c>clock_tampered</c>). Nothing has run out; the machine is lying
+        /// about the time.
+        /// </summary>
+        public event EventHandler<LicenseState>? ClockTamperDetected;
+
+        /// <summary>Which transition, if any, moving to <paramref name="next"/> amounts to.</summary>
+        /// <remarks>
+        /// At most one: the four are mutually exclusive by decision, and a repeat
+        /// of the verdict already held is not a transition at all.
+        /// </remarks>
+        private static EventKind TransitionOf(LicenseState? prev, LicenseState next)
+        {
+            if (next.Decision == "clock_tampered")
+                return prev?.Decision == "clock_tampered" ? EventKind.None : EventKind.ClockTamper;
+            if (next.Decision == "grace_expired")
+                return prev?.Decision == "grace_expired" ? EventKind.None : EventKind.GraceExpired;
+            if (next.IsValid)
+            {
+                // Grace begins when a cached verdict is what is keeping the
+                // application running, not when the network drops: a failed call
+                // that falls back on nothing throws, and never reaches here.
+                if (!next.IsOffline) return EventKind.None;
+                return prev != null && prev.IsOffline && prev.IsValid
+                    ? EventKind.None
+                    : EventKind.GraceStarted;
+            }
+            return prev?.Decision == next.Decision ? EventKind.None : EventKind.Invalid;
+        }
+
+        private enum EventKind { None, Invalid, GraceStarted, GraceExpired, ClockTamper }
+
+        /// <summary>
+        /// Adopt a verdict as the current one, announcing the transition it
+        /// makes.
+        /// </summary>
+        /// <remarks>
+        /// The single funnel every path goes through, which is what makes the
+        /// events trustworthy: a verdict reached anywhere else would be a
+        /// transition nobody hears about.
+        /// </remarks>
+        private LicenseState Adopt(LicenseState state)
+        {
+            EventKind kind = TransitionOf(Current, state);
+            Current = state;
+            EventHandler<LicenseState>? handler = kind switch
+            {
+                EventKind.Invalid => LicenseInvalid,
+                EventKind.GraceStarted => GracePeriodStarted,
+                EventKind.GraceExpired => GracePeriodExpired,
+                EventKind.ClockTamper => ClockTamperDetected,
+                _ => null,
+            };
+            if (handler != null)
+            {
+                try
+                {
+                    handler(this, state);
+                }
+                catch
+                {
+                    // Deliberate: see the remarks on LicenseInvalid.
+                }
+            }
+            return state;
+        }
+
         /// <summary>Whether a feature is enabled per the last verified state.</summary>
         public bool IsFeatureEnabled(string name) => Current?.IsFeatureEnabled(name) ?? false;
 
@@ -559,8 +661,7 @@ namespace Talos.Sdk
             AdvanceClock(claims);
             _store?.Save(_binding);
 
-            Current = StateFromClaims(claims, "valid", false);
-            return Current;
+            return Adopt(StateFromClaims(claims, "valid", false));
         }
 
         /// <summary>
@@ -765,8 +866,7 @@ namespace Talos.Sdk
                     : "invalid";
                 AdvanceClock(claims);
                 Persist(b => b.Validation = token);
-                Current = StateFromClaims(claims, decision, false);
-                return Current;
+                return Adopt(StateFromClaims(claims, decision, false));
             }
             catch (Exception e) when (!(e is TalosApiException) && !(e is OperationCanceledException))
             {
@@ -781,8 +881,7 @@ namespace Talos.Sdk
                 // network's, so it propagates untouched.
                 LicenseState? offline = OfflineDecision();
                 if (offline == null) throw;
-                Current = offline;
-                return offline;
+                return Adopt(offline);
             }
         }
 
@@ -888,15 +987,14 @@ namespace Talos.Sdk
             Persist(_ => { });
             // A heartbeat carries the decision but not the entitlement bag; keep
             // the features from the last activate/validate.
-            Current = new LicenseState
+            return Adopt(new LicenseState
             {
                 Decision = decision,
                 Features = Current?.Features ?? default,
                 LicenseExpiresAt = Current?.LicenseExpiresAt,
                 RevalidateAfter = Current?.RevalidateAfter,
                 GraceUntil = Current?.GraceUntil,
-            };
-            return Current;
+            });
         }
 
         /// <summary>Release this machine's seat.</summary>

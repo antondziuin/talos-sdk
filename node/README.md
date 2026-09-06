@@ -199,6 +199,36 @@ IP address is stored. Call `talos.heartbeat()` directly if you would rather own
 the schedule; `talos.heartbeatIntervalSeconds` is the policy's answer once the
 first one has been sent.
 
+## Events: the transitions, not the level
+
+```ts
+talos.on("gracePeriodStarted", (s) => showOfflineBanner(s.graceUntil));
+talos.on("gracePeriodExpired", () => requireConnection());
+talos.on("licenseInvalid", (s) => showLicenceProblem(s.decision));
+talos.on("clockTamperDetected", () => showClockWarning());
+```
+
+Four events, each raised **once** on the way in and not again while nothing
+changes: an application offline for a week gets one `gracePeriodStarted`, not
+one per check-in. `licenseInvalid` covers the server's own verdicts (`expired`,
+`revoked`, `suspended`, `deactivated`, `machine_revoked`, `invalid`) and fires
+again when the *reason* changes, because "your subscription lapsed" and "this
+machine was revoked" are different things to put in front of a user. The two
+grace verdicts are deliberately not folded into it: what ran out there is
+permission to keep believing a cached answer, and reporting it as a licence
+problem sends the user to support instead of to their network.
+
+`on` returns a function that unsubscribes. Listeners are called synchronously,
+from every path that adopts a verdict — `activate`, `validate`, `heartbeat` and
+the offline fallback — so a host running its own timer gets the same
+transitions. A listener that throws is ignored: these are raised from inside
+`validate`, whose own catch treats a throw as an unreachable server, and a
+broken banner must not turn a live "revoked" answer into offline grace.
+
+There is deliberately no "grace ended" or "licence recovered" event. That is a
+level, and `onState` (or `talos.current`) already carries it on every check-in;
+a second way to learn one fact is a second thing to keep in step.
+
 ## Hardware changes
 
 The SDK identifies the machine by a set of component hashes (never the raw

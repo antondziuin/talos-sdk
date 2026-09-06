@@ -223,6 +223,36 @@ IP address is stored. Call `HeartbeatAsync()` directly if you would rather own
 the schedule; `HeartbeatIntervalSeconds` is the policy's answer once the first
 one has been sent.
 
+## Events: the transitions, not the level
+
+```csharp
+talos.GracePeriodStarted += (_, s) => ShowOfflineBanner(s.GraceUntil);
+talos.GracePeriodExpired += (_, _) => RequireConnection();
+talos.LicenseInvalid += (_, s) => ShowLicenceProblem(s.Decision);
+talos.ClockTamperDetected += (_, _) => ShowClockWarning();
+```
+
+Four events, each raised **once** on the way in and not again while nothing
+changes: an application offline for a week gets one `GracePeriodStarted`, not
+one per check-in. `LicenseInvalid` covers the server's own verdicts (`expired`,
+`revoked`, `suspended`, `deactivated`, `machine_revoked`, `invalid`) and fires
+again when the *reason* changes, because "your subscription lapsed" and "this
+machine was revoked" are different things to put in front of a user. The two
+grace verdicts are deliberately not folded into it: what ran out there is
+permission to keep believing a cached answer, and reporting it as a licence
+problem sends the user to support instead of to their network.
+
+Handlers run synchronously on the calling thread, from every path that adopts a
+verdict — `ActivateAsync`, `ValidateAsync`, `HeartbeatAsync` and the offline
+fallback — so a host running its own timer gets the same transitions. A handler
+that throws is ignored: these are raised from inside `ValidateAsync`, whose own
+catch treats a throw as an unreachable server, and a broken banner must not turn
+a live "revoked" answer into offline grace.
+
+There is deliberately no "grace ended" or "licence recovered" event. That is a
+level, and `onState` (or `talos.Current`) already carries it on every check-in;
+a second way to learn one fact is a second thing to keep in step.
+
 ## Hardware changes
 
 The SDK identifies the machine by a set of component hashes (never the raw

@@ -280,6 +280,24 @@ export interface DownloadProgress {
 /** Called as an artifact download advances. */
 export type DownloadProgressCallback = (progress: DownloadProgress) => void;
 
+/**
+ * The licence transitions a host can subscribe to with {@link TalosClient.on}.
+ *
+ * Edges, not levels. `onState` already delivers the verdict on every check-in,
+ * and an application that wants "tell me when grace starts" has to diff those
+ * itself — getting that right (not re-warning every ten minutes for the whole
+ * outage) is exactly the bookkeeping a library should do once instead of every
+ * host doing it slightly wrong.
+ */
+export type TalosEventName =
+  | "licenseInvalid"
+  | "gracePeriodStarted"
+  | "gracePeriodExpired"
+  | "clockTamperDetected";
+
+/** Handler for a {@link TalosEventName}; receives the state that was adopted. */
+export type LicenseListener = (state: LicenseState) => void;
+
 /** A held floating seat. Renew before {@link expiresAt} or it is reclaimed. */
 export interface Lease {
   /** Server-side lease id (from the signed token). */
@@ -450,6 +468,7 @@ export class TalosClient {
   /** Default instance id for floating leases: one per client object. */
   private readonly instanceId: string = b64urlEncode(randomBytes(9));
   current: LicenseState | null = null;
+  private readonly listeners = new Map<TalosEventName, Set<LicenseListener>>();
 
   constructor(options: TalosOptions) {
     if (!options.productToken) throw new TalosError("productToken required");
@@ -737,8 +756,7 @@ export class TalosClient {
     };
     this.advanceClock(claims);
     this.store?.save(this.binding);
-    this.current = stateFromClaims(claims, "valid", false);
-    return this.current;
+    return this.adopt(stateFromClaims(claims, "valid", false));
   }
 
   /**
@@ -750,6 +768,58 @@ export class TalosClient {
    */
   get heartbeatIntervalSeconds(): number | null {
     return this.heartbeatInterval;
+  }
+
+  /**
+   * Subscribe to a licence transition. Returns a function that unsubscribes.
+   *
+   * ```ts
+   * const off = talos.on("gracePeriodStarted", (s) => showOfflineBanner(s.graceUntil));
+   * ```
+   *
+   * Fires from every path that adopts a verdict — `activate`, `validate`,
+   * `heartbeat`, and the offline fallback — not only from the background loop,
+   * so a host that runs its own timer gets the same transitions. The listener
+   * runs synchronously inside that call; a listener that throws is ignored (see
+   * {@link emit}).
+   */
+  on(event: TalosEventName, listener: LicenseListener): () => void {
+    let set = this.listeners.get(event);
+    if (!set) {
+      set = new Set();
+      this.listeners.set(event, set);
+    }
+    set.add(listener);
+    return () => {
+      set.delete(listener);
+    };
+  }
+
+  /**
+   * Adopt a verdict as the current one, announcing the transition it makes.
+   *
+   * The single funnel every path goes through, which is what makes the events
+   * trustworthy: a verdict reached anywhere else would be a transition nobody
+   * hears about.
+   */
+  private adopt(state: LicenseState): LicenseState {
+    const event = transitionEvent(this.current, state);
+    this.current = state;
+    if (event) this.emit(event, state);
+    return state;
+  }
+
+  private emit(event: TalosEventName, state: LicenseState): void {
+    for (const listener of this.listeners.get(event) ?? []) {
+      try {
+        listener(state);
+      } catch {
+        // The verdict is already decided, and this is being raised from inside
+        // `validate`, whose own catch treats a throw as an unreachable server.
+        // A host's broken banner code must not turn a live "revoked" answer
+        // into offline grace.
+      }
+    }
   }
 
   /**
@@ -869,8 +939,7 @@ export class TalosClient {
         typeof claims["decision"] === "string" ? (claims["decision"] as string) : "invalid";
       this.advanceClock(claims);
       this.persist({ validation: token, timeHighWater: this.binding?.timeHighWater });
-      this.current = stateFromClaims(claims, decision, false);
-      return this.current;
+      return this.adopt(stateFromClaims(claims, decision, false));
     } catch (e) {
       // An HTTP status is an *answer* — "revoked", "no such machine", "tenant
       // suspended". Honouring a cached verdict over one would turn every
@@ -882,8 +951,7 @@ export class TalosClient {
       if (e instanceof TalosApiError) throw e;
       const offline = this.offlineDecision();
       if (!offline) throw e;
-      this.current = offline;
-      return offline;
+      return this.adopt(offline);
     }
   }
 
@@ -1023,15 +1091,16 @@ export class TalosClient {
     this.persist({ timeHighWater: this.binding?.timeHighWater });
     // A heartbeat carries the decision but not the entitlement bag; keep the
     // features from the last activate/validate.
-    this.current = new LicenseState(
-      decision,
-      this.current?.features ?? {},
-      this.current?.licenseExpiresAt ?? null,
-      false,
-      this.current?.revalidateAfter ?? null,
-      this.current?.graceUntil ?? null,
+    return this.adopt(
+      new LicenseState(
+        decision,
+        this.current?.features ?? {},
+        this.current?.licenseExpiresAt ?? null,
+        false,
+        this.current?.revalidateAfter ?? null,
+        this.current?.graceUntil ?? null,
+      ),
     );
-    return this.current;
   }
 
   /**
@@ -1551,6 +1620,33 @@ function num(v: unknown): number | null {
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * Which transition, if any, moving from `prev` to `next` amounts to.
+ *
+ * At most one: the four are mutually exclusive by decision, and a repeat of the
+ * verdict already held is not a transition at all — an application offline for a
+ * week gets one `gracePeriodStarted`, not one per check-in. A *different* bad
+ * verdict does fire again (`expired` after `suspended` is a different thing to
+ * tell the user about), which is why this compares the decision and not just
+ * validity.
+ */
+function transitionEvent(prev: LicenseState | null, next: LicenseState): TalosEventName | null {
+  if (next.decision === "clock_tampered") {
+    return prev?.decision === "clock_tampered" ? null : "clockTamperDetected";
+  }
+  if (next.decision === "grace_expired") {
+    return prev?.decision === "grace_expired" ? null : "gracePeriodExpired";
+  }
+  if (next.isValid) {
+    // Grace begins when a cached verdict is what is keeping the application
+    // running, not when the network drops: a failed call that falls back on
+    // nothing throws, and never reaches here.
+    if (!next.isOffline) return null;
+    return prev?.isOffline && prev.isValid ? null : "gracePeriodStarted";
+  }
+  return prev?.decision === next.decision ? null : "licenseInvalid";
 }
 
 function newNonce(): string {
