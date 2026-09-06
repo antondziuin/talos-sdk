@@ -13,7 +13,9 @@ import {
   type UpdateDelta,
 } from "../src/client.js";
 import { collectFingerprint } from "../src/fingerprint.js";
-import { StateStore, stateKeyMaterial } from "../src/state.js";
+import { StateStore, stateKeyMaterial, hashLicenseKey } from "../src/state.js";
+
+const LICENSE_KEY_HASH = hashLicenseKey("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE");
 
 /**
  * Patches, from the client's side.
@@ -200,7 +202,7 @@ function client(pubB64: string, fetchImpl: FetchLike, appVersion?: string): Talo
   const file = path.join(mkdtempSync(path.join(os.tmpdir(), "talos-delta-")), "state.bin");
   const fp = collectFingerprint(PRODUCT);
   new StateStore(file, PRODUCT, stateKeyMaterial(fp)).save({
-    licenseKey: "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE",
+    licenseKeyHash: LICENSE_KEY_HASH,
     activationSecret: "secret",
     machineId: "m1",
     fingerprint: fp.composite,

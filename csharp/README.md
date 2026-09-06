@@ -55,6 +55,26 @@ the Node SDK: a total-duration limit on a multi-megabyte artifact is a size
 limit disguised as a safeguard. That one is bounded by the signed manifest's
 size.
 
+## The licence key is not kept
+
+After activation the SDK holds no licence key — not in memory, not in the state
+file. The server resolves the licence from the per-machine activation secret,
+which is what these calls authenticate with anyway, so the key was only a lookup
+value travelling beside the credential.
+
+That matters because the state file lives on a disk the user does not solely
+control. It is encrypted, but with material any process on that machine can
+read; a plaintext licence key in it is a credential-shaped file, and a licence
+key works anywhere. A machine-bound secret does not.
+
+What is kept is a SHA-256 of the key, for one thing only: activating twice with
+the same key validates instead of spending a second seat. It is accepted by
+nothing — the server matches an HMAC under a pepper no client has seen.
+
+A state file written by an older version is upgraded on first read, so nobody
+re-activates to get this. And `license_key` is still accepted by every route, so
+an application shipped against an older SDK keeps working unchanged.
+
 ## The machine binding is persistent
 
 `ActivateAsync` binds this machine and the SDK writes that binding to a

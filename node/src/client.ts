@@ -9,6 +9,7 @@ import { collectFingerprint, type FingerprintData } from "./fingerprint.js";
 import {
   StateStore,
   defaultStatePath,
+  hashLicenseKey,
   stateKeyMaterial,
   type StoredBinding,
 } from "./state.js";
@@ -389,7 +390,15 @@ export class TalosClient {
   private keysetLicenseKeys: KeyObject[] = [];
   private keysetReleaseKeys: KeyObject[] = [];
 
-  private licenseKey: string | null = null;
+  /**
+   * SHA-256 of the key this machine activated with, or null.
+   *
+   * The key itself is deliberately not held: after activation the server
+   * resolves the licence from the activation secret, so keeping the key would
+   * mean a plaintext credential in memory and on disk for the sake of one
+   * string comparison in `activate`.
+   */
+  private licenseKeyHash: string | null = null;
   private activationSecret: string | null = null;
   private machineId: string | null = null;
   private readonly store: StateStore | null;
@@ -457,7 +466,7 @@ export class TalosClient {
     const stored = this.store?.load() ?? null;
     if (stored) {
       this.binding = stored;
-      this.licenseKey = stored.licenseKey;
+      this.licenseKeyHash = stored.licenseKeyHash;
       this.activationSecret = stored.activationSecret;
       this.machineId = stored.machineId;
       // Adopt the cached keyset before anything asks for a verification key.
@@ -517,7 +526,7 @@ export class TalosClient {
    * go straight to {@link validate}?
    */
   get isActivated(): boolean {
-    return this.activationSecret !== null && this.licenseKey !== null;
+    return this.activationSecret !== null;
   }
 
   /** The server's id for this machine, once activated. */
@@ -650,7 +659,7 @@ export class TalosClient {
    * elsewhere.
    */
   async activate(licenseKey: string): Promise<LicenseState> {
-    if (this.isActivated && this.licenseKey === licenseKey) {
+    if (this.isActivated && this.licenseKeyHash === hashLicenseKey(licenseKey)) {
       try {
         const state = await this.validate();
         // `deactivated` means the developer released the seat; taking it again
@@ -691,11 +700,14 @@ export class TalosClient {
       nonce,
       body["activation_token"] as string,
     );
-    this.licenseKey = licenseKey;
+    // The key is not kept. From here the activation secret identifies both the
+    // machine and its licence, so nothing needs the key again until somebody
+    // types a different one.
+    this.licenseKeyHash = hashLicenseKey(licenseKey);
     this.activationSecret = body["activation_secret"] as string;
     this.machineId = (body["machine_id"] as string) ?? null;
     this.binding = {
-      licenseKey,
+      licenseKeyHash: this.licenseKeyHash,
       activationSecret: this.activationSecret,
       machineId: this.machineId ?? "",
       fingerprint: this.fingerprint,
@@ -778,7 +790,7 @@ export class TalosClient {
 
   /** Drop the machine binding, in memory and on disk. */
   private forgetBinding(): void {
-    this.licenseKey = null;
+    this.licenseKeyHash = null;
     this.activationSecret = null;
     this.machineId = null;
     this.current = null;
@@ -816,7 +828,6 @@ export class TalosClient {
       const nonce = newNonce();
       const body = await this.post("/v1/client/validate", {
         product_token: this.options.productToken,
-        license_key: this.licenseKey,
         fingerprint: { composite: this.fingerprint, components: this.fp.components },
         activation_secret: this.activationSecret,
         nonce,
@@ -932,7 +943,6 @@ export class TalosClient {
     this.requireActivated();
     await this.post("/v1/client/deactivate", {
       product_token: this.options.productToken,
-      license_key: this.licenseKey,
       fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
     });
@@ -966,7 +976,6 @@ export class TalosClient {
     const nonce = newNonce();
     const body = await this.post("/v1/client/heartbeat", {
       product_token: this.options.productToken,
-      license_key: this.licenseKey,
       fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       nonce,
@@ -1025,7 +1034,6 @@ export class TalosClient {
     const nonce = newNonce();
     const body = await this.post("/v1/client/leases", {
       product_token: this.options.productToken,
-      license_key: this.licenseKey,
       fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       instance_id: instanceId,
@@ -1082,10 +1090,9 @@ export class TalosClient {
 
   /** Best-effort DELETE of one instance's seat (used for stale-renewal cleanup). */
   private async releaseInstance(instanceId: string): Promise<void> {
-    if (!this.activationSecret || !this.licenseKey) return;
+    if (!this.activationSecret) return;
     await this.request("DELETE", "/v1/client/leases", {
       product_token: this.options.productToken,
-      license_key: this.licenseKey,
       fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       instance_id: instanceId,
@@ -1156,7 +1163,6 @@ export class TalosClient {
     await this.ensureKeyset();
     const body = await this.post("/v1/client/updates/check", {
       product_token: this.options.productToken,
-      license_key: this.licenseKey,
       fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       current_version: opts.currentVersion ?? this.options.appVersion,
@@ -1349,7 +1355,6 @@ export class TalosClient {
       method: "GET",
       headers: {
         "x-talos-product-token": this.options.productToken,
-        "x-talos-license-key": this.licenseKey!,
         "x-talos-activation-secret": this.activationSecret!,
         "x-talos-fingerprint": this.fingerprint,
       },
@@ -1368,7 +1373,7 @@ export class TalosClient {
   }
 
   private requireActivated(): void {
-    if (!this.activationSecret || !this.licenseKey) {
+    if (!this.activationSecret) {
       throw new TalosError("not activated: call activate() first");
     }
   }

@@ -18,7 +18,26 @@ import type { FingerprintData } from "./fingerprint.js";
  * suspension into a hard kill switch for the developer's own paying users.
  */
 export interface StoredBinding {
-  licenseKey: string;
+  /**
+   * SHA-256 of the licence key as it was typed, hex — **not** the key.
+   *
+   * The key itself used to live here, so that the next call could send it. It
+   * no longer has to: the server resolves a licence from the activation secret,
+   * which is the credential these calls authenticate with anyway. What was left
+   * was a plaintext licence key in a file on every customer's machine, which is
+   * a credential-shaped file and exactly what an infostealer collects.
+   *
+   * A hash is kept because one thing still needs it: `activate()` called twice
+   * with the same key must validate rather than spend a second seat, and that
+   * comparison is all the stored value was ever used for. The hash cannot be
+   * replayed to the server — the server matches an HMAC under its own pepper —
+   * so this is a value with exactly one use and no resale.
+   *
+   * Hashed as typed, without normalising, because the comparison it replaces
+   * was a string equality on the same input: normalising here would change when
+   * a re-activation is avoided, which is not what this change is about.
+   */
+  licenseKeyHash: string;
   activationSecret: string;
   machineId: string;
   /**
@@ -144,6 +163,17 @@ export function stateKeyMaterial(fp: FingerprintData): string {
   );
 }
 
+/**
+ * SHA-256 of a licence key, hex.
+ *
+ * Used only to recognise "the same key as last time" without keeping the key.
+ * Not a credential and not accepted by anything: the server matches an HMAC
+ * computed under a pepper this process has never seen.
+ */
+export function hashLicenseKey(key: string): string {
+  return createHash("sha256").update(key, "utf8").digest("hex");
+}
+
 /** Reads and writes one product's machine binding. */
 export class StateStore {
   private readonly key: Buffer;
@@ -187,8 +217,19 @@ export class StateStore {
       const plain = Buffer.concat([d.update(body), d.final()]).toString("utf8");
       const o = JSON.parse(plain) as Record<string, unknown>;
       if (o["v"] !== 1) return null;
+      // An older file carries `licenseKey` in the clear. Upgrade it in place
+      // rather than discarding the binding: the customer keeps their seat, and
+      // the plaintext key stops existing on disk at the next save — which is
+      // the point of the change, and it must not cost anybody a re-activation
+      // to get.
+      const legacyKey = typeof o["licenseKey"] === "string" ? o["licenseKey"] : "";
       const b: StoredBinding = {
-        licenseKey: String(o["licenseKey"] ?? ""),
+        licenseKeyHash:
+          typeof o["licenseKeyHash"] === "string" && o["licenseKeyHash"]
+            ? o["licenseKeyHash"]
+            : legacyKey
+              ? hashLicenseKey(legacyKey)
+              : "",
         activationSecret: String(o["activationSecret"] ?? ""),
         machineId: String(o["machineId"] ?? ""),
         fingerprint: String(o["fingerprint"] ?? ""),
@@ -211,7 +252,10 @@ export class StateStore {
       ) {
         b.pendingRelease = { version: pending["version"], releaseSeq: pending["releaseSeq"] };
       }
-      return b.licenseKey && b.activationSecret ? b : null;
+      // The activation secret is what makes a binding usable. The key hash is
+      // a convenience for one comparison, and an old file that somehow lacks
+      // both is still a seat this machine holds.
+      return b.activationSecret ? b : null;
     } catch {
       return null;
     }

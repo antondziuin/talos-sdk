@@ -7,7 +7,9 @@ import { describe, expect, it, vi } from "vitest";
 
 import { TalosClient, type FetchLike } from "../src/client.js";
 import { collectFingerprint } from "../src/fingerprint.js";
-import { StateStore, stateKeyMaterial } from "../src/state.js";
+import { StateStore, stateKeyMaterial, hashLicenseKey } from "../src/state.js";
+
+const LICENSE_KEY_HASH = hashLicenseKey("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE");
 
 /**
  * A cached keyset goes stale, and that is what makes revoking a key reach an
@@ -67,7 +69,7 @@ function seed(keyset: string): string {
   const file = path.join(mkdtempSync(path.join(os.tmpdir(), "talos-stale-")), "state.bin");
   const fp = collectFingerprint(PRODUCT);
   new StateStore(file, PRODUCT, stateKeyMaterial(fp)).save({
-    licenseKey: "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE",
+    licenseKeyHash: LICENSE_KEY_HASH,
     activationSecret: "secret",
     machineId: "m1",
     fingerprint: fp.composite,

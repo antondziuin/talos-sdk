@@ -156,7 +156,13 @@ namespace Talos.Sdk
         private List<byte[]> _keysetLicenseKeys = new List<byte[]>();
         private List<byte[]> _keysetReleaseKeys = new List<byte[]>();
 
-        private string? _licenseKey;
+        /// <summary>
+        /// SHA-256 of the key this machine activated with, or null. The key
+        /// itself is deliberately not held: after activation the server resolves
+        /// the licence from the activation secret, so keeping it would mean a
+        /// plaintext credential in memory and on disk for one comparison.
+        /// </summary>
+        private string? _licenseKeyHash;
         private string? _activationSecret;
         private string? _machineId;
         private readonly StateStore? _store;
@@ -229,7 +235,7 @@ namespace Talos.Sdk
             if (stored != null)
             {
                 _binding = stored;
-                _licenseKey = stored.LicenseKey;
+                _licenseKeyHash = stored.LicenseKeyHash;
                 _activationSecret = stored.ActivationSecret;
                 _machineId = stored.MachineId;
                 // Adopt the cached keyset before anything asks for a
@@ -325,7 +331,7 @@ namespace Talos.Sdk
         /// on construction, so this is the startup question: prompt for a licence
         /// key, or go straight to <see cref="ValidateAsync"/>?
         /// </summary>
-        public bool IsActivated => _activationSecret != null && _licenseKey != null;
+        public bool IsActivated => _activationSecret != null;
 
         /// <summary>The server's id for this machine, once activated.</summary>
         public string? MachineId => _machineId;
@@ -482,7 +488,7 @@ namespace Talos.Sdk
         /// </summary>
         public async Task<LicenseState> ActivateAsync(string licenseKey, CancellationToken ct = default)
         {
-            if (IsActivated && _licenseKey == licenseKey)
+            if (IsActivated && _licenseKeyHash == StateStore.HashLicenseKey(licenseKey))
             {
                 try
                 {
@@ -527,12 +533,14 @@ namespace Talos.Sdk
             JsonElement claims = TalosCompact.Verify(
                 LicenseVerifyKeys(), "activation", _options.ProductToken, nonce, token);
 
-            _licenseKey = licenseKey;
+            // The key is not kept. From here the activation secret identifies
+            // both the machine and its licence.
+            _licenseKeyHash = StateStore.HashLicenseKey(licenseKey);
             _activationSecret = root.GetProperty("activation_secret").GetString();
             _machineId = root.GetProperty("machine_id").GetString();
             _binding = new StoredBinding
             {
-                LicenseKey = licenseKey,
+                LicenseKeyHash = _licenseKeyHash,
                 ActivationSecret = _activationSecret ?? "",
                 MachineId = _machineId ?? "",
                 Fingerprint = _fingerprint,
@@ -672,7 +680,7 @@ namespace Talos.Sdk
         /// <summary>Drop the machine binding, in memory and on disk.</summary>
         private void ForgetBinding()
         {
-            _licenseKey = null;
+            _licenseKeyHash = null;
             _activationSecret = null;
             _machineId = null;
             Current = null;
@@ -731,7 +739,6 @@ namespace Talos.Sdk
                 var body = new
                 {
                     product_token = _options.ProductToken,
-                    license_key = _licenseKey,
                     fingerprint = new { composite = _fingerprint, components = _fp.Components },
                     activation_secret = _activationSecret,
                     nonce,
@@ -848,7 +855,6 @@ namespace Talos.Sdk
             var body = new
             {
                 product_token = _options.ProductToken,
-                license_key = _licenseKey,
                 fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
                 nonce,
@@ -894,7 +900,6 @@ namespace Talos.Sdk
             var body = new
             {
                 product_token = _options.ProductToken,
-                license_key = _licenseKey,
                 fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
             };
@@ -923,7 +928,6 @@ namespace Talos.Sdk
             var body = new
             {
                 product_token = _options.ProductToken,
-                license_key = _licenseKey,
                 fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
                 instance_id = instanceId,
@@ -984,11 +988,10 @@ namespace Talos.Sdk
         /// <summary>Best-effort release of one instance's seat (stale-renewal cleanup).</summary>
         private async Task ReleaseInstanceAsync(string instanceId, CancellationToken ct)
         {
-            if (_activationSecret == null || _licenseKey == null) return;
+            if (_activationSecret == null) return;
             var body = new
             {
                 product_token = _options.ProductToken,
-                license_key = _licenseKey,
                 fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
                 instance_id = instanceId,
@@ -1094,7 +1097,6 @@ namespace Talos.Sdk
             var body = new
             {
                 product_token = _options.ProductToken,
-                license_key = _licenseKey,
                 fingerprint = new { composite = _fingerprint, components = _fp.Components },
                 activation_secret = _activationSecret,
                 current_version = opts.CurrentVersion ?? _options.AppVersion,
@@ -1329,7 +1331,6 @@ namespace Talos.Sdk
 
             using var req = new HttpRequestMessage(HttpMethod.Get, _options.ServerUrl.TrimEnd('/') + downloadPath);
             req.Headers.TryAddWithoutValidation("x-talos-product-token", _options.ProductToken);
-            req.Headers.TryAddWithoutValidation("x-talos-license-key", _licenseKey);
             req.Headers.TryAddWithoutValidation("x-talos-activation-secret", _activationSecret);
             req.Headers.TryAddWithoutValidation("x-talos-fingerprint", _fingerprint);
             using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)
@@ -1415,7 +1416,7 @@ namespace Talos.Sdk
 
         private void RequireActivated()
         {
-            if (_activationSecret == null || _licenseKey == null)
+            if (_activationSecret == null)
                 throw new TalosException("not activated: call ActivateAsync first");
         }
 

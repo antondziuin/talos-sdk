@@ -25,7 +25,29 @@ namespace Talos.Sdk
     /// </summary>
     public sealed class StoredBinding
     {
-        public string LicenseKey { get; set; } = "";
+        /// <summary>
+        /// SHA-256 of the licence key as it was typed, hex — <b>not</b> the key.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The key itself used to live here so the next call could send it. It
+        /// no longer has to: the server resolves a licence from the activation
+        /// secret, which is the credential those calls authenticate with
+        /// anyway. What was left was a plaintext licence key in a file on every
+        /// customer's machine — a credential-shaped file, and exactly what an
+        /// infostealer collects.
+        /// </para>
+        /// <para>
+        /// A hash is kept because one thing still needs it: calling
+        /// <c>ActivateAsync</c> twice with the same key must validate rather
+        /// than spend a second seat, and that comparison is all the stored value
+        /// was ever used for. It cannot be replayed to the server, which matches
+        /// an HMAC under its own pepper. Hashed as typed, without normalising,
+        /// because the comparison it replaces was a string equality on the same
+        /// input.
+        /// </para>
+        /// </remarks>
+        public string LicenseKeyHash { get; set; } = "";
         public string ActivationSecret { get; set; } = "";
         public string MachineId { get; set; } = "";
 
@@ -172,6 +194,46 @@ namespace Talos.Sdk
         /// the machine.
         /// </para>
         /// </summary>
+        /// <summary>
+        /// Which key hash a stored file yields: its own, or one derived from a
+        /// licence key an older version left in the clear.
+        /// </summary>
+        /// <remarks>
+        /// An older file carries `licenseKey`. Upgraded in place rather than
+        /// discarded: the customer keeps their seat — charging every existing
+        /// install a re-activation for a change made on their behalf would be a
+        /// poor trade — and the plaintext stops existing on disk at the next
+        /// save, which is when it actually leaves the machine.
+        ///
+        /// A separate function because it is the whole decision, and testing it
+        /// through the sealed envelope would mean a test that rebuilds the
+        /// envelope.
+        /// </remarks>
+        public static string ResolveKeyHash(string? storedHash, string? legacyKey)
+        {
+            if (!string.IsNullOrEmpty(storedHash)) return storedHash!;
+            return string.IsNullOrEmpty(legacyKey) ? "" : HashLicenseKey(legacyKey!);
+        }
+
+        /// <summary>SHA-256 of a licence key, hex.</summary>
+        /// <remarks>
+        /// Used only to recognise "the same key as last time" without keeping
+        /// the key. Not a credential and accepted by nothing: the server matches
+        /// an HMAC computed under a pepper this process has never seen.
+        /// </remarks>
+        public static string HashLicenseKey(string key)
+        {
+            using var sha = SHA256.Create();
+            byte[] h = sha.ComputeHash(Encoding.UTF8.GetBytes(key));
+#if NET8_0_OR_GREATER
+            return Convert.ToHexString(h).ToLowerInvariant();
+#else
+            var sb = new StringBuilder(h.Length * 2);
+            foreach (byte b in h) sb.Append(b.ToString("x2"));
+            return sb.ToString();
+#endif
+        }
+
         public static string KeyMaterial(IReadOnlyDictionary<string, string> components)
         {
             foreach (string id in new[] { "machine_guid", "smbios_uuid", "os_install" })
@@ -212,7 +274,8 @@ namespace Talos.Sdk
                 if (!root.TryGetProperty("v", out var v) || v.GetInt32() != 1) return null;
                 var b = new StoredBinding
                 {
-                    LicenseKey = Str(root, "licenseKey"),
+                    LicenseKeyHash =
+                        ResolveKeyHash(Str(root, "licenseKeyHash"), Str(root, "licenseKey")),
                     ActivationSecret = Str(root, "activationSecret"),
                     MachineId = Str(root, "machineId"),
                     Fingerprint = Str(root, "fingerprint"),
@@ -239,7 +302,10 @@ namespace Talos.Sdk
                             ? pr.GetInt64()
                             : 0,
                 };
-                return b.LicenseKey.Length > 0 && b.ActivationSecret.Length > 0 ? b : null;
+                // The activation secret is what makes a binding usable. The key
+                // hash serves one local comparison, and a file that somehow
+                // lacks it is still a seat this machine holds.
+                return b.ActivationSecret.Length > 0 ? b : null;
             }
             catch
             {
@@ -259,7 +325,7 @@ namespace Talos.Sdk
                 string json = JsonSerializer.Serialize(new
                 {
                     v = 1,
-                    licenseKey = b.LicenseKey,
+                    licenseKeyHash = b.LicenseKeyHash,
                     activationSecret = b.ActivationSecret,
                     machineId = b.MachineId,
                     fingerprint = b.Fingerprint,

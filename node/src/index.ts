@@ -17,5 +17,5 @@ export {
 } from "./client.js";
 export { TalosError, TalosSignatureError, TalosApiError } from "./errors.js";
 export { collectFingerprint, type FingerprintData } from "./fingerprint.js";
-export { defaultStatePath, StateStore, type StoredBinding } from "./state.js";
+export { defaultStatePath, hashLicenseKey, StateStore, type StoredBinding } from "./state.js";
 export { verifyToken, verifyManifest, verifyKeyset, publicKeyFromBase64 } from "./talos-compact.js";

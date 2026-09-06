@@ -4,10 +4,12 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { StateStore, defaultStatePath, type StoredBinding } from "../src/index.js";
+import { StateStore, defaultStatePath, type StoredBinding, hashLicenseKey } from "../src/index.js";
+
+const LICENSE_KEY_HASH = hashLicenseKey("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE");
 
 const BINDING: StoredBinding = {
-  licenseKey: "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE",
+  licenseKeyHash: LICENSE_KEY_HASH,
   activationSecret: "s3cr3t-from-the-server",
   machineId: "01234567-89ab-cdef-0123-456789abcdef",
   fingerprint: "fp2:deadbeef",
@@ -32,8 +34,39 @@ describe("state store", () => {
     const p = tmpFile();
     new StateStore(p, "tpt_one", "km").save(BINDING);
     const raw = readFileSync(p).toString("latin1");
-    expect(raw).not.toContain(BINDING.licenseKey);
+    // Two claims, and the second is newer and stronger. The file is encrypted,
+    // so nothing appears in it as typed — but the key is no longer *in* it at
+    // all, in any form: after activation the server resolves the licence from
+    // the activation secret, so what used to be a plaintext credential on every
+    // customer's disk is now a hash with one local use.
+    expect(raw).not.toContain("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE");
     expect(raw).not.toContain(BINDING.activationSecret);
+    expect(JSON.stringify(BINDING)).not.toContain("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE");
+  });
+
+  it("upgrades a file that still carries the key in it", () => {
+    // The installed base. An older SDK wrote `licenseKey`; this one must keep
+    // the seat — discarding the binding would charge every existing customer a
+    // re-activation for a change made on their behalf — and must stop writing
+    // the key at the next save, which is when the plaintext actually disappears.
+    const p = tmpFile();
+    const store = new StateStore(p, "tpt_one", "km");
+    store.save({
+      ...BINDING,
+      licenseKeyHash: "",
+      // The shape an older version persisted.
+      licenseKey: "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE",
+    } as StoredBinding & { licenseKey: string });
+
+    const loaded = store.load();
+    expect(loaded).not.toBeNull();
+    expect(loaded!.licenseKeyHash).toBe(LICENSE_KEY_HASH);
+    expect(loaded!.activationSecret).toBe(BINDING.activationSecret);
+
+    store.save(loaded!);
+    const again = store.load() as (StoredBinding & { licenseKey?: string }) | null;
+    expect(again!.licenseKeyHash).toBe(LICENSE_KEY_HASH);
+    expect(again).not.toHaveProperty("licenseKey");
   });
 
   it("refuses a file belonging to another product", () => {

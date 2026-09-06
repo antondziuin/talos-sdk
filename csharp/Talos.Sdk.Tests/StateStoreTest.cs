@@ -15,7 +15,7 @@ namespace Talos.Sdk.Tests
     {
         private static StoredBinding Sample() => new StoredBinding
         {
-            LicenseKey = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE",
+            LicenseKeyHash = StateStore.HashLicenseKey("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE"),
             ActivationSecret = "s3cr3t-from-the-server",
             MachineId = "01234567-89ab-cdef-0123-456789abcdef",
             Fingerprint = "fp2:deadbeef",
@@ -37,7 +37,7 @@ namespace Talos.Sdk.Tests
 
             StoredBinding? got = store.Load();
             Assert.NotNull(got);
-            Assert.Equal(Sample().LicenseKey, got!.LicenseKey);
+            Assert.Equal(Sample().LicenseKeyHash, got!.LicenseKeyHash);
             Assert.Equal(Sample().ActivationSecret, got.ActivationSecret);
             Assert.Equal(Sample().MachineId, got.MachineId);
             Assert.Equal(Sample().Fingerprint, got.Fingerprint);
@@ -47,12 +47,46 @@ namespace Talos.Sdk.Tests
         }
 
         [Fact]
+        public void UpgradesAFileThatStillCarriesTheKey()
+        {
+            // The installed base. An older SDK wrote `licenseKey`; a file from
+            // it must keep its seat rather than be discarded — charging every
+            // existing customer a re-activation for a change made on their
+            // behalf would be a poor trade — and the plaintext leaves the disk
+            // at the next save.
+            string hash = StateStore.HashLicenseKey("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE");
+            Assert.Equal(hash, StateStore.ResolveKeyHash(null, "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE"));
+            Assert.Equal(hash, StateStore.ResolveKeyHash("", "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE"));
+            // A current file wins over a legacy field, so a half-upgraded file
+            // does not re-derive from a key that may since have changed.
+            Assert.Equal("kept", StateStore.ResolveKeyHash("kept", "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE"));
+            Assert.Equal("", StateStore.ResolveKeyHash(null, null));
+        }
+
+        [Fact]
+        public void SavingNeverWritesTheKeyBack()
+        {
+            // Whatever a file arrived carrying, what leaves is the hash.
+            string p = TmpFile();
+            var store = new StateStore(p, "tpt_one", "km");
+            store.Save(Sample());
+            string raw = Encoding.Latin1.GetString(File.ReadAllBytes(p));
+            Assert.DoesNotContain("licenseKey\"", raw);
+        }
+
+        [Fact]
         public void DoesNotWriteTheLicenceKeyInTheClear()
         {
             string p = TmpFile();
             new StateStore(p, "tpt_one", "km").Save(Sample());
             string raw = Encoding.Latin1.GetString(File.ReadAllBytes(p));
-            Assert.DoesNotContain(Sample().LicenseKey, raw);
+            // Two claims, and the second is the newer and stronger one. The
+            // file is encrypted, so nothing appears in it as typed — but the
+            // key is no longer in it at all, in any form: after activation the
+            // server resolves the licence from the activation secret, so what
+            // used to be a plaintext credential on every customer's disk is now
+            // a hash with one local use.
+            Assert.DoesNotContain("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE", raw);
             Assert.DoesNotContain(Sample().ActivationSecret, raw);
         }
 

@@ -8,7 +8,9 @@ import { describe, expect, it } from "vitest";
 import { TalosClient, type FetchLike, type TalosOptions } from "../src/client.js";
 import { TalosApiError } from "../src/errors.js";
 import { collectFingerprint } from "../src/fingerprint.js";
-import { StateStore, stateKeyMaterial, type StoredBinding } from "../src/state.js";
+import { StateStore, stateKeyMaterial, type StoredBinding, hashLicenseKey } from "../src/state.js";
+
+const LICENSE_KEY_HASH = hashLicenseKey("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE");
 
 /**
  * The offline path, with no server at all.
@@ -67,7 +69,7 @@ function seed(
   const file = path.join(mkdtempSync(path.join(os.tmpdir(), "talos-offline-")), "state.bin");
   const fp = collectFingerprint(PRODUCT);
   new StateStore(file, PRODUCT, stateKeyMaterial(fp)).save({
-    licenseKey: "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE",
+    licenseKeyHash: LICENSE_KEY_HASH,
     activationSecret: "secret",
     machineId: "m1",
     fingerprint,

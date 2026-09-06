@@ -99,7 +99,7 @@ namespace Talos.Sdk.Tests
             var fp = Talos.Sdk.Fingerprint.Collect(Product, null);
             var binding = new StoredBinding
             {
-                LicenseKey = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE",
+                LicenseKeyHash = StateStore.HashLicenseKey("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE"),
                 ActivationSecret = "secret",
                 MachineId = "m1",
                 Fingerprint = fp.Composite,
