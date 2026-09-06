@@ -130,6 +130,16 @@ export interface TalosOptions {
    */
   fetch?: FetchLike;
   /**
+   * The update channel this install follows (`stable` by default, `beta` and
+   * whatever else the product publishes).
+   *
+   * The default for {@link TalosClient.checkForUpdate}, and the channel a
+   * heartbeat names when something is subscribed to `updateAvailable` — a beta
+   * install has to ask about its own channel or it would be told about
+   * stable's releases.
+   */
+  updateChannel?: string;
+  /**
    * How long a licensing call may take before it is abandoned, in milliseconds.
    * Default 10000; `0` disables it.
    *
@@ -289,13 +299,26 @@ export type DownloadProgressCallback = (progress: DownloadProgress) => void;
  * outage) is exactly the bookkeeping a library should do once instead of every
  * host doing it slightly wrong.
  */
-export type TalosEventName =
-  | "licenseInvalid"
-  | "gracePeriodStarted"
-  | "gracePeriodExpired"
-  | "clockTamperDetected";
+export interface TalosEventMap {
+  /** The licence stopped being usable; the payload says why. */
+  licenseInvalid: LicenseState;
+  /** Running on a cached verdict because the server could not be reached. */
+  gracePeriodStarted: LicenseState;
+  /** The offline window closed: the cached verdict may no longer be honoured. */
+  gracePeriodExpired: LicenseState;
+  /** The system clock moved back behind a signed server time already seen. */
+  clockTamperDetected: LicenseState;
+  /**
+   * A release newer than this install is waiting, noticed by a heartbeat rather
+   * than by being asked. The payload is the same verified {@link UpdateInfo}
+   * {@link TalosClient.checkForUpdate} returns.
+   */
+  updateAvailable: UpdateInfo;
+}
 
-/** Handler for a {@link TalosEventName}; receives the state that was adopted. */
+export type TalosEventName = keyof TalosEventMap;
+
+/** Handler for a licence transition; receives the state that was adopted. */
 export type LicenseListener = (state: LicenseState) => void;
 
 /** A held floating seat. Renew before {@link expiresAt} or it is reclaimed. */
@@ -468,7 +491,9 @@ export class TalosClient {
   /** Default instance id for floating leases: one per client object. */
   private readonly instanceId: string = b64urlEncode(randomBytes(9));
   current: LicenseState | null = null;
-  private readonly listeners = new Map<TalosEventName, Set<LicenseListener>>();
+  private readonly listeners = new Map<TalosEventName, Set<(payload: never) => void>>();
+  /** The newest release this client has already announced. */
+  private announcedReleaseSeq = 0;
 
   constructor(options: TalosOptions) {
     if (!options.productToken) throw new TalosError("productToken required");
@@ -782,16 +807,27 @@ export class TalosClient {
    * so a host that runs its own timer gets the same transitions. The listener
    * runs synchronously inside that call; a listener that throws is ignored (see
    * {@link emit}).
+   *
+   * `updateAvailable` is the one event that is not a licence transition: it
+   * carries an {@link UpdateInfo}, and subscribing to it is what makes the
+   * heartbeat ask the server whether a release is waiting.
    */
-  on(event: TalosEventName, listener: LicenseListener): () => void {
+  on<E extends TalosEventName>(
+    event: E,
+    listener: (payload: TalosEventMap[E]) => void,
+  ): () => void {
     let set = this.listeners.get(event);
     if (!set) {
       set = new Set();
       this.listeners.set(event, set);
     }
-    set.add(listener);
+    // The registry is one map for five payload types; `never` is the only
+    // parameter every listener is assignable to, and the cast back at emit is
+    // where the type is put on again.
+    const fn = listener as (payload: never) => void;
+    set.add(fn);
     return () => {
-      set.delete(listener);
+      set.delete(fn);
     };
   }
 
@@ -809,10 +845,10 @@ export class TalosClient {
     return state;
   }
 
-  private emit(event: TalosEventName, state: LicenseState): void {
+  private emit<E extends TalosEventName>(event: E, payload: TalosEventMap[E]): void {
     for (const listener of this.listeners.get(event) ?? []) {
       try {
-        listener(state);
+        (listener as (p: TalosEventMap[E]) => void)(payload);
       } catch {
         // The verdict is already decided, and this is being raised from inside
         // `validate`, whose own catch treats a throw as an unreachable server.
@@ -1070,6 +1106,12 @@ export class TalosClient {
       os: `${os.type()} ${os.release()}`,
       arch: os.arch(),
       sdk_version: SDK_ID,
+      // Naming the channel is what asks the server for the update hint, and it
+      // costs two queries there — so it is asked for only when somebody is
+      // listening for the answer.
+      update_channel: this.listeners.get("updateAvailable")?.size
+        ? this.updateChannel()
+        : undefined,
     });
     const claims = verifyToken(
       this.licenseVerifyKeys(),
@@ -1091,7 +1133,7 @@ export class TalosClient {
     this.persist({ timeHighWater: this.binding?.timeHighWater });
     // A heartbeat carries the decision but not the entitlement bag; keep the
     // features from the last activate/validate.
-    return this.adopt(
+    const state = this.adopt(
       new LicenseState(
         decision,
         this.current?.features ?? {},
@@ -1101,6 +1143,41 @@ export class TalosClient {
         this.current?.graceUntil ?? null,
       ),
     );
+    await this.announceUpdate(claims);
+    return state;
+  }
+
+  /** The channel this install follows; `stable` unless set. */
+  private updateChannel(): string {
+    return this.options.updateChannel || "stable";
+  }
+
+  /**
+   * Act on the heartbeat's `upd` hint: confirm it with a real update check and
+   * emit `updateAvailable` for a release not announced yet.
+   *
+   * The hint is read from the **signed** claims, not the response envelope, and
+   * it is only ever a prompt to go and look: the check applies this install's
+   * anti-downgrade floor and verifies a manifest, neither of which the hint
+   * does. A hint that turns out to be wrong costs one request and emits
+   * nothing.
+   *
+   * A failing check is swallowed. The heartbeat it rode in on has already
+   * succeeded, and a licensing call must not start failing because the update
+   * service is having a bad day.
+   */
+  private async announceUpdate(claims: Record<string, unknown>): Promise<void> {
+    if (!this.listeners.get("updateAvailable")?.size) return;
+    if (claims["upd"] !== true) return;
+    let info: UpdateInfo | null;
+    try {
+      info = await this.checkForUpdate();
+    } catch {
+      return;
+    }
+    if (!info || info.releaseSeq <= this.announcedReleaseSeq) return;
+    this.announcedReleaseSeq = info.releaseSeq;
+    this.emit("updateAvailable", info);
   }
 
   /**
@@ -1255,7 +1332,7 @@ export class TalosClient {
       activation_secret: this.activationSecret,
       current_version: opts.currentVersion ?? this.options.appVersion,
       current_release_seq: this.releaseFloor(opts.currentReleaseSeq),
-      channel: opts.channel,
+      channel: opts.channel ?? this.updateChannel(),
     });
     if (body["update_available"] !== true) return null;
 

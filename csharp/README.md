@@ -230,9 +230,10 @@ talos.GracePeriodStarted += (_, s) => ShowOfflineBanner(s.GraceUntil);
 talos.GracePeriodExpired += (_, _) => RequireConnection();
 talos.LicenseInvalid += (_, s) => ShowLicenceProblem(s.Decision);
 talos.ClockTamperDetected += (_, _) => ShowClockWarning();
+talos.UpdateAvailable += (_, info) => OfferUpdate(info.Version);
 ```
 
-Four events, each raised **once** on the way in and not again while nothing
+Four of them are licence transitions, each raised **once** on the way in and not again while nothing
 changes: an application offline for a week gets one `GracePeriodStarted`, not
 one per check-in. `LicenseInvalid` covers the server's own verdicts (`expired`,
 `revoked`, `suspended`, `deactivated`, `machine_revoked`, `invalid`) and fires
@@ -252,6 +253,16 @@ a live "revoked" answer into offline grace.
 There is deliberately no "grace ended" or "licence recovered" event. That is a
 level, and `onState` (or `talos.Current`) already carries it on every check-in;
 a second way to learn one fact is a second thing to keep in step.
+
+`UpdateAvailable` is the odd one out: it carries an `UpdateInfo`, not a licence
+state, and it is how an application learns about a release **without asking**.
+Subscribing to it makes each heartbeat name your `UpdateChannel` (`stable`
+unless you set one), which is what asks the server whether anything is waiting;
+on a yes, the SDK runs a real `CheckForUpdateAsync` and hands you what that
+verified — the signed manifest and this install's own anti-downgrade floor,
+never the hint's word. Nothing is asked for and nothing is spent while no
+handler is attached, and each release is announced once however long the user
+puts off installing it.
 
 ## Hardware changes
 

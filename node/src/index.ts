@@ -17,6 +17,7 @@ export {
   type AcquireLeaseOptions,
   type CheckInOptions,
   type TalosEventName,
+  type TalosEventMap,
   type LicenseListener,
 } from "./client.js";
 export { TalosError, TalosSignatureError, TalosApiError } from "./errors.js";

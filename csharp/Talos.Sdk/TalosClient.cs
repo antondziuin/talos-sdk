@@ -65,6 +65,18 @@ namespace Talos.Sdk
         public HttpClient? HttpClient { get; set; }
 
         /// <summary>
+        /// The update channel this install follows (<c>stable</c> by default,
+        /// <c>beta</c> and whatever else the product publishes).
+        /// </summary>
+        /// <remarks>
+        /// The default for <see cref="TalosClient.CheckForUpdateAsync"/>, and
+        /// the channel a heartbeat names when something is subscribed to
+        /// <see cref="TalosClient.UpdateAvailable"/> — a beta install has to ask
+        /// about its own channel or it would be told about stable's releases.
+        /// </remarks>
+        public string? UpdateChannel { get; set; }
+
+        /// <summary>
         /// How long a licensing call may take before it is abandoned, in
         /// milliseconds. Default 10000; <c>0</c> disables it.
         /// </summary>
@@ -510,6 +522,32 @@ namespace Talos.Sdk
         /// about the time.
         /// </summary>
         public event EventHandler<LicenseState>? ClockTamperDetected;
+
+        /// <summary>
+        /// A release newer than this install is waiting. Raised from the
+        /// heartbeat — so an application that runs check-ins learns about an
+        /// update without asking — and carries the same verified
+        /// <see cref="UpdateInfo"/> that <see cref="CheckForUpdateAsync"/>
+        /// returns.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Costs nothing unless something is subscribed: the heartbeat asks for
+        /// the hint only when this event has a handler, and the server computes
+        /// it only when asked. On the hint the SDK runs a real update check, so
+        /// what reaches a handler has been through the signed manifest and this
+        /// install's own anti-downgrade floor, not the hint's word.
+        /// </para>
+        /// <para>
+        /// Raised once per release. The hint stays true for as long as the user
+        /// puts off updating, which on a ten-minute cadence is a great many
+        /// heartbeats.
+        /// </para>
+        /// </remarks>
+        public event EventHandler<UpdateInfo>? UpdateAvailable;
+
+        /// <summary>The newest release this client has already announced.</summary>
+        private long _announcedReleaseSeq;
 
         /// <summary>Which transition, if any, moving to <paramref name="next"/> amounts to.</summary>
         /// <remarks>
@@ -967,6 +1005,10 @@ namespace Talos.Sdk
                 os = RuntimeInformation.OSDescription,
                 arch = RuntimeInformation.OSArchitecture.ToString(),
                 sdk_version = SdkVersion.Id,
+                // Naming the channel is what asks the server for the update
+                // hint, and it costs two queries there — so it is asked for
+                // only when somebody is listening for the answer.
+                update_channel = UpdateAvailable == null ? null : UpdateChannel(),
             };
             using var doc = await PostAsync("/v1/client/heartbeat", body, ct).ConfigureAwait(false);
             JsonElement claims = TalosCompact.Verify(
@@ -987,7 +1029,7 @@ namespace Talos.Sdk
             Persist(_ => { });
             // A heartbeat carries the decision but not the entitlement bag; keep
             // the features from the last activate/validate.
-            return Adopt(new LicenseState
+            LicenseState state = Adopt(new LicenseState
             {
                 Decision = decision,
                 Features = Current?.Features ?? default,
@@ -995,6 +1037,57 @@ namespace Talos.Sdk
                 RevalidateAfter = Current?.RevalidateAfter,
                 GraceUntil = Current?.GraceUntil,
             });
+            await AnnounceUpdateAsync(claims, ct).ConfigureAwait(false);
+            return state;
+        }
+
+        /// <summary>The channel this install follows; <c>stable</c> unless set.</summary>
+        private string UpdateChannel() =>
+            string.IsNullOrEmpty(_options.UpdateChannel) ? "stable" : _options.UpdateChannel!;
+
+        /// <summary>
+        /// Act on the heartbeat's <c>upd</c> hint: confirm it with a real update
+        /// check and raise <see cref="UpdateAvailable"/> for a release not
+        /// announced yet.
+        /// </summary>
+        /// <remarks>
+        /// The hint is read from the <b>signed</b> claims, not the response
+        /// envelope, and it is only ever a prompt to go and look: the check
+        /// applies this install's anti-downgrade floor and verifies a manifest,
+        /// neither of which the hint does. A hint that turns out to be wrong
+        /// therefore costs one request and raises nothing.
+        /// <para>
+        /// A failing check is swallowed. The heartbeat it rode in on has already
+        /// succeeded, and a licensing call must not start failing because the
+        /// update service is having a bad day.
+        /// </para>
+        /// </remarks>
+        private async Task AnnounceUpdateAsync(JsonElement claims, CancellationToken ct)
+        {
+            EventHandler<UpdateInfo>? handler = UpdateAvailable;
+            if (handler == null) return;
+            if (!claims.TryGetProperty("upd", out var upd) || upd.ValueKind != JsonValueKind.True)
+                return;
+
+            UpdateInfo? info;
+            try
+            {
+                info = await CheckForUpdateAsync(ct: ct).ConfigureAwait(false);
+            }
+            catch (Exception e) when (!(e is OperationCanceledException))
+            {
+                return;
+            }
+            if (info == null || info.ReleaseSeq <= _announcedReleaseSeq) return;
+            _announcedReleaseSeq = info.ReleaseSeq;
+            try
+            {
+                handler(this, info);
+            }
+            catch
+            {
+                // Deliberate: see the remarks on LicenseInvalid.
+            }
         }
 
         /// <summary>Release this machine's seat.</summary>
@@ -1205,7 +1298,7 @@ namespace Talos.Sdk
                 activation_secret = _activationSecret,
                 current_version = opts.CurrentVersion ?? _options.AppVersion,
                 current_release_seq = ReleaseFloor(opts.CurrentReleaseSeq),
-                channel = opts.Channel,
+                channel = opts.Channel ?? UpdateChannel(),
             };
             using var doc = await PostAsync("/v1/client/updates/check", body, ct).ConfigureAwait(false);
             JsonElement root = doc.RootElement;

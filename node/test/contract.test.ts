@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { TalosClient, TalosError } from "../src/index.js";
+import { TalosClient, TalosError, type UpdateInfo } from "../src/index.js";
 
 /**
  * Cross-language contract test: drives the real Rust `/v1/client` API and
@@ -82,8 +82,16 @@ describe("contract", () => {
     expect(none).toBeNull();
 
     // Heartbeat: signed decision + the telemetry source for monitoring.
+    // With something subscribed it also carries the update hint, which is the
+    // one path in this SDK that spans two routes and a signed claim the server
+    // only sets when asked — so it is worth proving against a real server
+    // rather than a stub of one.
+    const announced: UpdateInfo[] = [];
+    client.on("updateAvailable", (info) => announced.push(info));
     const beat = await client.heartbeat();
     expect(beat.decision).toBe("valid");
+    expect(announced).toHaveLength(1);
+    expect(announced[0]!.version).toBe(env("TALOS_UPDATE_VERSION"));
 
     // Floating seats (the demo policy has max_concurrent_seats = 1).
     const lease = await client.acquireLease({ instanceId: "inst-1", autoRenew: false });

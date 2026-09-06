@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -126,6 +127,121 @@ namespace Talos.Sdk.Tests
                 return _f(body);
             }
         }
+
+        private sealed class Routing : HttpMessageHandler
+        {
+            private readonly Func<string, string, HttpResponseMessage> _f;
+            public Routing(Func<string, string, HttpResponseMessage> f) => _f = f;
+
+            protected override async Task<HttpResponseMessage> SendAsync(
+                HttpRequestMessage request, CancellationToken ct)
+            {
+                string body = request.Content == null
+                    ? ""
+                    : await request.Content.ReadAsStringAsync().ConfigureAwait(false);
+                return _f(request.RequestUri!.AbsolutePath, body);
+            }
+        }
+
+        private static HttpResponseMessage Json(object body) =>
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"),
+            };
+
+        private static readonly byte[] Build = Encoding.UTF8.GetBytes("the bytes of 1.1.0");
+
+        /// <summary>A signed manifest for 1.1.0, as the update check returns it.</summary>
+        private static string Manifest(Ed25519PrivateKeyParameters sk)
+        {
+            using var sha = SHA256.Create();
+            var hex = new StringBuilder();
+            foreach (byte b in sha.ComputeHash(Build)) hex.Append(b.ToString("x2"));
+            return Mint(sk, "manifest", JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["v"] = 1,
+                ["typ"] = "manifest",
+                ["aud"] = Product,
+                ["version"] = "1.1.0",
+                ["release_seq"] = 42,
+                ["mandatory"] = false,
+                ["artifacts"] = new[]
+                {
+                    new Dictionary<string, object?>
+                    {
+                        ["platform"] = "windows",
+                        ["arch"] = "x64",
+                        ["kind"] = "installer",
+                        ["filename"] = "app-1.1.0.exe",
+                        ["size"] = Build.Length,
+                        ["sha256"] = hex.ToString(),
+                    },
+                },
+            }));
+        }
+
+        /// <summary>
+        /// A server whose heartbeat says an update is waiting, recording what
+        /// each request asked for. <paramref name="checkFails"/> makes the
+        /// update check itself fall over, which must not reach the heartbeat.
+        /// </summary>
+        private static HttpClient Beating(
+            Ed25519PrivateKeyParameters sk, List<string?> channels, bool checkFails = false) =>
+            new HttpClient(new Routing((path, body) =>
+            {
+                using var doc = JsonDocument.Parse(body);
+                if (path.EndsWith("/heartbeat", StringComparison.Ordinal))
+                {
+                    channels.Add(
+                        doc.RootElement.TryGetProperty("update_channel", out var ch)
+                        && ch.ValueKind == JsonValueKind.String
+                            ? ch.GetString()
+                            : null);
+                    long now = Now();
+                    string token = Mint(sk, "heartbeat", JsonSerializer.Serialize(
+                        new Dictionary<string, object?>
+                        {
+                            ["aud"] = Product,
+                            ["typ"] = "heartbeat",
+                            ["iat"] = now,
+                            ["nbf"] = now - 60,
+                            ["exp"] = now + 300,
+                            ["non"] = doc.RootElement.GetProperty("nonce").GetString(),
+                            ["decision"] = "valid",
+                            ["server_time"] = now,
+                            ["heartbeat_interval_s"] = 600,
+                            ["upd"] = true,
+                            ["fph"] = Composite(),
+                        }));
+                    return Json(new Dictionary<string, object?>
+                    {
+                        ["heartbeat_token"] = token,
+                        ["license_status"] = "valid",
+                        ["heartbeat_interval_s"] = 600,
+                        ["update_available"] = true,
+                    });
+                }
+                if (checkFails) return new HttpResponseMessage(HttpStatusCode.InternalServerError);
+                return Json(new Dictionary<string, object?>
+                {
+                    ["update_available"] = true,
+                    ["version"] = "1.1.0",
+                    ["release_seq"] = 42,
+                    ["manifest"] = Manifest(sk),
+                    ["artifacts"] = new[]
+                    {
+                        new Dictionary<string, object?>
+                        {
+                            ["platform"] = "windows",
+                            ["arch"] = "x64",
+                            ["kind"] = "installer",
+                            ["artifact_id"] = "a1",
+                            ["download_path"] = "/v1/client/updates/artifacts/a1",
+                        },
+                    },
+                });
+            }));
 
         private static HttpClient DeadNetwork() =>
             new HttpClient(new Stub(_ => throw new HttpRequestException("ENOTFOUND")));
@@ -255,6 +371,62 @@ namespace Talos.Sdk.Tests
             await client.ValidateAsync();
             await client.ValidateAsync();
             Assert.Equal(new[] { "revoked", "expired" }, seen);
+        }
+
+        [Fact]
+        public async Task AsksAboutUpdatesOnlyWhenSomebodyIsListening()
+        {
+            var (pub, sk) = Keypair();
+            var channels = new List<string?>();
+            var client = Client(pub, Seed(sk), Beating(sk, channels));
+
+            await client.HeartbeatAsync();
+            // Nobody subscribed: the hint is two queries on the busiest route in
+            // the system, spent on an answer that would be dropped.
+            Assert.Equal(new string?[] { null }, channels);
+
+            client.UpdateAvailable += (_, _) => { };
+            await client.HeartbeatAsync();
+            Assert.Equal(new string?[] { null, "stable" }, channels);
+        }
+
+        [Fact]
+        public async Task AnnouncesAWaitingReleaseOncePerRelease()
+        {
+            var (pub, sk) = Keypair();
+            var channels = new List<string?>();
+            var client = Client(pub, Seed(sk), Beating(sk, channels));
+            var seen = new List<UpdateInfo>();
+            client.UpdateAvailable += (_, info) => seen.Add(info);
+
+            await client.HeartbeatAsync();
+            await client.HeartbeatAsync();
+            await client.HeartbeatAsync();
+
+            // The hint stays true for as long as the user puts off updating,
+            // which on a ten-minute cadence is a great many heartbeats. What
+            // reaches the handler came from the signed manifest, not the hint.
+            Assert.Single(seen);
+            Assert.Equal("1.1.0", seen[0].Version);
+            Assert.Equal(42, seen[0].ReleaseSeq);
+            Assert.Equal("installer", seen[0].Artifacts[0].Kind);
+        }
+
+        [Fact]
+        public async Task KeepsTheHeartbeatWorkingWhenTheUpdateCheckDoesNot()
+        {
+            var (pub, sk) = Keypair();
+            var channels = new List<string?>();
+            var client = Client(pub, Seed(sk), Beating(sk, channels, checkFails: true));
+            var seen = new List<UpdateInfo>();
+            client.UpdateAvailable += (_, info) => seen.Add(info);
+
+            // The heartbeat is a licensing call and the hint is a convenience
+            // riding on it. An update service having a bad day must not turn
+            // into a licence that cannot be checked.
+            LicenseState state = await client.HeartbeatAsync();
+            Assert.Equal("valid", state.Decision);
+            Assert.Empty(seen);
         }
 
         [Fact]

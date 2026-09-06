@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 using Talos.Sdk;
@@ -92,8 +93,16 @@ namespace Talos.Sdk.Tests
             Assert.Null(none);
 
             // Heartbeat: signed decision + the telemetry source for monitoring.
+            // With something subscribed it also carries the update hint, which
+            // is the one path in this SDK that spans two routes and a signed
+            // claim the server only sets when asked — so it is worth proving
+            // against a real server rather than a stub of one.
+            var announced = new List<UpdateInfo>();
+            client.UpdateAvailable += (_, info) => announced.Add(info);
             LicenseState beat = await client.HeartbeatAsync();
             Assert.Equal("valid", beat.Decision);
+            Assert.Single(announced);
+            Assert.Equal(Env("TALOS_UPDATE_VERSION"), announced[0].Version);
 
             // Floating seats (the demo policy has max_concurrent_seats = 1).
             Lease lease = await client.AcquireLeaseAsync(

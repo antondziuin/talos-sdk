@@ -1,11 +1,16 @@
-import { generateKeyPairSync, sign as cryptoSign, type KeyObject } from "node:crypto";
+import { createHash, generateKeyPairSync, sign as cryptoSign, type KeyObject } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { TalosClient, type FetchLike, type LicenseState } from "../src/client.js";
+import {
+  TalosClient,
+  type FetchLike,
+  type LicenseState,
+  type UpdateInfo,
+} from "../src/client.js";
 import { collectFingerprint } from "../src/fingerprint.js";
 import { StateStore, stateKeyMaterial, hashLicenseKey, type StoredBinding } from "../src/state.js";
 
@@ -107,6 +112,102 @@ function answering(privateKey: KeyObject, decision: () => string): FetchLike {
   };
 }
 
+const BUILD = Buffer.from("the bytes of 1.1.0");
+
+/** A signed manifest for 1.1.0, as the update check returns it. */
+function manifest(privateKey: KeyObject): string {
+  return mint(privateKey, "manifest", {
+    v: 1,
+    typ: "manifest",
+    aud: PRODUCT,
+    version: "1.1.0",
+    release_seq: 42,
+    mandatory: false,
+    artifacts: [
+      {
+        platform: "windows",
+        arch: "x64",
+        kind: "installer",
+        filename: "app-1.1.0.exe",
+        size: BUILD.length,
+        sha256: createHash("sha256").update(BUILD).digest("hex"),
+      },
+    ],
+  });
+}
+
+/**
+ * A server whose heartbeat says an update is waiting, recording what each
+ * request asked for. `checkFails` makes the update check itself fall over,
+ * which must not reach the heartbeat.
+ */
+function beating(
+  privateKey: KeyObject,
+  channels: (string | undefined)[],
+  checkFails = false,
+): FetchLike {
+  return (url, init) => {
+    const sent = JSON.parse(String(init.body)) as { nonce: string; update_channel?: string };
+    if (url.endsWith("/heartbeat")) {
+      channels.push(sent.update_channel);
+      const now = NOW();
+      const token = mint(privateKey, "heartbeat", {
+        aud: PRODUCT,
+        typ: "heartbeat",
+        iat: now,
+        nbf: now - 60,
+        exp: now + 300,
+        non: sent.nonce,
+        decision: "valid",
+        server_time: now,
+        heartbeat_interval_s: 600,
+        upd: true,
+        fph: fingerprint,
+      });
+      return jsonResponse({
+        heartbeat_token: token,
+        license_status: "valid",
+        heartbeat_interval_s: 600,
+        update_available: true,
+      });
+    }
+    if (checkFails) return Promise.resolve({ ...jsonBody({}), status: 500 });
+    return jsonResponse({
+      update_available: true,
+      version: "1.1.0",
+      release_seq: 42,
+      manifest: manifest(privateKey),
+      artifacts: [
+        {
+          platform: "windows",
+          arch: "x64",
+          kind: "installer",
+          artifact_id: "a1",
+          download_path: "/v1/client/updates/artifacts/a1",
+        },
+      ],
+    });
+  };
+}
+
+type JsonResponse = {
+  status: number;
+  text: () => Promise<string>;
+  arrayBuffer: () => Promise<ArrayBuffer>;
+};
+
+function jsonBody(body: unknown): JsonResponse {
+  return {
+    status: 200,
+    text: () => Promise.resolve(JSON.stringify(body)),
+    arrayBuffer: () => Promise.reject(new Error("not a download")),
+  };
+}
+
+function jsonResponse(body: unknown): Promise<JsonResponse> {
+  return Promise.resolve(jsonBody(body));
+}
+
 function client(pubB64: string, statePath: string, fetchImpl: FetchLike = deadNetwork): TalosClient {
   return new TalosClient({
     productToken: PRODUCT,
@@ -200,6 +301,59 @@ describe("licence events", () => {
     decision = "suspended";
     await c.validate();
     expect(seen).toEqual(["revoked", "expired"]);
+  });
+
+  it("asks about updates only when somebody is listening", async () => {
+    const { pubB64, privateKey } = keypair();
+    const channels: (string | undefined)[] = [];
+    const c = client(pubB64, seed(privateKey), beating(privateKey, channels));
+
+    await c.heartbeat();
+    // Nobody subscribed: the hint is two queries on the busiest route in the
+    // system, spent on an answer that would be dropped.
+    expect(channels).toEqual([undefined]);
+
+    const off = c.on("updateAvailable", () => {});
+    await c.heartbeat();
+    expect(channels).toEqual([undefined, "stable"]);
+
+    // And it stops asking again once the last listener goes.
+    off();
+    await c.heartbeat();
+    expect(channels).toEqual([undefined, "stable", undefined]);
+  });
+
+  it("announces a waiting release once per release", async () => {
+    const { pubB64, privateKey } = keypair();
+    const c = client(pubB64, seed(privateKey), beating(privateKey, []));
+    const seen: UpdateInfo[] = [];
+    c.on("updateAvailable", (info) => seen.push(info));
+
+    await c.heartbeat();
+    await c.heartbeat();
+    await c.heartbeat();
+
+    // The hint stays true for as long as the user puts off updating, which on a
+    // ten-minute cadence is a great many heartbeats. What reaches the listener
+    // came from the signed manifest, not from the hint.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.version).toBe("1.1.0");
+    expect(seen[0]!.releaseSeq).toBe(42);
+    expect(seen[0]!.artifacts[0]!.kind).toBe("installer");
+  });
+
+  it("keeps the heartbeat working when the update check does not", async () => {
+    const { pubB64, privateKey } = keypair();
+    const c = client(pubB64, seed(privateKey), beating(privateKey, [], true));
+    const seen: UpdateInfo[] = [];
+    c.on("updateAvailable", (info) => seen.push(info));
+
+    // The heartbeat is a licensing call and the hint is a convenience riding on
+    // it. An update service having a bad day must not turn into a licence that
+    // cannot be checked.
+    const state = await c.heartbeat();
+    expect(state.decision).toBe("valid");
+    expect(seen).toEqual([]);
   });
 
   it("cannot have the verdict changed by a listener that throws", async () => {

@@ -206,9 +206,10 @@ talos.on("gracePeriodStarted", (s) => showOfflineBanner(s.graceUntil));
 talos.on("gracePeriodExpired", () => requireConnection());
 talos.on("licenseInvalid", (s) => showLicenceProblem(s.decision));
 talos.on("clockTamperDetected", () => showClockWarning());
+talos.on("updateAvailable", (info) => offerUpdate(info.version));
 ```
 
-Four events, each raised **once** on the way in and not again while nothing
+Four of them are licence transitions, each raised **once** on the way in and not again while nothing
 changes: an application offline for a week gets one `gracePeriodStarted`, not
 one per check-in. `licenseInvalid` covers the server's own verdicts (`expired`,
 `revoked`, `suspended`, `deactivated`, `machine_revoked`, `invalid`) and fires
@@ -228,6 +229,16 @@ broken banner must not turn a live "revoked" answer into offline grace.
 There is deliberately no "grace ended" or "licence recovered" event. That is a
 level, and `onState` (or `talos.current`) already carries it on every check-in;
 a second way to learn one fact is a second thing to keep in step.
+
+`updateAvailable` is the odd one out: it carries an `UpdateInfo`, not a licence
+state, and it is how an application learns about a release **without asking**.
+Subscribing to it makes each heartbeat name your `updateChannel` (`stable`
+unless you set one), which is what asks the server whether anything is waiting;
+on a yes, the SDK runs a real `checkForUpdate` and hands you what that verified
+— the signed manifest and this install's own anti-downgrade floor, never the
+hint's word. Nothing is asked for and nothing is spent while no listener is
+attached, and each release is announced once however long the user puts off
+installing it.
 
 ## Hardware changes
 
