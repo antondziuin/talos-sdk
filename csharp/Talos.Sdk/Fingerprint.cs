@@ -197,7 +197,10 @@ namespace Talos.Sdk
             long bytes = 0;
             if (IsWindows())
             {
-                var status = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX)) };
+                // The generic overload, not Marshal.SizeOf(Type): the Type one
+                // builds marshalling code at run time, which a NativeAOT
+                // application does not have. Both give the same number here.
+                var status = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
                 if (Safe(() => GlobalMemoryStatusEx(ref status))) bytes = (long)status.ullTotalPhys;
             }
             else

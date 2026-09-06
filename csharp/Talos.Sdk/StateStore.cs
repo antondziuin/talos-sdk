@@ -4,6 +4,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Org.BouncyCastle.Crypto.Engines;
 using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Modes;
@@ -322,20 +323,22 @@ namespace Talos.Sdk
         {
             try
             {
-                string json = JsonSerializer.Serialize(new
-                {
-                    v = 1,
-                    licenseKeyHash = b.LicenseKeyHash,
-                    activationSecret = b.ActivationSecret,
-                    machineId = b.MachineId,
-                    fingerprint = b.Fingerprint,
-                    keyset = b.Keyset,
-                    validation = b.Validation,
-                    timeHighWater = b.TimeHighWater,
-                    releaseSeqHighWater = b.ReleaseSeqHighWater,
-                    pendingVersion = b.PendingVersion,
-                    pendingReleaseSeq = b.PendingReleaseSeq,
-                });
+                string json = JsonSerializer.Serialize(
+                    new StateFileDto
+                    {
+                        V = 1,
+                        LicenseKeyHash = b.LicenseKeyHash,
+                        ActivationSecret = b.ActivationSecret,
+                        MachineId = b.MachineId,
+                        Fingerprint = b.Fingerprint,
+                        Keyset = b.Keyset,
+                        Validation = b.Validation,
+                        TimeHighWater = b.TimeHighWater,
+                        ReleaseSeqHighWater = b.ReleaseSeqHighWater,
+                        PendingVersion = b.PendingVersion,
+                        PendingReleaseSeq = b.PendingReleaseSeq,
+                    },
+                    StateJson.Default.StateFileDto);
                 var iv = new byte[IvLen];
                 using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(iv);
                 byte[] sealedBytes = Gcm(true, iv, Encoding.UTF8.GetBytes(json));
@@ -408,5 +411,42 @@ namespace Talos.Sdk
             gen.GenerateBytes(okm, 0, length);
             return okm;
         }
+    }
+
+    /// <summary>
+    /// The state file's shape on disk.
+    /// </summary>
+    /// <remarks>
+    /// Written through <see cref="StateJson"/> rather than reflected over: a
+    /// trimmed or NativeAOT application would otherwise write an empty object
+    /// here and lose its activation on every launch. Only the writer is
+    /// declared — <see cref="StateStore.Load"/> reads the file field by field
+    /// through <c>JsonDocument</c>, deliberately, because this file lives on a
+    /// disk the user owns and every value in it is input.
+    /// </remarks>
+    internal sealed class StateFileDto
+    {
+        public int V { get; set; }
+        public string? LicenseKeyHash { get; set; }
+        public string? ActivationSecret { get; set; }
+        public string? MachineId { get; set; }
+        public string? Fingerprint { get; set; }
+        public string? Keyset { get; set; }
+        public string? Validation { get; set; }
+        public long TimeHighWater { get; set; }
+        public long ReleaseSeqHighWater { get; set; }
+        public string? PendingVersion { get; set; }
+        public long PendingReleaseSeq { get; set; }
+    }
+
+    /// <summary>
+    /// Compile-time serializer for the state file. camelCase, unlike the wire's
+    /// snake_case, because that is what files written by every earlier version
+    /// already use and <see cref="StateStore.Load"/> still reads.
+    /// </summary>
+    [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+    [JsonSerializable(typeof(StateFileDto))]
+    internal partial class StateJson : JsonSerializerContext
+    {
     }
 }

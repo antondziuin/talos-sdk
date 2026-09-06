@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -371,8 +372,9 @@ namespace Talos.Sdk
         public async Task RefreshKeysetAsync(CancellationToken ct = default)
         {
             if (_anchorKey == null) return;
-            var body = new { product_token = _options.ProductToken };
-            using var doc = await PostAsync("/v1/client/keyset", body, ct).ConfigureAwait(false);
+            var body = new KeysetReq { ProductToken = _options.ProductToken };
+            using var doc = await PostAsync("/v1/client/keyset", body, WireJson.Default.KeysetReq, ct)
+                .ConfigureAwait(false);
             if (doc.RootElement.TryGetProperty("keyset", out var ks) && ks.ValueKind == JsonValueKind.String)
             {
                 AdoptKeyset(ks.GetString());
@@ -656,19 +658,20 @@ namespace Talos.Sdk
             }
 
             string nonce = NewNonce();
-            var body = new
+            var body = new ActivateReq
             {
-                product_token = _options.ProductToken,
-                license_key = licenseKey,
-                fingerprint = new { composite = _fingerprint, components = _fp.Components },
-                nonce,
-                hostname = ReportedHostname(),
-                os = RuntimeInformation.OSDescription,
-                arch = RuntimeInformation.OSArchitecture.ToString(),
-                app_version = _options.AppVersion,
-                sdk_version = SdkVersion.Id,
+                ProductToken = _options.ProductToken,
+                LicenseKey = licenseKey,
+                Fingerprint = FingerprintBody(),
+                Nonce = nonce,
+                Hostname = ReportedHostname(),
+                Os = RuntimeInformation.OSDescription,
+                Arch = RuntimeInformation.OSArchitecture.ToString(),
+                AppVersion = _options.AppVersion,
+                SdkVersion = SdkVersion.Id,
             };
-            using var doc = await PostAsync("/v1/client/activate", body, ct).ConfigureAwait(false);
+            using var doc = await PostAsync(
+                "/v1/client/activate", body, WireJson.Default.ActivateReq, ct).ConfigureAwait(false);
             JsonElement root = doc.RootElement;
 
             // Adopt the keyset delivered with activation, then verify against the
@@ -881,20 +884,22 @@ namespace Talos.Sdk
             {
                 await EnsureKeysetAsync(ct).ConfigureAwait(false);
                 string nonce = NewNonce();
-                var body = new
+                var body = new ValidateReq
                 {
-                    product_token = _options.ProductToken,
-                    fingerprint = new { composite = _fingerprint, components = _fp.Components },
-                    activation_secret = _activationSecret,
-                    nonce,
+                    ProductToken = _options.ProductToken,
+                    Fingerprint = FingerprintBody(),
+                    ActivationSecret = _activationSecret,
+                    Nonce = nonce,
                     // Sent here as well as on activation and heartbeat, because
                     // check-ins are opt-in and this call is not: an application
                     // that validates on launch and never starts them would
                     // otherwise show, forever, whatever version it activated on.
-                    app_version = _options.AppVersion,
-                    sdk_version = SdkVersion.Id,
+                    AppVersion = _options.AppVersion,
+                    SdkVersion = SdkVersion.Id,
                 };
-                using var doc = await PostAsync("/v1/client/validate", body, ct).ConfigureAwait(false);
+                using var doc = await PostAsync(
+                    "/v1/client/validate", body, WireJson.Default.ValidateReq, ct)
+                    .ConfigureAwait(false);
                 string token = doc.RootElement.GetProperty("validation_token").GetString()!;
                 JsonElement claims = TalosCompact.Verify(
                     LicenseVerifyKeys(), "validation", _options.ProductToken, nonce, token);
@@ -995,22 +1000,24 @@ namespace Talos.Sdk
             RequireActivated();
             await EnsureKeysetAsync(ct).ConfigureAwait(false);
             string nonce = NewNonce();
-            var body = new
+            var body = new HeartbeatReq
             {
-                product_token = _options.ProductToken,
-                fingerprint = new { composite = _fingerprint, components = _fp.Components },
-                activation_secret = _activationSecret,
-                nonce,
-                app_version = _options.AppVersion,
-                os = RuntimeInformation.OSDescription,
-                arch = RuntimeInformation.OSArchitecture.ToString(),
-                sdk_version = SdkVersion.Id,
+                ProductToken = _options.ProductToken,
+                Fingerprint = FingerprintBody(),
+                ActivationSecret = _activationSecret,
+                Nonce = nonce,
+                AppVersion = _options.AppVersion,
+                Os = RuntimeInformation.OSDescription,
+                Arch = RuntimeInformation.OSArchitecture.ToString(),
+                SdkVersion = SdkVersion.Id,
                 // Naming the channel is what asks the server for the update
                 // hint, and it costs two queries there — so it is asked for
                 // only when somebody is listening for the answer.
-                update_channel = UpdateAvailable == null ? null : UpdateChannel(),
+                UpdateChannel = UpdateAvailable == null ? null : UpdateChannel(),
             };
-            using var doc = await PostAsync("/v1/client/heartbeat", body, ct).ConfigureAwait(false);
+            using var doc = await PostAsync(
+                "/v1/client/heartbeat", body, WireJson.Default.HeartbeatReq, ct)
+                .ConfigureAwait(false);
             JsonElement claims = TalosCompact.Verify(
                 LicenseVerifyKeys(), "heartbeat", _options.ProductToken, nonce,
                 doc.RootElement.GetProperty("heartbeat_token").GetString()!);
@@ -1040,6 +1047,10 @@ namespace Talos.Sdk
             await AnnounceUpdateAsync(claims, ct).ConfigureAwait(false);
             return state;
         }
+
+        /// <summary>This machine's fingerprint, as every request carries it.</summary>
+        private FingerprintDto FingerprintBody() =>
+            new FingerprintDto { Composite = _fingerprint, Components = _fp.Components };
 
         /// <summary>The channel this install follows; <c>stable</c> unless set.</summary>
         private string UpdateChannel() =>
@@ -1094,13 +1105,15 @@ namespace Talos.Sdk
         public async Task DeactivateAsync(CancellationToken ct = default)
         {
             RequireActivated();
-            var body = new
+            var body = new DeactivateReq
             {
-                product_token = _options.ProductToken,
-                fingerprint = new { composite = _fingerprint, components = _fp.Components },
-                activation_secret = _activationSecret,
+                ProductToken = _options.ProductToken,
+                Fingerprint = FingerprintBody(),
+                ActivationSecret = _activationSecret,
             };
-            using var _ = await PostAsync("/v1/client/deactivate", body, ct).ConfigureAwait(false);
+            using var _ = await PostAsync(
+                "/v1/client/deactivate", body, WireJson.Default.DeactivateReq, ct)
+                .ConfigureAwait(false);
             ForgetBinding();
         }
 
@@ -1122,15 +1135,16 @@ namespace Talos.Sdk
             // is in flight, we must not adopt the seat we just took.
             int generation = _leaseGeneration;
             string nonce = NewNonce();
-            var body = new
+            var body = new LeaseReq
             {
-                product_token = _options.ProductToken,
-                fingerprint = new { composite = _fingerprint, components = _fp.Components },
-                activation_secret = _activationSecret,
-                instance_id = instanceId,
-                nonce,
+                ProductToken = _options.ProductToken,
+                Fingerprint = FingerprintBody(),
+                ActivationSecret = _activationSecret,
+                InstanceId = instanceId,
+                Nonce = nonce,
             };
-            using var doc = await PostAsync("/v1/client/leases", body, ct).ConfigureAwait(false);
+            using var doc = await PostAsync("/v1/client/leases", body, WireJson.Default.LeaseReq, ct)
+                .ConfigureAwait(false);
             JsonElement root = doc.RootElement;
 
             // The lease token is signed: a MITM cannot fabricate a seat.
@@ -1186,16 +1200,17 @@ namespace Talos.Sdk
         private async Task ReleaseInstanceAsync(string instanceId, CancellationToken ct)
         {
             if (_activationSecret == null) return;
-            var body = new
+            var body = new LeaseReq
             {
-                product_token = _options.ProductToken,
-                fingerprint = new { composite = _fingerprint, components = _fp.Components },
-                activation_secret = _activationSecret,
-                instance_id = instanceId,
+                ProductToken = _options.ProductToken,
+                Fingerprint = FingerprintBody(),
+                ActivationSecret = _activationSecret,
+                InstanceId = instanceId,
             };
             try
             {
-                using var _ = await SendAsync(HttpMethod.Delete, "/v1/client/leases", body, ct)
+                using var _ = await SendAsync(
+                    HttpMethod.Delete, "/v1/client/leases", body, WireJson.Default.LeaseReq, ct)
                     .ConfigureAwait(false);
             }
             catch
@@ -1291,16 +1306,18 @@ namespace Talos.Sdk
             RequireActivated();
             await EnsureKeysetAsync(ct).ConfigureAwait(false);
             opts ??= new CheckForUpdateOptions();
-            var body = new
+            var body = new UpdateCheckReq
             {
-                product_token = _options.ProductToken,
-                fingerprint = new { composite = _fingerprint, components = _fp.Components },
-                activation_secret = _activationSecret,
-                current_version = opts.CurrentVersion ?? _options.AppVersion,
-                current_release_seq = ReleaseFloor(opts.CurrentReleaseSeq),
-                channel = opts.Channel ?? UpdateChannel(),
+                ProductToken = _options.ProductToken,
+                Fingerprint = FingerprintBody(),
+                ActivationSecret = _activationSecret,
+                CurrentVersion = opts.CurrentVersion ?? _options.AppVersion,
+                CurrentReleaseSeq = ReleaseFloor(opts.CurrentReleaseSeq),
+                Channel = opts.Channel ?? UpdateChannel(),
             };
-            using var doc = await PostAsync("/v1/client/updates/check", body, ct).ConfigureAwait(false);
+            using var doc = await PostAsync(
+                "/v1/client/updates/check", body, WireJson.Default.UpdateCheckReq, ct)
+                .ConfigureAwait(false);
             JsonElement root = doc.RootElement;
             if (!root.TryGetProperty("update_available", out var ua) || ua.ValueKind != JsonValueKind.True)
                 return null;
@@ -1693,8 +1710,9 @@ namespace Talos.Sdk
             return state;
         }
 
-        private Task<JsonDocument> PostAsync(string path, object body, CancellationToken ct)
-            => SendAsync(HttpMethod.Post, path, body, ct);
+        private Task<JsonDocument> PostAsync<T>(
+            string path, T body, JsonTypeInfo<T> type, CancellationToken ct)
+            => SendAsync(HttpMethod.Post, path, body, type, ct);
 
         /// <summary>
         /// Default cap on a licensing call, in milliseconds.
@@ -1706,10 +1724,12 @@ namespace Talos.Sdk
         /// </remarks>
         private const int DefaultHttpTimeoutMs = 10_000;
 
-        private async Task<JsonDocument> SendAsync(
-            HttpMethod method, string path, object body, CancellationToken ct)
+        private async Task<JsonDocument> SendAsync<T>(
+            HttpMethod method, string path, T body, JsonTypeInfo<T> type, CancellationToken ct)
         {
-            string json = JsonSerializer.Serialize(body);
+            // Serialized through generated metadata, never by reflection: see
+            // WireJson. A trimmed application would otherwise send `{}`.
+            string json = JsonSerializer.Serialize(body, type);
             using var req = new HttpRequestMessage(method, _options.ServerUrl.TrimEnd('/') + path)
             {
                 Content = new StringContent(json, Encoding.UTF8, "application/json"),

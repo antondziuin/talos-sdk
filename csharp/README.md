@@ -107,6 +107,20 @@ surface.
 Both are on the list to revisit once this SDK is published and its surface has
 settled — see `docs/AUDIT-BACKLOG.md`.
 
+## Trimming and NativeAOT
+
+The SDK is marked `IsAotCompatible` on `net8.0`, which turns on the trim, AOT
+and single-file analyzers over its own code, and CI builds it with
+`-warnaserror`. That combination is the point: every request body is a declared
+type with a **compile-time** serializer (`[JsonSerializable]` source generation),
+and a reflective `JsonSerializer` call coming back is a build error rather than
+an application that publishes cleanly and then sends `{}` to `/v1/client/activate`
+on a customer's machine. Responses were never reflected over — they are read
+field by field through `JsonDocument`.
+
+The `netstandard2.0` build carries the same generated serializers; it simply has
+no analyzers, because there is no trimmed publish there to protect.
+
 ## The machine binding is persistent
 
 `ActivateAsync` binds this machine and the SDK writes that binding to a

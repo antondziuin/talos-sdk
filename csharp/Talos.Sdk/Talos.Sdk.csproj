@@ -15,6 +15,16 @@
     <Authors>Talos</Authors>
   </PropertyGroup>
 
+  <!-- Turns on the trim/AOT/single-file analyzers, which are what actually keep
+       this library reflection-free: every JSON call goes through a generated
+       serializer (WireJson, StateJson), and a reflective one coming back is a
+       build error rather than an app that ships and sends `{}`. net8.0 only —
+       the analyzers do not exist for netstandard2.0, and neither does an AOT
+       publish to protect. -->
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" />
     <PackageReference Include="Microsoft.Win32.Registry" Version="5.0.0" />
