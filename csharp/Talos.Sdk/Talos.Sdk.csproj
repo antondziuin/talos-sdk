@@ -13,7 +13,35 @@
     <Version>0.0.0</Version>
     <Description>Client SDK for the Talos licensing &amp; software-protection platform.</Description>
     <Authors>Talos</Authors>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <!-- The symbols nobody thinks about until they are looking at a stack trace
+         from a customer's machine. A `.snupkg` beside the package lets a
+         debugger step into this library from an application that only ever
+         referenced it, which is the difference between "somewhere inside the
+         licensing SDK" and a line number. -->
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <!-- SourceLink, which ships inside the .NET SDK: these two properties are
+         all it needs to stamp the package with where the source came from and
+         to embed the files git does not track (the generated serializers).
+         There is no remote on this repository yet, so today they resolve to
+         nothing; the day there is one, the packages already carry it rather
+         than the first release after somebody remembers. -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
   </PropertyGroup>
+
+  <!-- A deterministic build: the same source produces byte-identical output, so
+       a package can be rebuilt from a tag and compared with the one that was
+       published. Only under CI, because the path mapping it turns on makes
+       local debugging worse for no gain on a machine that is not publishing. -->
+  <PropertyGroup Condition="'$(ContinuousIntegrationBuild)' == '' and '$(CI)' == 'true'">
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <!-- Turns on the trim/AOT/single-file analyzers, which are what actually keep
        this library reflection-free: every JSON call goes through a generated
