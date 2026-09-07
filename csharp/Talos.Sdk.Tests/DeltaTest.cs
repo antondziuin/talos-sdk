@@ -261,6 +261,35 @@ namespace Talos.Sdk.Tests
 
         // ---- the properties ---------------------------------------------------
 
+        /// <summary>
+        /// A maintenance licence that has run out is not a licence that failed.
+        /// <para>
+        /// <c>ValidateAsync</c> still says valid — the customer keeps the version
+        /// they bought — and only the update check refuses, with
+        /// <c>updates_not_entitled</c>. An application that reads that 403 as a
+        /// licensing error locks a paying customer out of software they own; one
+        /// that reads it as "no update available" never tells them their
+        /// maintenance lapsed. Telling them apart needs the code, so the code has
+        /// to survive to the caller.
+        /// </para>
+        /// </summary>
+        [Fact]
+        public async Task SaysWhyUpdatesWereRefusedRatherThanJustThatTheyWere()
+        {
+            var (pub, _) = Keypair();
+            var http = new HttpClient(new Router(_ => new HttpResponseMessage(HttpStatusCode.Forbidden)
+            {
+                Content = new StringContent(
+                    "{\"error\":\"updates_not_entitled\"}", Encoding.UTF8, "application/json"),
+            }));
+            var client = Client(pub, http, "1.0.0");
+
+            var refused = await Assert.ThrowsAsync<TalosApiException>(
+                () => client.CheckForUpdateAsync());
+            Assert.Equal(403, refused.StatusCode);
+            Assert.Equal("updates_not_entitled", refused.Error);
+        }
+
         [Fact]
         public async Task KeepsPatchesOutOfTheListDownloadUpdatePicksFrom()
         {

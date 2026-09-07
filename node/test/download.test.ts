@@ -165,6 +165,31 @@ describe("downloadUpdate", () => {
    * and the host had nothing to show a user for the minutes it took: one
    * promise, no output, indistinguishable from a hang.
    */
+  /**
+   * A maintenance licence that has run out is not a licence that has failed.
+   *
+   * `validate` still says valid — the customer keeps the version they bought —
+   * and only `/updates/check` refuses, with `updates_not_entitled`. An
+   * application that treats that 403 as a licensing error locks a paying
+   * customer out of software they own; one that treats it as "no update
+   * available" never tells them their maintenance lapsed. Distinguishing it is
+   * the point, so the code has to reach the caller.
+   */
+  it("says why updates were refused, not just that they were", async () => {
+    const { pubB64 } = keypair();
+    const impl: FetchLike = () =>
+      Promise.resolve({
+        status: 403,
+        text: () => Promise.resolve(JSON.stringify({ error: "updates_not_entitled" })),
+        arrayBuffer: () => Promise.reject(new Error("not a download")),
+      });
+
+    await expect(seededClient(pubB64, impl).checkForUpdate()).rejects.toMatchObject({
+      statusCode: 403,
+      errorCode: "updates_not_entitled",
+    });
+  });
+
   it("reports progress while the bytes are still arriving", async () => {
     const { pubB64 } = keypair();
     const res = streamResponse(payload);

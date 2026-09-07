@@ -246,6 +246,35 @@ hint's word. Nothing is asked for and nothing is spent while no listener is
 attached, and each release is announced once however long the user puts off
 installing it.
 
+## When updates are refused
+
+A maintenance licence that has run out is **not** a licence that has failed.
+`validate()` still returns `valid` — the customer keeps the version they bought,
+and their application must keep working — and only the update check refuses:
+
+```ts
+try {
+  const upd = await talos.checkForUpdate();
+  if (upd) offerUpdate(upd);
+} catch (e) {
+  if (e instanceof TalosApiError && e.errorCode === "updates_not_entitled") {
+    // Not a licensing failure. Say what it is and what fixes it.
+    showNotice("Your maintenance period has ended. The app keeps working; renew to get updates.");
+  } else {
+    throw e;
+  }
+}
+```
+
+Both mistakes here cost something. Treating the 403 as a licensing error locks a
+paying customer out of software they own. Treating it as "no update available"
+never tells them their maintenance lapsed, so they find out when they ask why
+they are three versions behind — and nobody renews for a reason they were not
+given.
+
+The same code arrives on the artifact download, for the same reason: the gate is
+the licence's `updates` entitlement, checked on both routes.
+
 ## Hardware changes
 
 The SDK identifies the machine by a set of component hashes (never the raw
