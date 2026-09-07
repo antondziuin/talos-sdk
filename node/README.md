@@ -275,6 +275,27 @@ given.
 The same code arrives on the artifact download, for the same reason: the gate is
 the licence's `updates` entitlement, checked on both routes.
 
+## Hardening the shipped bundle
+
+The renderer, the bundle and the disk all belong to the person running your
+application, so nothing here is a licence check — the checks are on the server,
+and the entitlement is the thing worth gating on (see the portal's
+"Entitlements" page). What client-side hardening buys is time.
+
+- **Bundle first**, with esbuild or webpack: one file, no module boundaries, no
+  helpfully-named source files to open.
+- **Then `bytenode`**, which compiles that bundle to V8 bytecode — the practical
+  option for Node and Electron applications, and the one this SDK's C# sibling
+  reaches for with NativeAOT.
+- **Keep the client in the main process** in Electron. The renderer is the part
+  an attacker already controls; it should be told a verdict and never hold the
+  activation secret (see `examples/electron-main`).
+
+Honestly labelled: bytecode can be decompiled and every obfuscator has a
+deobfuscator. These buy an attacker's afternoon, not their ability — which is
+why the server decides seats, expiry and revocation, and why a feature that only
+exists on the server cannot be patched into existence on the client.
+
 ## Hardware changes
 
 The SDK identifies the machine by a set of component hashes (never the raw
