@@ -1,0 +1,85 @@
+{
+  "//": "Frozen Talos-compact wire vectors. Generated and checked by server/crates/talos-crypto/tests/wire_vectors.rs, and verified independently by the C# SDK (WireVectorsTest.cs) and the Node SDK (wire-vectors.test.ts). Not hand-editable: change the generator and re-bless with TALOS_BLESS_VECTORS=1.",
+  "aud": "tpt_01234567890123456789012345678901",
+  "keys": {
+    "anchor": "QArdijrt1uKNU17rV6Pha+rUNGPDlS9ktjatmS9F1yQ=",
+    "license": "gr39Hpo2O8YOVFuFyeOBIweV3jxfZplHVvIxKMvd+BA=",
+    "release": "EF2Bl4i0/705I3wKbRzpKMtv2BOm+z2A5k8SKAZ2HM4="
+  },
+  "negative": [
+    {
+      "key": "license",
+      "name": "tampered_payload",
+      "token": "talos.1.activation.eyJhAWQiOiJ0cHRfMDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTc2NzIyNTYwMCwia2lkIjoiazEiLCJsaWMiOnsiYWN0IjoiMDFhMDdiOWMtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwiZmVhdHVyZXMiOnsicHJvIjp0cnVlLCJzZWF0cyI6NX0sImZwaCI6ImI3ZjBjMWQyZTNhNGI1YzZkN2U4ZjkwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYmNjZGRlZWZmMDAxMTIyMzM0NDUiLCJncmFjZV9oIjo3Miwia2luZCI6InBlcnBldHVhbCIsImxpY19leHAiOm51bGwsInBvbGljeSI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMiIsInJldmFsX2giOjI0fSwibmJmIjoxNzY3MjI1NjAwLCJub24iOiJuMG5jZS1jb250cmFjdC12ZWN0b3ItMDAwMDAwMDAwMSIsInN1YiI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInR5cCI6ImFjdGl2YXRpb24iLCJ2IjoxfQ.22PYyV29syyX_4i5QBu9HcK3nC_0ULbSyOMfwrkS23TYZtTiHja2XQ3kjyrDgvFgCgWHC0SDdJPsSXdP_-CeBg",
+      "typ": "activation",
+      "why": "one character of the claims changed after signing"
+    },
+    {
+      "key": "license",
+      "name": "tampered_signature",
+      "token": "talos.1.activation.eyJhdWQiOiJ0cHRfMDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTc2NzIyNTYwMCwia2lkIjoiazEiLCJsaWMiOnsiYWN0IjoiMDFhMDdiOWMtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwiZmVhdHVyZXMiOnsicHJvIjp0cnVlLCJzZWF0cyI6NX0sImZwaCI6ImI3ZjBjMWQyZTNhNGI1YzZkN2U4ZjkwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYmNjZGRlZWZmMDAxMTIyMzM0NDUiLCJncmFjZV9oIjo3Miwia2luZCI6InBlcnBldHVhbCIsImxpY19leHAiOm51bGwsInBvbGljeSI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMiIsInJldmFsX2giOjI0fSwibmJmIjoxNzY3MjI1NjAwLCJub24iOiJuMG5jZS1jb250cmFjdC12ZWN0b3ItMDAwMDAwMDAwMSIsInN1YiI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInR5cCI6ImFjdGl2YXRpb24iLCJ2IjoxfQ.22PYAV29syyX_4i5QBu9HcK3nC_0ULbSyOMfwrkS23TYZtTiHja2XQ3kjyrDgvFgCgWHC0SDdJPsSXdP_-CeBg",
+      "typ": "activation",
+      "why": "one character of the signature changed"
+    },
+    {
+      "key": "license",
+      "name": "wrong_type_tag",
+      "token": "talos.1.validation.eyJhY3QiOiIwMWEwN2I5Yy0wMDAwLTcwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJhdWQiOiJ0cHRfMDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEiLCJkZWNpc2lvbiI6InZhbGlkIiwiZXhwIjo0MTAyNDQ0ODAwLCJmcGgiOiJiN2YwYzFkMmUzYTRiNWM2ZDdlOGY5MDExMjIzMzQ0NTU2Njc3ODg5OWFhYmJjY2RkZWVmZjAwMTEyMjMzNDQ1IiwiZ3JhY2VfdW50aWwiOjE3Njc0ODQ4MDAsImlhdCI6MTc2NzIyNTYwMCwia2lkIjoiazEiLCJsaWMiOnsiZmVhdHVyZXMiOnsicHJvIjp0cnVlLCJzZWF0cyI6NX0sImxpY19leHAiOm51bGx9LCJuYmYiOjE3NjcyMjU2MDAsIm5vbiI6Im4wbmNlLWNvbnRyYWN0LXZlY3Rvci0wMDAwMDAwMDAxIiwicmV2YWxfYWZ0ZXIiOjE3NjczMTIwMDAsInNlcnZlcl90aW1lIjoxNzY3MjI1NjAwLCJzdWIiOiIwMWEwN2I5Yy0wMDAwLTcwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0eXAiOiJ2YWxpZGF0aW9uIiwidiI6MX0.sohCqcRzY_JPqohjgVrUhxui3DHCouh_lOeoNnDZfNTyYfuIankyYM3snmw4UhlTW_KR729mV8cqcjdxcyO5Cg",
+      "typ": "activation",
+      "why": "a validation token presented where an activation is expected; typ is inside the signed prefix, so this fails twice over"
+    },
+    {
+      "key": "license",
+      "name": "signed_by_the_release_key",
+      "token": "talos.1.activation.eyJhdWQiOiJ0cHRfMDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTc2NzIyNTYwMCwia2lkIjoiazEiLCJsaWMiOnsiYWN0IjoiMDFhMDdiOWMtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwiZmVhdHVyZXMiOnsicHJvIjp0cnVlLCJzZWF0cyI6NX0sImZwaCI6ImI3ZjBjMWQyZTNhNGI1YzZkN2U4ZjkwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYmNjZGRlZWZmMDAxMTIyMzM0NDUiLCJncmFjZV9oIjo3Miwia2luZCI6InBlcnBldHVhbCIsImxpY19leHAiOm51bGwsInBvbGljeSI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMiIsInJldmFsX2giOjI0fSwibmJmIjoxNzY3MjI1NjAwLCJub24iOiJuMG5jZS1jb250cmFjdC12ZWN0b3ItMDAwMDAwMDAwMSIsInN1YiI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInR5cCI6ImFjdGl2YXRpb24iLCJ2IjoxfQ.Z_yOC5-Ier2LrWkfirMoViJS3j4XMF9BEus4FQyR5ZXXKaWhhAF22XK95U3nZMcE-LmCnp2NY62jl06evTn3BQ",
+      "typ": "activation",
+      "why": "the same claims signed by the product's OTHER key: one key's signatures must not be valid in another key's role"
+    },
+    {
+      "key": "license",
+      "name": "truncated",
+      "token": "talos.1.activation.eyJhdWQiOiJ0cHRfMDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTc2NzIyNTYwMCwia2lkIjoiazEiLCJsaWMiOnsiYWN0IjoiMDFhMDdiOWMtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwiZmVhdHVyZXMiOnsicHJvIjp0cnVlLCJzZWF0cyI6NX0sImZwaCI6ImI3ZjBjMWQyZTNhNGI1YzZkN2U4ZjkwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYmNjZGRlZWZmMDAxMTIyMzM0NDUiLCJncmFjZV9oIjo3Miwia2luZCI6InBlcnBldHVhbCIsImxpY19leHAiOm51bGwsInBvbGljeSI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMiIsInJldmFsX2giOjI0fSwibmJmIjoxNzY3MjI1NjAwLCJub24iOiJuMG5jZS1jb250cmFjdC12ZWN0b3ItMDAwMDAwMDAwMSIsInN1YiI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInR5cCI6ImFjdGl2YXRpb24iLCJ2IjoxfQ",
+      "typ": "activation",
+      "why": "the signature segment removed entirely"
+    }
+  ],
+  "nonce": "n0nce-contract-vector-0000000001",
+  "vectors": [
+    {
+      "key": "license",
+      "name": "activation",
+      "token": "talos.1.activation.eyJhdWQiOiJ0cHRfMDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTc2NzIyNTYwMCwia2lkIjoiazEiLCJsaWMiOnsiYWN0IjoiMDFhMDdiOWMtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwiZmVhdHVyZXMiOnsicHJvIjp0cnVlLCJzZWF0cyI6NX0sImZwaCI6ImI3ZjBjMWQyZTNhNGI1YzZkN2U4ZjkwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYmNjZGRlZWZmMDAxMTIyMzM0NDUiLCJncmFjZV9oIjo3Miwia2luZCI6InBlcnBldHVhbCIsImxpY19leHAiOm51bGwsInBvbGljeSI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMiIsInJldmFsX2giOjI0fSwibmJmIjoxNzY3MjI1NjAwLCJub24iOiJuMG5jZS1jb250cmFjdC12ZWN0b3ItMDAwMDAwMDAwMSIsInN1YiI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInR5cCI6ImFjdGl2YXRpb24iLCJ2IjoxfQ.22PYyV29syyX_4i5QBu9HcK3nC_0ULbSyOMfwrkS23TYZtTiHja2XQ3kjyrDgvFgCgWHC0SDdJPsSXdP_-CeBg",
+      "typ": "activation"
+    },
+    {
+      "key": "license",
+      "name": "validation",
+      "token": "talos.1.validation.eyJhY3QiOiIwMWEwN2I5Yy0wMDAwLTcwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJhdWQiOiJ0cHRfMDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEiLCJkZWNpc2lvbiI6InZhbGlkIiwiZXhwIjo0MTAyNDQ0ODAwLCJmcGgiOiJiN2YwYzFkMmUzYTRiNWM2ZDdlOGY5MDExMjIzMzQ0NTU2Njc3ODg5OWFhYmJjY2RkZWVmZjAwMTEyMjMzNDQ1IiwiZ3JhY2VfdW50aWwiOjE3Njc0ODQ4MDAsImlhdCI6MTc2NzIyNTYwMCwia2lkIjoiazEiLCJsaWMiOnsiZmVhdHVyZXMiOnsicHJvIjp0cnVlLCJzZWF0cyI6NX0sImxpY19leHAiOm51bGx9LCJuYmYiOjE3NjcyMjU2MDAsIm5vbiI6Im4wbmNlLWNvbnRyYWN0LXZlY3Rvci0wMDAwMDAwMDAxIiwicmV2YWxfYWZ0ZXIiOjE3NjczMTIwMDAsInNlcnZlcl90aW1lIjoxNzY3MjI1NjAwLCJzdWIiOiIwMWEwN2I5Yy0wMDAwLTcwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0eXAiOiJ2YWxpZGF0aW9uIiwidiI6MX0.sohCqcRzY_JPqohjgVrUhxui3DHCouh_lOeoNnDZfNTyYfuIankyYM3snmw4UhlTW_KR729mV8cqcjdxcyO5Cg",
+      "typ": "validation"
+    },
+    {
+      "key": "license",
+      "name": "heartbeat",
+      "token": "talos.1.heartbeat.eyJhdWQiOiJ0cHRfMDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEiLCJkZWNpc2lvbiI6InZhbGlkIiwiZXhwIjo0MTAyNDQ0ODAwLCJmcGgiOiJiN2YwYzFkMmUzYTRiNWM2ZDdlOGY5MDExMjIzMzQ0NTU2Njc3ODg5OWFhYmJjY2RkZWVmZjAwMTEyMjMzNDQ1IiwiaGVhcnRiZWF0X2ludGVydmFsX3MiOjM2MDAsImlhdCI6MTc2NzIyNTYwMCwia2lkIjoiazEiLCJuYmYiOjE3NjcyMjU2MDAsIm5vbiI6Im4wbmNlLWNvbnRyYWN0LXZlY3Rvci0wMDAwMDAwMDAxIiwic2VydmVyX3RpbWUiOjE3NjcyMjU2MDAsInN1YiI6IjAxYTA3YjljLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInR5cCI6ImhlYXJ0YmVhdCIsInVwZCI6dHJ1ZSwidiI6MX0.gS9CUyAd9f9XBPRA3qTvPnB-UPz8eW0LoAtLRHcVCfcjhjDM1yxLUm0PGtHLsZcTQmUGyZxwWhwnXF27vO5FCg",
+      "typ": "heartbeat"
+    },
+    {
+      "key": "license",
+      "name": "lease",
+      "token": "talos.1.lease.eyJhdWQiOiJ0cHRfMDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEiLCJleHAiOjQxMDI0NDQ4MDAsImZwaCI6ImI3ZjBjMWQyZTNhNGI1YzZkN2U4ZjkwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYmNjZGRlZWZmMDAxMTIyMzM0NDUiLCJpYXQiOjE3NjcyMjU2MDAsImluc3QiOiJpbnN0LTEiLCJraWQiOiJrMSIsImxlYXNlIjoiMDFhMDdiOWMwMDAwNzAwMDgwMDAwMDAwMDAwMDAwMDQiLCJtYXhfc2VhdHMiOjMsIm5iZiI6MTc2NzIyNTYwMCwibm9uIjoibjBuY2UtY29udHJhY3QtdmVjdG9yLTAwMDAwMDAwMDEiLCJzZWF0c19pbl91c2UiOjEsInNlcnZlcl90aW1lIjoxNzY3MjI1NjAwLCJzdWIiOiIwMWEwN2I5Yy0wMDAwLTcwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0eXAiOiJsZWFzZSIsInYiOjF9.M_ty4SMEQZFNcdkHmQkOSG1jUxkll_PmgQaYDEI2-pTX4RXBGfwgJO5y21M0fEWvDccyvPfX3LEWjAla2JdBBg",
+      "typ": "lease"
+    },
+    {
+      "key": "anchor",
+      "name": "keyset",
+      "token": "talos.1.keyset.eyJhbmNob3Jfa2lkIjoiYW5jaG9yMSIsImF1ZCI6InRwdF8wMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMSIsImlhdCI6MTc2NzIyNTYwMCwiaXNzIjoiMDFhMDdiOWMtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMDBhIiwia2V5cyI6W3sia2lkIjoiazEiLCJwayI6ImdyMzlIcG8yTzhZT1ZGdUZ5ZU9CSXdlVjNqeGZacGxIVnZJeEtNdmQrQkE9IiwicHVycG9zZSI6ImxpY2Vuc2UiLCJzdGF0dXMiOiJhY3RpdmUifSx7ImtpZCI6InIxIiwicGsiOiJFRjJCbDRpMC83MDVJM3dLYlJ6cEtNdHYyQk9tK3oyQTVrOFNLQVoySE00PSIsInB1cnBvc2UiOiJyZWxlYXNlIiwic3RhdHVzIjoiYWN0aXZlIn1dLCJ0eXAiOiJrZXlzZXQiLCJ2IjoxfQ.yPSqUTMofBKM8-jxD_o5dp5zMFOHc7afyYO8v4tM6g2EMx0SULY2W_pkEDSxwm4bgKGDa7GsADrax_pADhl3Ag",
+      "typ": "keyset"
+    },
+    {
+      "key": "release",
+      "name": "manifest",
+      "token": "talos.1.manifest.eyJhcnRpZmFjdHMiOlt7ImFyY2giOiJ4NjQiLCJmaWxlbmFtZSI6Im5vdGVzLTEuMi4wLXg2NC5leGUiLCJraW5kIjoiaW5zdGFsbGVyIiwicGxhdGZvcm0iOiJ3aW5kb3dzIiwic2hhMjU2IjoiM2IxZjhlMGE1YzJkNGU2ZjgwOTFhMmIzYzRkNWU2ZjcwODE5MmEzYjRjNWQ2ZTdmODA5MWEyYjNjNGQ1ZTZmNyIsInNpemUiOjQxOTQzMDR9XSwiYXVkIjoidHB0XzAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxIiwiY2hhbm5lbCI6InN0YWJsZSIsImlhdCI6MTc2NzIyNTYwMCwiaXNzIjoiMDFhMDdiOWMtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMDBhIiwia2lkIjoicjEiLCJtYW5kYXRvcnkiOmZhbHNlLCJub3RfYmVmb3JlIjpudWxsLCJub3Rlc191cmwiOm51bGwsInByb2R1Y3RfaWQiOiIwMWEwN2I5YzAwMDA3MDAwODAwMDAwMDAwMDAwMDAwNiIsInB1Ymxpc2hlZF9hdCI6MTc2NzIyNTYwMCwicmVsZWFzZV9zZXEiOjcsInN1YiI6IjAxYTA3YjljMDAwMDcwMDA4MDAwMDAwMDAwMDAwMDA1IiwidHlwIjoibWFuaWZlc3QiLCJ2IjoxLCJ2ZXJzaW9uIjoiMS4yLjAifQ.uWleMJu0NBvLKfQFLbJlAxMCtNejLbhhv4SgOx2cOlIy_RPi_wQEWHybk1sgm6m7O71QbQOEDWe93CCb5RQwBg",
+      "typ": "manifest"
+    }
+  ]
+}

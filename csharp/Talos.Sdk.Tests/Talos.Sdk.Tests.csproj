@@ -17,4 +17,13 @@
     <ProjectReference Include="..\Talos.Sdk\Talos.Sdk.csproj" />
   </ItemGroup>
 
+  <!-- The frozen wire vectors, shared with the Rust generator and the Node SDK.
+       Linked rather than copied: one file, three readers, no chance of an SDK
+       verifying a stale private copy of the contract. -->
+  <ItemGroup>
+    <None Include="..\..\contract-vectors.json" Link="contract-vectors.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>
