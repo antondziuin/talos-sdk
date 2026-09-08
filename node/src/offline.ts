@@ -23,6 +23,16 @@ import { b64urlEncode } from "./talos-compact.js";
 
 /** Domain tag of `talos-request.json`; also part of what is signed. */
 export const REQUEST_DOMAIN = "talos-offline-request";
+
+/**
+ * Domain tag of `talos-deactivation.json`, the document that hands a seat back.
+ *
+ * The second thing a machine key signs, and the reason the domain is inside the
+ * signed bytes rather than beside them: without it a captured request would be a
+ * valid receipt for the same machine, and returning a seat is not what its owner
+ * asked for when they asked for a licence.
+ */
+export const RECEIPT_DOMAIN = "talos-offline-deactivation";
 /** `kind` of the file the portal issues back. */
 export const LICENSE_FILE_KIND = "talos-offline-license";
 const DOC_VERSION = 1;

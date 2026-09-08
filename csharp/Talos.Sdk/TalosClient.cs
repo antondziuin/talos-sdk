@@ -773,7 +773,7 @@ namespace Talos.Sdk
         /// </summary>
         /// <remarks>
         /// <para>
-        /// Save <see cref="OfflineRequest.ToJson"/> as <c>talos-request.json</c>,
+        /// Save <see cref="OfflineDocument.ToJson"/> as <c>talos-request.json</c>,
         /// carry it to whoever sold the licence, and they upload it in the
         /// portal. What comes back is a <c>license.talos</c> for
         /// <see cref="LoadOfflineLicenseAsync(string, CancellationToken)"/> — and
@@ -792,7 +792,7 @@ namespace Talos.Sdk
         /// needed — but when present the server checks it against the licence
         /// being issued against, which catches issuing from the wrong tab.
         /// </param>
-        public OfflineRequest CreateOfflineRequest(string? licenseKey = null)
+        public OfflineDocument CreateOfflineRequest(string? licenseKey = null)
         {
             var key = MachineKey();
             var payload = new OfflineRequestPayload
@@ -892,6 +892,73 @@ namespace Talos.Sdk
             // about which keys this client trusts.
             if (!string.IsNullOrEmpty(keyset)) AdoptKeyset(keyset);
             return AdoptOfflineToken(token!, keyset);
+        }
+
+        /// <summary>
+        /// Hand this machine's air-gapped seat back.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Write <see cref="OfflineDocument.ToJson"/> as
+        /// <c>talos-deactivation.json</c> and send it to the vendor; they upload
+        /// it in the portal and the seat returns to the pool. Signed by the same
+        /// key the licence file is bound to, which is what makes it worth
+        /// anything to a server that has never spoken to this machine.
+        /// </para>
+        /// <para>
+        /// <b>The licence is dropped here, before the document is returned</b> —
+        /// so an application that writes the file, or loses it, or never sends it
+        /// has still stopped using the seat it is giving up. A receipt proves
+        /// intent, not destruction: the vendor's copy of the file cannot be
+        /// recalled, and if this machine is later restored from a snapshot it
+        /// keeps working until that file expires. That is the accepted cost, and
+        /// it is why the horizon is short.
+        /// </para>
+        /// <para>
+        /// Throws when this install holds no offline licence — there is nothing
+        /// to hand back, and a document saying otherwise would be a lie the
+        /// vendor acts on.
+        /// </para>
+        /// </remarks>
+        public OfflineDocument CreateOfflineDeactivation()
+        {
+            string? token = _binding?.OfflineToken;
+            string? key = _binding?.MachineKey;
+            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(key))
+                throw new TalosException("no offline licence to hand back");
+
+            // Read what the file says about itself before dropping it: the
+            // receipt has to name the file and the machine, and afterwards there
+            // is nothing to read it from.
+            JsonElement claims;
+            try
+            {
+                claims = TalosCompact.VerifyCached(
+                    LicenseVerifyKeys(), "offline", _options.ProductToken, token!);
+            }
+            catch (TalosException e)
+            {
+                throw new TalosException("the stored offline licence no longer verifies", e);
+            }
+            var payload = new OfflineReceiptPayload
+            {
+                Fid = GetStr(claims, "fid") ?? "",
+                Mid = GetStr(claims, "mid") ?? "",
+                Fph = _fingerprint,
+                LocalTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            };
+
+            // Drop it first. The order is the point: see above.
+            StoredBinding b = BindingBase();
+            b.OfflineToken = null;
+            _binding = b;
+            Current = null;
+            _store?.Save(b);
+
+            return Offline.SignDocument(
+                key!,
+                Offline.ReceiptDomain,
+                JsonSerializer.Serialize(payload, WireJson.Default.OfflineReceiptPayload));
         }
 
         /// <summary>

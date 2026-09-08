@@ -135,7 +135,7 @@ namespace Talos.Sdk.Tests
                 HttpClient = new HttpClient(new Dead()),
             });
 
-        private static JsonElement PayloadOf(OfflineRequest doc)
+        private static JsonElement PayloadOf(OfflineDocument doc)
         {
             using var parsed = JsonDocument.Parse(B64UrlDecode(doc.Req));
             return parsed.RootElement.Clone();
@@ -147,7 +147,7 @@ namespace Talos.Sdk.Tests
         public void TheRequestIsSignedByTheKeyItNamesAndCarriesThisMachinesFingerprint()
         {
             var (pub, _) = Keypair();
-            OfflineRequest doc = Client(TempFile("state.bin"), publicKey: pub)
+            OfflineDocument doc = Client(TempFile("state.bin"), publicKey: pub)
                 .CreateOfflineRequest("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE");
             Assert.Equal(Offline.RequestDomain, doc.Kind);
 
@@ -190,7 +190,7 @@ namespace Talos.Sdk.Tests
         public void TheRequestSerialisesToTheDocumentTheServerReads()
         {
             var (pub, _) = Keypair();
-            OfflineRequest doc = Client(TempFile("state.bin"), publicKey: pub).CreateOfflineRequest();
+            OfflineDocument doc = Client(TempFile("state.bin"), publicKey: pub).CreateOfflineRequest();
             using var parsed = JsonDocument.Parse(doc.ToJson());
             JsonElement root = parsed.RootElement;
             // Four fields, spelled the way the portal route deserialises them —
@@ -356,6 +356,52 @@ namespace Talos.Sdk.Tests
             var missing = await Assert.ThrowsAsync<TalosException>(
                 () => talos.LoadOfflineLicenseAsync(Path.Combine(Path.GetTempPath(), "nope.talos")));
             Assert.Contains("cannot read", missing.Message);
+        }
+
+        [Fact]
+        public async Task HandsTheSeatBackAndDropsTheLicenceBeforeTheReceiptExists()
+        {
+            var (pub, key) = Keypair();
+            string state = TempFile("state.bin");
+            TalosClient talos = Client(state, publicKey: pub);
+            string mpk = PayloadOf(talos.CreateOfflineRequest())
+                .GetProperty("machine_pubkey").GetString()!;
+            await talos.LoadOfflineLicenseAsync(LicenseFile(Mint(key, "offline", OfflineJson(mpk))));
+
+            OfflineDocument receipt = talos.CreateOfflineDeactivation();
+            Assert.Equal(Offline.ReceiptDomain, receipt.Kind);
+            JsonElement payload = PayloadOf(receipt);
+            Assert.Equal("f-air-1", payload.GetProperty("fid").GetString());
+            Assert.Equal("m-air-1", payload.GetProperty("mid").GetString());
+            Assert.Equal(Composite(), payload.GetProperty("fph").GetString());
+
+            // Signed by the same key the file is bound to — which is the only
+            // reason a server that has never spoken to this machine can believe
+            // it.
+            var verifier = new Ed25519Signer();
+            verifier.Init(false, new Ed25519PublicKeyParameters(Convert.FromBase64String(mpk), 0));
+            byte[] msg = Encoding.ASCII.GetBytes(
+                Offline.SignedMessage(Offline.ReceiptDomain, receipt.Req));
+            verifier.BlockUpdate(msg, 0, msg.Length);
+            Assert.True(verifier.VerifySignature(B64UrlDecode(receipt.Sig)));
+
+            // The licence is gone here, not when the vendor gets round to the
+            // upload: an application that writes the file, loses it, or never
+            // sends it has still stopped using the seat it is giving up.
+            Assert.False(talos.IsActivated);
+            TalosClient restarted = Client(state, publicKey: pub);
+            Assert.False(restarted.IsActivated);
+            await Assert.ThrowsAsync<TalosException>(() => restarted.ValidateAsync());
+        }
+
+        [Fact]
+        public void RefusesToWriteAReceiptWhenThereIsNoOfflineLicenceToHandBack()
+        {
+            var (talos, _, _, _) = Requested();
+            // A document saying otherwise would be a lie the vendor acts on: a
+            // seat freed for an install that is still running.
+            var e = Assert.Throws<TalosException>(() => talos.CreateOfflineDeactivation());
+            Assert.Contains("no offline licence", e.Message);
         }
 
         [Fact]

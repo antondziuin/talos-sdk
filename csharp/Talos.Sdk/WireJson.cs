@@ -92,7 +92,7 @@ namespace Talos.Sdk
     }
 
     /// <summary>
-    /// The payload inside <see cref="OfflineRequest.Req"/> — everything the
+    /// The payload inside <see cref="OfflineDocument.Req"/> — everything the
     /// portal needs to cut an air-gapped licence file for this machine.
     /// </summary>
     /// <remarks>
@@ -132,6 +132,18 @@ namespace Talos.Sdk
         public long CreatedAt { get; set; }
     }
 
+    /// <summary>
+    /// The payload inside a <c>talos-deactivation.json</c>: which file this
+    /// machine is handing back, and its own account of when.
+    /// </summary>
+    internal sealed class OfflineReceiptPayload
+    {
+        public string Fid { get; set; } = "";
+        public string Mid { get; set; } = "";
+        public string Fph { get; set; } = "";
+        public long LocalTime { get; set; }
+    }
+
     /// <summary>`POST /v1/client/updates/check`.</summary>
     internal sealed class UpdateCheckReq
     {
@@ -168,11 +180,12 @@ namespace Talos.Sdk
     [JsonSerializable(typeof(LeaseReq))]
     [JsonSerializable(typeof(UpdateCheckReq))]
     // The air-gapped documents. Same policy, and they need it as much as the
-    // wire types do: `OfflineRequest.ToJson` is called from a host that may well
+    // wire types do: `OfflineDocument.ToJson` is called from a host that may well
     // be published AOT, and a reflective serializer there would hand the vendor
     // an empty envelope with a valid signature over nothing.
     [JsonSerializable(typeof(OfflineRequestPayload))]
-    [JsonSerializable(typeof(OfflineRequest))]
+    [JsonSerializable(typeof(OfflineReceiptPayload))]
+    [JsonSerializable(typeof(OfflineDocument))]
     internal partial class WireJson : JsonSerializerContext
     {
     }

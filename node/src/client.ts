@@ -18,6 +18,7 @@ import {
   generateMachineKey,
   signMachineDoc,
   LICENSE_FILE_KIND,
+  RECEIPT_DOMAIN,
   REQUEST_DOMAIN,
   type MachineKey,
   type SignedDoc,
@@ -537,9 +538,15 @@ export class TalosClient {
     const stored = this.store?.load() ?? null;
     if (stored) {
       this.binding = stored;
-      this.licenseKeyHash = stored.licenseKeyHash;
-      this.activationSecret = stored.activationSecret;
-      this.machineId = stored.machineId;
+      // Empty means absent, and the distinction is load-bearing now that a
+      // binding can exist without an activation: these fields are stored as
+      // strings and default to `""`, an air-gapped install has no secret and no
+      // id, and an install that has just handed its seat back has neither
+      // either. Kept as `""` they are truthy against a `!== null` test, and
+      // `isActivated` would answer yes for an install holding nothing.
+      this.licenseKeyHash = stored.licenseKeyHash || null;
+      this.activationSecret = stored.activationSecret || null;
+      this.machineId = stored.machineId || null;
       // Adopt the cached keyset before anything asks for a verification key.
       // Without it an anchor-only client has nothing to verify a cached
       // decision with, and the offline path is unreachable in exactly the
@@ -925,6 +932,59 @@ export class TalosClient {
     // this client trusts.
     if (typeof doc["keyset"] === "string") this.adoptKeyset(doc["keyset"]);
     return this.adoptOfflineToken(doc["token"], doc["keyset"]);
+  }
+
+  /**
+   * Hand this machine's air-gapped seat back.
+   *
+   * Save the returned object as `talos-deactivation.json` and send it to the
+   * vendor; they upload it in the portal and the seat returns to the pool.
+   * Signed by the same key the licence file is bound to, which is what makes it
+   * worth anything to a server that has never spoken to this machine.
+   *
+   * **The licence is dropped here, before the document is returned** — so an
+   * application that writes the file, or loses it, or never sends it has still
+   * stopped using the seat it is giving up. A receipt proves intent, not
+   * destruction: the vendor's copy of the file cannot be recalled, and if this
+   * machine is later restored from a snapshot it keeps working until that file
+   * expires. That is the accepted cost, and it is why the horizon is short.
+   *
+   * Throws when this install holds no offline licence — there is nothing to hand
+   * back, and a document saying otherwise would be a lie the vendor acts on.
+   */
+  createOfflineDeactivation(): SignedDoc {
+    const token = this.binding?.offlineToken;
+    const key = this.binding?.machineKey;
+    const pub = this.binding?.machinePublicKey;
+    if (!token || !key || !pub) {
+      throw new TalosError("no offline licence to hand back");
+    }
+    // Read what the file says about itself before dropping it: the receipt has
+    // to name the file and the machine, and after `forget` there is nothing to
+    // read it from.
+    let claims: Record<string, unknown>;
+    try {
+      claims = verifyCachedToken(
+        this.licenseVerifyKeys(),
+        "offline",
+        this.options.productToken,
+        token,
+      );
+    } catch {
+      throw new TalosError("the stored offline licence no longer verifies");
+    }
+
+    // Drop it first. The order is the point: see above.
+    this.binding = { ...this.bindingBase(), offlineToken: undefined };
+    this.current = null;
+    this.store?.save(this.binding);
+
+    return signMachineDoc({ privateKey: key, publicKey: pub }, RECEIPT_DOMAIN, {
+      fid: claims["fid"],
+      mid: claims["mid"],
+      fph: this.fingerprint,
+      local_time: nowSeconds(),
+    });
   }
 
   /**

@@ -257,6 +257,12 @@ does not verify. A file that is one but cannot license this machine comes back a
 a verdict you can show the user — `machine_mismatch`, `offline_file_expired` (get
 a new file), `expired` (renew the licence), `clock_tampered`.
 
+Retiring the machine? `talos.CreateOfflineDeactivation()` writes a
+`talos-deactivation.json` for the vendor to upload, and **drops the licence
+before returning it** — so an app that loses the file has still stopped using the
+seat. Credited once per file, so a machine restored from a snapshot replaying its
+receipt changes nothing.
+
 Two things to know before you offer this to customers. A file **cannot be
 recalled** — revoking it in the portal frees the seat so you can issue to a
 replacement machine, but the machine holding it keeps working until the file's

@@ -46,6 +46,18 @@ namespace Talos.Sdk
         /// </remarks>
         public const string RequestDomain = "talos-offline-request";
 
+        /// <summary>
+        /// Domain tag of <c>talos-deactivation.json</c>, the document that hands
+        /// a seat back.
+        /// </summary>
+        /// <remarks>
+        /// The second thing a machine key signs, and the reason the domain is
+        /// inside the signed bytes rather than beside them: without it a captured
+        /// request would be a valid receipt for the same machine, and returning a
+        /// seat is not what its owner asked for when they asked for a licence.
+        /// </remarks>
+        public const string ReceiptDomain = "talos-offline-deactivation";
+
         /// <summary><c>kind</c> of the file the portal issues back.</summary>
         public const string LicenseFileKind = "talos-offline-license";
 
@@ -81,7 +93,7 @@ namespace Talos.Sdk
             domain + "." + DocVersion + "." + payloadB64;
 
         /// <summary>Sign a payload as a machine document.</summary>
-        internal static OfflineRequest SignDocument(
+        internal static OfflineDocument SignDocument(
             string privateKeyB64, string domain, string payloadJson)
         {
             string req = Base64Url.Encode(Encoding.UTF8.GetBytes(payloadJson));
@@ -89,7 +101,7 @@ namespace Talos.Sdk
             var signer = new Ed25519Signer();
             signer.Init(true, new Ed25519PrivateKeyParameters(Convert.FromBase64String(privateKeyB64), 0));
             signer.BlockUpdate(msg, 0, msg.Length);
-            return new OfflineRequest
+            return new OfflineDocument
             {
                 V = DocVersion,
                 Kind = domain,
@@ -100,26 +112,32 @@ namespace Talos.Sdk
     }
 
     /// <summary>
-    /// <c>talos-request.json</c>: what a machine that cannot reach the server
-    /// writes, and a human carries to the vendor.
+    /// A document this machine signed, for a human to carry to the vendor.
     /// </summary>
     /// <remarks>
-    /// Returned by <see cref="TalosClient.CreateOfflineRequest"/>. Write
-    /// <see cref="ToJson"/> to a file and hand it over; what comes back is a
-    /// <c>license.talos</c> for
-    /// <see cref="TalosClient.LoadOfflineLicenseAsync(string, System.Threading.CancellationToken)"/>.
+    /// Two of them share this shape, which is why the type is not named after
+    /// either: <c>talos-request.json</c> from
+    /// <see cref="TalosClient.CreateOfflineRequest"/>, which asks for a licence
+    /// file, and <c>talos-deactivation.json</c> from
+    /// <see cref="TalosClient.CreateOfflineDeactivation"/>, which hands the seat
+    /// back. <see cref="Kind"/> says which, and it is inside the signed bytes —
+    /// so one is never a valid version of the other.
+    /// <para>
+    /// Write <see cref="ToJson"/> to a file and hand it over.
+    /// </para>
     /// </remarks>
-    public sealed class OfflineRequest
+    public sealed class OfflineDocument
     {
         /// <summary>Document version. <c>1</c>.</summary>
         public int V { get; set; } = Offline.DocVersion;
 
         /// <summary>
-        /// <c>talos-offline-request</c> — also the domain inside the signed bytes.
+        /// <see cref="Offline.RequestDomain"/> or <see cref="Offline.ReceiptDomain"/>
+        /// — also the domain inside the signed bytes.
         /// </summary>
         public string Kind { get; set; } = Offline.RequestDomain;
 
-        /// <summary>base64url of the request payload.</summary>
+        /// <summary>base64url of the payload.</summary>
         public string Req { get; set; } = "";
 
         /// <summary>
@@ -135,6 +153,6 @@ namespace Talos.Sdk
         /// this type would reach for reflection, which is exactly what
         /// <see cref="WireJson"/> exists to avoid.
         /// </remarks>
-        public string ToJson() => JsonSerializer.Serialize(this, WireJson.Default.OfflineRequest);
+        public string ToJson() => JsonSerializer.Serialize(this, WireJson.Default.OfflineDocument);
     }
 }

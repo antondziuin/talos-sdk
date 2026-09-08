@@ -7,7 +7,12 @@ import { describe, expect, it } from "vitest";
 
 import { TalosClient, type FetchLike, type TalosOptions } from "../src/client.js";
 import { collectFingerprint } from "../src/fingerprint.js";
-import { LICENSE_FILE_KIND, REQUEST_DOMAIN, signedMessage } from "../src/offline.js";
+import {
+  LICENSE_FILE_KIND,
+  RECEIPT_DOMAIN,
+  REQUEST_DOMAIN,
+  signedMessage,
+} from "../src/offline.js";
 
 /**
  * Air-gapped activation: the machine identity this SDK generates for itself, the
@@ -267,6 +272,46 @@ describe("loading an offline licence file", () => {
     const junk = path.join(mkdtempSync(path.join(os.tmpdir(), "talos-junk-")), "license.talos");
     writeFileSync(junk, "not json");
     await expect(talos.loadOfflineLicense(junk)).rejects.toThrow(/offline licence file/);
+  });
+
+  it("hands the seat back, and drops the licence before the receipt exists", async () => {
+    const { talos, mpk, file, licenseKey, pubB64 } = requested();
+    await talos.loadOfflineLicense(licenseFile(mint(licenseKey, "offline", offlineClaims(mpk))));
+
+    const receipt = talos.createOfflineDeactivation();
+    expect(receipt.kind).toBe(RECEIPT_DOMAIN);
+    const payload = requestPayload(receipt);
+    expect(payload["fid"]).toBe("f-air-1");
+    expect(payload["mid"]).toBe("m-air-1");
+    expect(payload["fph"]).toBe(fingerprint);
+
+    // Signed by the same key the file is bound to — which is the only reason a
+    // server that has never spoken to this machine can believe it.
+    const raw = Buffer.from(mpk, "base64");
+    const der = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), raw]);
+    expect(
+      cryptoVerify(
+        null,
+        Buffer.from(signedMessage(RECEIPT_DOMAIN, receipt.req), "ascii"),
+        createPublicKey({ key: der, format: "der", type: "spki" }),
+        b64urlDecode(receipt.sig),
+      ),
+    ).toBe(true);
+
+    // The licence is gone here, not when the vendor gets round to the upload:
+    // an application that writes the file, loses it, or never sends it has
+    // still stopped using the seat it is giving up.
+    expect(talos.isActivated).toBe(false);
+    const restarted = client({ statePath: file, publicKey: pubB64 });
+    expect(restarted.isActivated).toBe(false);
+    await expect(restarted.validate()).rejects.toThrow(/not activated/);
+  });
+
+  it("refuses to write a receipt when there is no offline licence to hand back", async () => {
+    const { talos } = requested();
+    // A document saying otherwise would be a lie the vendor acts on: a seat
+    // freed for an install that is still running.
+    expect(() => talos.createOfflineDeactivation()).toThrow(/no offline licence/);
   });
 
   it("verifies against a keyset carried inside the file, with only the anchor pinned", async () => {

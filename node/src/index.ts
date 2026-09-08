@@ -31,4 +31,9 @@ export { verifyToken, verifyManifest, verifyKeyset, publicKeyFromBase64 } from "
  * upload UI can label and recognise the files rather than matching strings it
  * copied out of the docs.
  */
-export { LICENSE_FILE_KIND, REQUEST_DOMAIN, type SignedDoc } from "./offline.js";
+export {
+  LICENSE_FILE_KIND,
+  RECEIPT_DOMAIN,
+  REQUEST_DOMAIN,
+  type SignedDoc,
+} from "./offline.js";
