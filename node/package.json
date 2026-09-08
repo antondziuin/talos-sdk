@@ -1,7 +1,8 @@
 {
   "name": "@talos/sdk",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Client SDK for the Talos licensing & software-protection platform.",
+  "license": "MIT",
   "type": "module",
   "engines": { "node": ">=18" },
   "main": "./dist/index.cjs",

@@ -4,6 +4,14 @@ Online-first client SDK for the Talos licensing platform. Multi-targets
 `netstandard2.0` (reaches .NET Framework 4.6.2+, Unity, Mono) and `net8.0`.
 Ed25519 verification via BouncyCastle (pure managed — no native binaries).
 
+```sh
+dotnet add package Talos.Sdk
+```
+
+MIT-licensed, from `0.1.0` onward. The platform it talks to is not — the split is
+deliberate: a library you compile into your own application should not be
+something your legal review has to read.
+
 ## Quickstart
 
 ```csharp

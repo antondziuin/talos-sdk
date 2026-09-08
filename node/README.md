@@ -3,6 +3,14 @@
 Online-first client SDK for the Talos licensing platform. Node ≥18, **zero
 runtime dependencies** (`node:crypto` Ed25519, built-in `fetch`), dual ESM + CJS.
 
+```sh
+npm install @talos/sdk
+```
+
+MIT-licensed, from `0.1.0` onward. The platform it talks to is not — the split is
+deliberate: a library you install into your own application should not be
+something your legal review has to read.
+
 ## Quickstart
 
 ```ts
