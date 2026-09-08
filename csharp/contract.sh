@@ -5,6 +5,12 @@
 #
 # Requires: a running Postgres (deploy/saas/docker-compose.yml), the Rust
 # toolchain, and the .NET SDK. Run from the repo root: ./sdks/csharp/contract.sh
+#
+# This one only works in the Talos monorepo, which is private: it builds and
+# starts the server the SDKs are being tested against. In the public SDK mirror
+# it is here for reading — the cases it drives (`ContractTest`, and the Node
+# contract suite) self-skip without TALOS_CONTRACT and a live server, so the
+# mirror's CI stays green without it.
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
 

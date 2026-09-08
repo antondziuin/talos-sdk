@@ -1,0 +1,56 @@
+# CI for the public SDK repository.
+#
+# This file lives at `sdks/.github/workflows/ci.yml` in the private monorepo,
+# where GitHub ignores it — workflows only run from a repository's root — and
+# arrives at `.github/workflows/ci.yml` in the mirror, which is its root. So the
+# mirror's CI is written, reviewed and versioned beside the code it tests
+# instead of drifting in a repository nobody opens.
+#
+# What it does NOT do is test against a live server: the contract harness needs
+# the Rust server and a Postgres, both of which stay private. Those cases
+# self-skip here and run in the monorepo on every push, which is where a wire
+# disagreement has to be caught anyway.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  csharp:
+    name: C# SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: dotnet test csharp/Talos.Sdk.Tests/Talos.Sdk.Tests.csproj -c Release
+      # The trim/AOT analyzers only mean something if a warning fails something.
+      # They are what keeps the SDK reflection-free: a reflective serializer call
+      # coming back would otherwise ship and send `{}` from a trimmed app.
+      - run: dotnet build csharp/Talos.Sdk/Talos.Sdk.csproj -c Release -warnaserror
+
+  node:
+    name: Node SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      # Zero runtime dependencies is a promise this SDK's README makes, and one
+      # nothing enforced: an `npm install` of anything at all would keep every
+      # test green while the package a customer installs grew a supply chain.
+      - name: the SDK ships with no runtime dependencies
+        run: |
+          node -e "const d=Object.keys(require('./package.json').dependencies||{});
+                   if (d.length) { console.error('runtime dependencies found: '+d.join(', ')); process.exit(1) }"

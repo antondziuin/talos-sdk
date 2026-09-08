@@ -1,0 +1,147 @@
+# Publishing, from the public repository.
+#
+# It runs here rather than in the monorepo for one reason that turns out to
+# decide several: npm attests provenance against a *public* repository, and the
+# monorepo is private. Publishing from there would mean no attestation, a
+# "Repository" link on both package pages that 404s for everyone who clicks it,
+# and SourceLink pointing consumers at sources they cannot fetch. From here all
+# three work, and the packages point at the code they were built from.
+#
+# Like the monorepo's own CI, this file is authored at
+# `sdks/.github/workflows/release.yml` in the private tree and arrives at the
+# mirror's root through `sdks/sync-mirror.sh`.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: the tag agrees with the manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A package published as 0.1.0 from a tree that says 0.2.0 is a mistake
+      # with no undo: a version, once taken on a public registry, is taken. So
+      # this runs before anything is built, not as part of publishing.
+      - name: version in the tag, the csproj and package.json is one version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          csproj=$(sed -n 's|^[[:space:]]*<Version>\([^<]*\)</Version>.*|\1|p' \
+                   csharp/Talos.Sdk/Talos.Sdk.csproj)
+          npm=$(node -p "require('./node/package.json').version")
+          echo "tag=$tag csproj=$csproj npm=$npm"
+          if [ "$tag" != "$csproj" ] || [ "$tag" != "$npm" ]; then
+            echo "::error::the tag says $tag, the csproj says $csproj and package.json says $npm." >&2
+            echo "Bump the manifests in the monorepo, re-sync, and tag that; a published version cannot be recalled." >&2
+            exit 1
+          fi
+          # `node/src/version.ts` is the third copy, and it is what the SDK
+          # reports to the server — held to package.json by the Node suite,
+          # which runs below before anything is published.
+
+  nuget:
+    name: NuGet
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: the token this job needs exists
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "${NUGET_API_KEY}" ]; then
+            echo "::error::NUGET_API_KEY is not set. Create an API key on nuget.org (scope: push new packages, glob Talos.*) and add it as a repository secret here." >&2
+            exit 1
+          fi
+      - run: dotnet test csharp/Talos.Sdk.Tests/Talos.Sdk.Tests.csproj -c Release
+      - run: dotnet pack csharp/Talos.Sdk/Talos.Sdk.csproj -c Release -o nupkg
+      - name: the package carries both frameworks, its README, symbols and a licence
+        run: |
+          unzip -l nupkg/Talos.Sdk.*.nupkg > listing
+          for want in lib/net8.0/Talos.Sdk.dll lib/netstandard2.0/Talos.Sdk.dll README.md; do
+            grep -q "$want" listing || { echo "the package is missing $want" >&2; exit 1; }
+          done
+          ls nupkg/*.snupkg > /dev/null || { echo "no symbol package was produced" >&2; exit 1; }
+          unzip -p nupkg/Talos.Sdk.*.nupkg Talos.Sdk.nuspec | grep -q '<license type="expression">MIT</license>' \
+            || { echo "the package does not declare the MIT licence" >&2; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nupkg-${{ github.ref_name }}
+          path: nupkg/*
+      # The `.snupkg` beside it goes up automatically: NuGet pushes the symbol
+      # package that shares a name with the package being pushed.
+      - name: push to nuget.org
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          dotnet nuget push "nupkg/*.nupkg" \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+
+  npm:
+    name: npm
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Provenance is an attestation signed with a short-lived OIDC token minted
+      # for this run. Without this permission `--provenance` fails, and the
+      # failure reads like an authentication problem.
+      id-token: write
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: the token this job needs exists
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NPM_TOKEN}" ]; then
+            echo "::error::NPM_TOKEN is not set. Create a granular token on npmjs.com with read and write on the @antondziuin scope and add it as a repository secret here." >&2
+            exit 1
+          fi
+      - run: npm install --no-audit --no-fund
+      # This is where `src/version.ts` is held to package.json, so it runs
+      # before the publish rather than beside it.
+      - run: npm test
+      - run: npm run build
+      - run: npm pack --pack-destination .
+      - name: the tarball carries the built package and nothing else
+        run: |
+          tar -tzf antondziuin-talos-sdk-*.tgz > listing
+          for want in package/dist/index.js package/dist/index.cjs package/dist/index.d.ts \
+                      package/README.md package/LICENSE; do
+            grep -q "^$want$" listing || { echo "the tarball is missing $want" >&2; exit 1; }
+          done
+          for unwanted in package/src/ package/test/; do
+            if grep -q "^$unwanted" listing; then
+              echo "the tarball ships $unwanted, which belongs to the repository and not to a customer" >&2
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball-${{ github.ref_name }}
+          path: node/antondziuin-talos-sdk-*.tgz
+      # `--access public`: the package is scoped, and npm makes scoped packages
+      # private by default — which on a free account is a publish that fails
+      # rather than a package nobody can see.
+      - name: publish to npmjs.com
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

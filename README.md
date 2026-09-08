@@ -1,6 +1,30 @@
 # Talos SDKs
 
-Client SDKs that developers embed in their products.
+Client SDKs that developers embed in their products. **MIT licensed** — the
+platform they talk to is not, and the split is deliberate: a library you compile
+into your own application should not be something your legal review has to read.
+
+```sh
+dotnet add package Talos.Sdk
+npm install @antondziuin/talos-sdk
+```
+
+## Where this code lives
+
+The public repository you are probably reading this in is a **mirror**. The SDKs
+are developed in the Talos monorepo, which is private, because that is where
+they are tested against a real server: the cross-language contract harness
+drives the actual Rust API and verifies real signed tokens, and the frozen wire
+vectors in `contract-vectors.json` are generated there and verified here, in C#
+and in Node, against bytes that predate all three implementations.
+
+The mirror carries the real history of these files — `git subtree split`, not a
+squashed export — and exists because npm attests provenance only against a
+public repository. Publishing from here is what makes the attestation, the
+package pages' repository links and SourceLink point at code anyone can read.
+
+Pull requests are welcome and land in the monorepo, so they arrive back here on
+the next release rather than as a merge commit.
 
 - `csharp/` — **`Talos.Sdk`** (NuGet). Multi-target `netstandard2.0;net8.0`,
   Ed25519 via BouncyCastle (pure managed). Phase 1.
