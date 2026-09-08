@@ -167,4 +167,18 @@ jobs:
       - name: publish to npmjs.com
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+        run: |
+          set -euo pipefail
+          # The NuGet half pushes with `--skip-duplicate`; npm has no such flag,
+          # and publishing a version that exists is a hard error. The two halves
+          # run in parallel, so without this the first failure of either one
+          # leaves a release that cannot be retried: the fixed re-run dies here
+          # on the version the successful half already published, and the only
+          # way forward is to burn a version number nobody consumed.
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if [ -n "$(npm view "$name@$version" version 2>/dev/null || true)" ]; then
+            echo "$name@$version is already on the registry; nothing to publish"
+            exit 0
+          fi
+          npm publish --provenance --access public
