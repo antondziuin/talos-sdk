@@ -1,5 +1,5 @@
 {
-  "name": "@talos/sdk",
+  "name": "@antondziuin/talos-sdk",
   "version": "0.1.0",
   "description": "Client SDK for the Talos licensing & software-protection platform.",
   "license": "MIT",

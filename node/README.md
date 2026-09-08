@@ -1,10 +1,10 @@
-# @talos/sdk (Node.js)
+# @antondziuin/talos-sdk (Node.js)
 
 Online-first client SDK for the Talos licensing platform. Node ≥18, **zero
 runtime dependencies** (`node:crypto` Ed25519, built-in `fetch`), dual ESM + CJS.
 
 ```sh
-npm install @talos/sdk
+npm install @antondziuin/talos-sdk
 ```
 
 MIT-licensed, from `0.1.0` onward. The platform it talks to is not — the split is
@@ -14,7 +14,7 @@ something your legal review has to read.
 ## Quickstart
 
 ```ts
-import { TalosClient } from "@talos/sdk";
+import { TalosClient } from "@antondziuin/talos-sdk";
 
 const talos = new TalosClient({
   productToken: "tpt_…",               // from the portal's Integration page
