@@ -92,6 +92,46 @@ namespace Talos.Sdk.Tests
             Assert.Equal(7, seen);
         }
 
+        /// <summary>
+        /// The one document that travels the other way: signed by a machine,
+        /// verified by the portal.
+        /// </summary>
+        /// <remarks>
+        /// Nothing else compares the three implementations' idea of what gets
+        /// signed. Three of them build the message from a domain string and a
+        /// version segment, and a typo in either on one side produces a request
+        /// that side signs happily and the portal refuses — with the symptom
+        /// landing on a customer whose file will not issue.
+        /// </remarks>
+        [Fact]
+        public void BuildsTheSameSignedMessageForAMachineDocumentAsTheServer()
+        {
+            JsonElement md = Doc.GetProperty("machine_doc");
+            string domain = md.GetProperty("domain").GetString()!;
+            string payload = md.GetProperty("payload_b64").GetString()!;
+            Assert.Equal(Offline.RequestDomain, domain);
+            // Through the SDK's own builder, not a copy of it spelled out here:
+            // a literal would agree with the committed bytes forever while the
+            // code that actually signs drifted away from both.
+            Assert.Equal(
+                md.GetProperty("signed_message").GetString(),
+                Offline.SignedMessage(domain, payload));
+
+            byte[] raw = Convert.FromBase64String(md.GetProperty("public_key").GetString()!);
+            var verifier = new Org.BouncyCastle.Crypto.Signers.Ed25519Signer();
+            verifier.Init(false, new Org.BouncyCastle.Crypto.Parameters.Ed25519PublicKeyParameters(raw, 0));
+            byte[] msg = System.Text.Encoding.ASCII.GetBytes(
+                md.GetProperty("signed_message").GetString()!);
+            verifier.BlockUpdate(msg, 0, msg.Length);
+            string sig = md.GetProperty("sig").GetString()!.Replace('-', '+').Replace('_', '/');
+            switch (sig.Length % 4)
+            {
+                case 2: sig += "=="; break;
+                case 3: sig += "="; break;
+            }
+            Assert.True(verifier.VerifySignature(Convert.FromBase64String(sig)));
+        }
+
         [Fact]
         public void AVectorDoesNotVerifyUnderAKeyItDoesNotName()
         {

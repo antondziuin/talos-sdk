@@ -91,6 +91,47 @@ namespace Talos.Sdk
         public string? Nonce { get; set; }
     }
 
+    /// <summary>
+    /// The payload inside <see cref="OfflineRequest.Req"/> — everything the
+    /// portal needs to cut an air-gapped licence file for this machine.
+    /// </summary>
+    /// <remarks>
+    /// Not a request body: it never goes over a wire. It is base64url-encoded
+    /// into a document a human carries, and the bytes produced here are the
+    /// bytes signed and the bytes verified.
+    /// </remarks>
+    internal sealed class OfflineRequestPayload
+    {
+        public string ProductToken { get; set; } = "";
+
+        /// <summary>
+        /// Optional. The operator picks the licence in the portal, so it is not
+        /// needed — but when present the server checks it against the licence
+        /// being issued against, which catches issuing from the wrong tab.
+        /// </summary>
+        public string? LicenseKey { get; set; }
+
+        public FingerprintDto Fingerprint { get; set; } = new FingerprintDto();
+
+        /// <summary>Standard base64 of this machine's 32-byte Ed25519 public key.</summary>
+        public string MachinePubkey { get; set; } = "";
+
+        public string Nonce { get; set; } = "";
+        public string? Hostname { get; set; }
+        public string? Os { get; set; }
+        public string? Arch { get; set; }
+        public string? AppVersion { get; set; }
+        public string? SdkVersion { get; set; }
+
+        /// <summary>
+        /// This machine's own clock when it wrote the request. Evidence for
+        /// whoever is looking at it, and an input to no decision: an air-gapped
+        /// machine's clock is the one thing in this exchange nobody can vouch
+        /// for.
+        /// </summary>
+        public long CreatedAt { get; set; }
+    }
+
     /// <summary>`POST /v1/client/updates/check`.</summary>
     internal sealed class UpdateCheckReq
     {
@@ -126,6 +167,12 @@ namespace Talos.Sdk
     [JsonSerializable(typeof(DeactivateReq))]
     [JsonSerializable(typeof(LeaseReq))]
     [JsonSerializable(typeof(UpdateCheckReq))]
+    // The air-gapped documents. Same policy, and they need it as much as the
+    // wire types do: `OfflineRequest.ToJson` is called from a host that may well
+    // be published AOT, and a reflective serializer there would hand the vendor
+    // an empty envelope with a valid signature over nothing.
+    [JsonSerializable(typeof(OfflineRequestPayload))]
+    [JsonSerializable(typeof(OfflineRequest))]
     internal partial class WireJson : JsonSerializerContext
     {
     }

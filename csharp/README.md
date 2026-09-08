@@ -223,6 +223,48 @@ acceptable answer. The SDK ignores any `kid` in the token and enforces
 gate premium value on server-returned *data* (entitlements/config), not client
 booleans, and ship an obfuscator / NativeAOT for release builds.
 
+## Air-gapped machines
+
+Grace above is for an install that has been online. This is for one that never
+will be — an isolated network, no route out at all.
+
+```csharp
+// On the machine. Write this out and carry it to your vendor:
+File.WriteAllText("talos-request.json", talos.CreateOfflineRequest().ToJson());
+
+// They upload it in the portal and hand you back license.talos:
+LicenseState state = await talos.LoadOfflineLicenseAsync("license.talos");
+// state.Decision == "valid"
+```
+
+The first call generates an **Ed25519 keypair for this machine**, keeps the
+private half in the same encrypted state file as everything else, and puts the
+public half in the request beside the fingerprint. The file you get back is bound
+to both, so a file copied off another machine does not license this one and this
+machine's state directory does not license another. Calling it twice reuses the
+same identity — only the nonce changes. `ToJson()` goes through the
+source-generated serializer, so a trimmed or NativeAOT host writes the real
+document rather than an empty envelope with a valid signature over nothing.
+
+Everything is verified locally: the anchor-signed keyset travels inside the file,
+so an anchor-only pin still works with no server to fetch one from. The verdict
+is kept, so later starts need nothing — `ValidateAsync()` re-checks the stored
+file instead of reaching for the network, and `IsActivated` is true.
+
+`LoadOfflineLicenseAsync` **throws** only for a file that is not a licence:
+unreadable, not one of ours, addressed to another product, or a signature that
+does not verify. A file that is one but cannot license this machine comes back as
+a verdict you can show the user — `machine_mismatch`, `offline_file_expired` (get
+a new file), `expired` (renew the licence), `clock_tampered`.
+
+Two things to know before you offer this to customers. A file **cannot be
+recalled** — revoking it in the portal frees the seat so you can issue to a
+replacement machine, but the machine holding it keeps working until the file's
+own expiry, which is why the policy's horizon is short. And hardware changes are
+not forgiven offline: the drift matcher lives on the server, so a replaced disk
+means `machine_mismatch` and a new request. Full design and the rest of the
+trade-offs: `docs/OFFLINE.md`.
+
 ## Heartbeats, monitoring, and cadence
 
 ```csharp

@@ -6,6 +6,15 @@ namespace Talos.Sdk
     public class TalosException : Exception
     {
         public TalosException(string message) : base(message) { }
+
+        /// <summary>
+        /// With the failure underneath it, for the cases where that is the
+        /// answer rather than noise — a licence file that could not be read is
+        /// "file not found" or "access denied", and losing which would leave a
+        /// support conversation guessing.
+        /// </summary>
+        public TalosException(string message, Exception innerException)
+            : base(message, innerException) { }
     }
 
     /// <summary>

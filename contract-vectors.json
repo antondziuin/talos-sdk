@@ -6,6 +6,14 @@
     "license": "gr39Hpo2O8YOVFuFyeOBIweV3jxfZplHVvIxKMvd+BA=",
     "release": "EF2Bl4i0/705I3wKbRzpKMtv2BOm+z2A5k8SKAZ2HM4="
   },
+  "machine_doc": {
+    "domain": "talos-offline-request",
+    "payload_b64": "eyJwcm9kdWN0X3Rva2VuIjoidHB0XzAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxIiwibGljZW5zZV9rZXkiOm51bGwsImZpbmdlcnByaW50Ijp7ImNvbXBvc2l0ZSI6ImZwMjpjb250cmFjdC12ZWN0b3ItbWFjaGluZSIsImNvbXBvbmVudHMiOnt9fSwibWFjaGluZV9wdWJrZXkiOiJTR01CQmxaTzZ0MWp3OGJ0WGR4RUFNekhldGw0SlZWYkJzcWdYRnRMWUJ3PSIsIm5vbmNlIjoibjBuY2UtY29udHJhY3QtdmVjdG9yLTAwMDAwMDAwMDEiLCJob3N0bmFtZSI6ImFpci1nYXBwZWQiLCJvcyI6ImxpbnV4IiwiYXJjaCI6Ing2NCIsImFwcF92ZXJzaW9uIjoiMS4wLjAiLCJzZGtfdmVyc2lvbiI6ImNvbnRyYWN0LzAuMC4wIiwiY3JlYXRlZF9hdCI6MTc2NzIyNTYwMH0",
+    "public_key": "SGMBBlZO6t1jw8btXdxEAMzHetl4JVVbBsqgXFtLYBw=",
+    "sig": "Rmk45gadYjlbrJiQPoCsH5zeWIGwzpu5Uahm1xDWAm-sp1vIW48JEo4PAQdlrf1JhjqQdjNDL22ncxwVPBG3CA",
+    "signed_message": "talos-offline-request.1.eyJwcm9kdWN0X3Rva2VuIjoidHB0XzAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxIiwibGljZW5zZV9rZXkiOm51bGwsImZpbmdlcnByaW50Ijp7ImNvbXBvc2l0ZSI6ImZwMjpjb250cmFjdC12ZWN0b3ItbWFjaGluZSIsImNvbXBvbmVudHMiOnt9fSwibWFjaGluZV9wdWJrZXkiOiJTR01CQmxaTzZ0MWp3OGJ0WGR4RUFNekhldGw0SlZWYkJzcWdYRnRMWUJ3PSIsIm5vbmNlIjoibjBuY2UtY29udHJhY3QtdmVjdG9yLTAwMDAwMDAwMDEiLCJob3N0bmFtZSI6ImFpci1nYXBwZWQiLCJvcyI6ImxpbnV4IiwiYXJjaCI6Ing2NCIsImFwcF92ZXJzaW9uIjoiMS4wLjAiLCJzZGtfdmVyc2lvbiI6ImNvbnRyYWN0LzAuMC4wIiwiY3JlYXRlZF9hdCI6MTc2NzIyNTYwMH0",
+    "why": "a machine-signed offline request: the domain and version are inside the signed bytes, so all three implementations must build the same message from them"
+  },
   "negative": [
     {
       "key": "license",

@@ -254,9 +254,15 @@ namespace Talos.Sdk
             if (stored != null)
             {
                 _binding = stored;
-                _licenseKeyHash = stored.LicenseKeyHash;
-                _activationSecret = stored.ActivationSecret;
-                _machineId = stored.MachineId;
+                // Empty means absent, and the distinction is load-bearing now
+                // that a binding can exist without an activation: the stored
+                // fields default to "" rather than null, and an air-gapped
+                // install has no secret and no id until its file is loaded. Kept
+                // as "" they would read as "activated", and `ValidateAsync` would
+                // reach for a server this machine cannot see.
+                _licenseKeyHash = Blank(stored.LicenseKeyHash);
+                _activationSecret = Blank(stored.ActivationSecret);
+                _machineId = Blank(stored.MachineId);
                 // Adopt the cached keyset before anything asks for a
                 // verification key. Without it an anchor-only client has nothing
                 // to verify a cached decision with, and the offline path is
@@ -346,14 +352,25 @@ namespace Talos.Sdk
         }
 
         /// <summary>
-        /// Whether this machine already holds an activation — restored from disk
-        /// on construction, so this is the startup question: prompt for a licence
+        /// Whether this machine already holds a licence — restored from disk on
+        /// construction, so this is the startup question: prompt for a licence
         /// key, or go straight to <see cref="ValidateAsync"/>?
         /// </summary>
-        public bool IsActivated => _activationSecret != null;
+        /// <remarks>
+        /// True for an online activation (the activation secret is held)
+        /// <b>and</b> for an air-gapped install that has loaded a licence file.
+        /// Widened rather than split, because what a host does with this is
+        /// decide whether to ask the user for a licence key — and an air-gapped
+        /// machine that already holds a valid file must not be asked for one it
+        /// has no way to redeem.
+        /// </remarks>
+        public bool IsActivated => _activationSecret != null || _binding?.OfflineToken != null;
 
         /// <summary>The server's id for this machine, once activated.</summary>
         public string? MachineId => _machineId;
+
+        /// <summary>An empty stored string is an absent value, not a value.</summary>
+        private static string? Blank(string? s) => string.IsNullOrEmpty(s) ? null : s;
 
         private static byte[]? Decode32(string? b64, string name)
         {
@@ -698,11 +715,255 @@ namespace Talos.Sdk
                 // not per machine.
                 Keyset = ks.ValueKind == JsonValueKind.String ? ks.GetString() : _binding?.Keyset,
                 TimeHighWater = _binding?.TimeHighWater ?? 0,
+                // The machine's own identity survives an online activation,
+                // because it is an identity and not a verdict: an install that
+                // reaches the network once must not have to repeat the whole
+                // air-gapped ceremony with its vendor the next time it is
+                // unplugged. The clock mark survives for the same reason a mark
+                // exists at all — it only moves forward. The offline *file* does
+                // not: a live activation supersedes it, and keeping it would
+                // leave two answers to "what licenses this machine".
+                MachineKey = _binding?.MachineKey,
+                MachinePublicKey = _binding?.MachinePublicKey,
+                OfflineSeen = _binding?.OfflineSeen ?? 0,
             };
             AdvanceClock(claims);
             _store?.Save(_binding);
 
             return Adopt(StateFromClaims(claims, "valid", false));
+        }
+
+        /// <summary>
+        /// The binding as it stands, or an empty one to build on.
+        /// </summary>
+        /// <remarks>
+        /// An air-gapped install reaches its first write with nothing stored — no
+        /// licence key, no activation secret, no machine id — so there has to be
+        /// something for the offline fields to be added to.
+        /// </remarks>
+        private StoredBinding BindingBase() =>
+            _binding ?? new StoredBinding { Fingerprint = _fingerprint };
+
+        /// <summary>
+        /// This machine's own keypair, generated once and kept in the state file.
+        /// </summary>
+        /// <remarks>
+        /// The air-gapped counterpart of the activation secret: a machine that
+        /// cannot reach a server is never issued one, so it makes an identity of
+        /// its own and the vendor binds the file to it.
+        /// </remarks>
+        private (string PrivateKey, string PublicKey) MachineKey()
+        {
+            if (_binding?.MachineKey is { Length: > 0 } held
+                && _binding.MachinePublicKey is { Length: > 0 } pub)
+            {
+                return (held, pub);
+            }
+            var key = Offline.GenerateMachineKey();
+            StoredBinding b = BindingBase();
+            b.MachineKey = key.PrivateKey;
+            b.MachinePublicKey = key.PublicKey;
+            _binding = b;
+            _store?.Save(b);
+            return key;
+        }
+
+        /// <summary>
+        /// Write the request an air-gapped machine hands to its vendor.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Save <see cref="OfflineRequest.ToJson"/> as <c>talos-request.json</c>,
+        /// carry it to whoever sold the licence, and they upload it in the
+        /// portal. What comes back is a <c>license.talos</c> for
+        /// <see cref="LoadOfflineLicenseAsync(string, CancellationToken)"/> — and
+        /// only for <i>this</i> machine: the request carries the fingerprint and
+        /// the public half of a keypair generated here, and the file is bound to
+        /// both.
+        /// </para>
+        /// <para>
+        /// Calling it twice produces two requests under the same identity. The
+        /// vendor can issue against either; the second file supersedes the first
+        /// without spending a second seat.
+        /// </para>
+        /// </remarks>
+        /// <param name="licenseKey">
+        /// Optional. The operator picks the licence in the portal, so it is not
+        /// needed — but when present the server checks it against the licence
+        /// being issued against, which catches issuing from the wrong tab.
+        /// </param>
+        public OfflineRequest CreateOfflineRequest(string? licenseKey = null)
+        {
+            var key = MachineKey();
+            var payload = new OfflineRequestPayload
+            {
+                ProductToken = _options.ProductToken,
+                LicenseKey = licenseKey,
+                Fingerprint = FingerprintBody(),
+                MachinePubkey = key.PublicKey,
+                Nonce = NewNonce(),
+                Hostname = ReportedHostname(),
+                Os = RuntimeInformation.OSDescription,
+                Arch = RuntimeInformation.OSArchitecture.ToString(),
+                AppVersion = _options.AppVersion,
+                SdkVersion = SdkVersion.Id,
+                CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            };
+            return Offline.SignDocument(
+                key.PrivateKey,
+                Offline.RequestDomain,
+                JsonSerializer.Serialize(payload, WireJson.Default.OfflineRequestPayload));
+        }
+
+        /// <summary>
+        /// Adopt an air-gapped licence file issued for this machine.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Everything is verified locally, because there is nothing to ask: the
+        /// anchor-signed keyset travels inside the file, the verdict is signed by
+        /// a key that keyset lists, and the file names both halves of this
+        /// machine's identity — its fingerprint and the public key it generated.
+        /// The verdict is then kept, so later starts are licensed with no further
+        /// ceremony.
+        /// </para>
+        /// <para>
+        /// <b>Throws</b> only for a file that is not a licence: unreadable, not
+        /// one of ours, addressed to another product, or a broken signature. A
+        /// file that <i>is</i> one but cannot license this machine right now comes
+        /// back as a verdict — <c>machine_mismatch</c> for another machine's file,
+        /// <c>offline_file_expired</c> for one past its horizon, <c>expired</c>
+        /// for a licence that has ended, and <c>clock_tampered</c> for a clock
+        /// wound back behind what this install has already seen. Those are things
+        /// the user can be told and can act on, and turning them into exceptions
+        /// would make the launch path throw for a reason nobody can catch
+        /// usefully.
+        /// </para>
+        /// </remarks>
+        public Task<LicenseState> LoadOfflineLicenseAsync(
+            string path, CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            byte[] bytes;
+            try
+            {
+                bytes = File.ReadAllBytes(path);
+            }
+            catch (Exception e) when (!(e is OperationCanceledException))
+            {
+                throw new TalosException("cannot read the offline licence file: " + path, e);
+            }
+            // Synchronous underneath, and honestly so: this reads one small file
+            // and does an Ed25519 verification. The Task-returning shape is the
+            // one §9 specifies and the one every other call on this client has,
+            // and a host awaiting it should not have to know which of them
+            // actually yields.
+            return Task.FromResult(LoadOfflineLicense(bytes));
+        }
+
+        /// <summary>
+        /// Adopt an air-gapped licence file already read into memory. Same rules
+        /// as <see cref="LoadOfflineLicenseAsync(string, CancellationToken)"/>.
+        /// </summary>
+        public LicenseState LoadOfflineLicense(byte[] fileContents)
+        {
+            if (fileContents == null) throw new ArgumentNullException(nameof(fileContents));
+            string? token;
+            string? keyset;
+            try
+            {
+                using var doc = JsonDocument.Parse(fileContents);
+                JsonElement root = doc.RootElement;
+                if (GetStr(root, "kind") != Offline.LicenseFileKind)
+                    throw new TalosException("not a Talos offline licence file");
+                token = GetStr(root, "token");
+                keyset = GetStr(root, "keyset");
+            }
+            catch (JsonException)
+            {
+                throw new TalosException("not a Talos offline licence file");
+            }
+            if (string.IsNullOrEmpty(token))
+                throw new TalosException("not a Talos offline licence file");
+
+            // The keyset is inside the file because an air-gapped machine has
+            // nowhere to fetch one from. It is adopted only if the pinned anchor
+            // signs it, so a file carrying somebody else's keyset changes nothing
+            // about which keys this client trusts.
+            if (!string.IsNullOrEmpty(keyset)) AdoptKeyset(keyset);
+            return AdoptOfflineToken(token!, keyset);
+        }
+
+        /// <summary>
+        /// Verify the offline file against this machine and this clock, and adopt
+        /// the verdict. Runs on load and again on every
+        /// <see cref="ValidateAsync"/>, because the two things that can change
+        /// afterwards — the clock and the calendar — are exactly what it checks.
+        /// </summary>
+        private LicenseState AdoptOfflineToken(string token, string? keyset)
+        {
+            // VerifyCached rather than Verify: it checks the signature, `typ`,
+            // `aud` and `nbf`, and leaves `exp` and the nonce to the caller. Both
+            // omissions are right here. The nonce belonged to a request document
+            // that may be weeks in the past and is not kept — it is the *server*
+            // that needs it, where it is unique per account and stops a captured
+            // request minting a second file. And `exp` is a verdict rather than
+            // an exception, below.
+            JsonElement claims = TalosCompact.VerifyCached(
+                LicenseVerifyKeys(), "offline", _options.ProductToken, token);
+
+            // Both halves, exactly. The fingerprint is what stops the whole state
+            // directory being copied to another computer, and the key is what
+            // stops the file alone being worth anything — neither is redundant,
+            // and accepting either on its own would open the case the other one
+            // closes.
+            string? mpk = GetStr(claims, "mpk");
+            if (string.IsNullOrEmpty(mpk)
+                || mpk != _binding?.MachinePublicKey
+                || GetStr(claims, "fph") != _fingerprint)
+            {
+                return Adopt(new LicenseState { Decision = "machine_mismatch", IsOffline = true });
+            }
+
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            // Both marks are lower bounds on "now" that this install has already
+            // observed: one signed by the server, one its own. A clock behind
+            // either has moved backwards.
+            long mark = Math.Max(_binding!.TimeHighWater, _binding.OfflineSeen);
+            if (mark > 0 && now + ClockSkewSeconds < mark)
+            {
+                return Adopt(new LicenseState { Decision = "clock_tampered", IsOffline = true });
+            }
+
+            long? exp = Num(claims, "exp");
+            LicenseState state = StateFromClaims(claims, "valid", true);
+            // No cadence to return to; the file's own horizon is the window.
+            state.RevalidateAfter = null;
+            state.GraceUntil = exp;
+
+            // Persist before deciding: the file is this machine's, so it is worth
+            // keeping even when today's answer is "expired" — the licence may be
+            // renewed and a new file issued, and in the meantime the app can say
+            // which file it is holding.
+            if (GetStr(claims, "mid") is { Length: > 0 } mid) _machineId = mid;
+            StoredBinding b = BindingBase();
+            b.MachineId = _machineId ?? b.MachineId;
+            b.OfflineToken = token;
+            b.OfflineSeen = Math.Max(b.OfflineSeen, now);
+            if (!string.IsNullOrEmpty(keyset)) b.Keyset = keyset;
+            _binding = b;
+            AdvanceClock(claims);
+            _store?.Save(b);
+
+            // The file's own horizon, which is the whole enforcement: there is no
+            // server to re-ask, so this deadline is the only thing that ever ends
+            // it. Distinct from `expired`, which is the *licence* ending — the
+            // remedies differ (a new file versus a renewal) and the app should be
+            // able to say which one to ask for.
+            if (exp == null || now > exp.Value) state.Decision = "offline_file_expired";
+            else if (state.LicenseExpiresAt != null && now > state.LicenseExpiresAt.Value)
+                state.Decision = "expired";
+            return Adopt(state);
         }
 
         /// <summary>
@@ -879,6 +1140,15 @@ namespace Talos.Sdk
         /// </summary>
         public async Task<LicenseState> ValidateAsync(CancellationToken ct = default)
         {
+            // An air-gapped install has no server to ask and no secret to ask
+            // with. Its file *is* the verdict — re-checked here rather than
+            // cached, because the two things that can have changed since it was
+            // loaded are precisely what that check is about: the clock and the
+            // calendar.
+            if (_activationSecret == null && _binding?.OfflineToken is { Length: > 0 } offlineToken)
+            {
+                return AdoptOfflineToken(offlineToken, null);
+            }
             RequireActivated();
             try
             {

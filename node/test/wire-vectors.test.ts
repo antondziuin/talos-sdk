@@ -1,6 +1,8 @@
+import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
+import { REQUEST_DOMAIN, signedMessage } from "../src/offline.js";
 import { publicKeyFromBase64, verifyKeyset, verifyManifest, verifyToken } from "../src/talos-compact.js";
 
 /**
@@ -20,12 +22,20 @@ import { publicKeyFromBase64, verifyKeyset, verifyManifest, verifyToken } from "
  */
 
 type Vector = { name: string; typ: string; key: string; token: string; why?: string };
+type MachineDoc = {
+  domain: string;
+  public_key: string;
+  payload_b64: string;
+  signed_message: string;
+  sig: string;
+};
 type Doc = {
   aud: string;
   nonce: string;
   keys: Record<string, string>;
   vectors: Vector[];
   negative: Vector[];
+  machine_doc: MachineDoc;
 };
 
 const doc = JSON.parse(
@@ -70,6 +80,29 @@ describe("frozen wire vectors", () => {
         expect(() => verifyWith(v, key(other)), `${v.name} under ${other}`).toThrow();
       }
     }
+  });
+
+  it("builds the same signed message for a machine document as the server", () => {
+    // The one document that goes the other way: signed here, verified by the
+    // portal. Nothing else compares the three implementations' idea of what
+    // gets signed — a typo in the domain or the version segment on one side
+    // produces a request that side signs happily and the portal refuses, and
+    // the symptom is a customer's file being rejected by their vendor.
+    const md = doc.machine_doc;
+    expect(md.domain).toBe(REQUEST_DOMAIN);
+    expect(signedMessage(md.domain, md.payload_b64)).toBe(md.signed_message);
+
+    const raw = Buffer.from(md.public_key, "base64");
+    const der = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), raw]);
+    const pub = createPublicKey({ key: der, format: "der", type: "spki" });
+    expect(
+      cryptoVerify(
+        null,
+        Buffer.from(md.signed_message, "ascii"),
+        pub,
+        Buffer.from(md.sig.replace(/-/g, "+").replace(/_/g, "/"), "base64"),
+      ),
+    ).toBe(true);
   });
 
   it("refuses every negative vector", () => {

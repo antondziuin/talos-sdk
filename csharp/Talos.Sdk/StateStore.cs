@@ -125,6 +125,57 @@ namespace Talos.Sdk
 
         /// <summary>The <c>release_seq</c> of <see cref="PendingVersion"/>.</summary>
         public long PendingReleaseSeq { get; set; }
+
+        /// <summary>
+        /// This machine's own Ed25519 private key (raw 32-byte seed, base64),
+        /// generated at its first offline request.
+        /// <para>
+        /// The air-gapped counterpart of <see cref="ActivationSecret"/>, and it
+        /// exists for the same reason that one does: an install has to be able to
+        /// prove it is the install a decision was made for. It never leaves this
+        /// file — only the public half travels, inside
+        /// <c>talos-request.json</c> — and losing the file means repeating the
+        /// ceremony with the vendor, because the identity has exactly one copy by
+        /// construction.
+        /// </para>
+        /// </summary>
+        public string? MachineKey { get; set; }
+
+        /// <summary>
+        /// The raw public half, standard base64. Checked against the licence
+        /// file's <c>mpk</c> claim.
+        /// </summary>
+        public string? MachinePublicKey { get; set; }
+
+        /// <summary>The last verified <c>typ=offline</c> licence file.</summary>
+        public string? OfflineToken { get; set; }
+
+        /// <summary>
+        /// The highest <b>local</b> clock ever seen while running on an offline
+        /// file, in unix seconds.
+        /// <para>
+        /// Deliberately separate from <see cref="TimeHighWater"/>, which holds
+        /// <i>server</i> times taken from signed claims. An air-gapped install
+        /// sees exactly one server time in its life — the <c>iat</c> of its file
+        /// — so the server mark stops moving, and nothing would notice a clock
+        /// wound back to the day after issuance to keep a year-long file alive
+        /// forever.
+        /// </para>
+        /// <para>
+        /// Mixing the two would be worse than useless: a machine whose clock ran
+        /// fast would inflate the server mark, and correcting the clock
+        /// afterwards would then read as tampering on an install that had done
+        /// nothing wrong.
+        /// </para>
+        /// <para>
+        /// What this bounds is <b>rollback, not freeze</b>. A user who stops
+        /// their clock keeps a file past its expiry; a user who winds it back is
+        /// told <c>clock_tampered</c>. That is the honest limit of enforcing a
+        /// deadline against a clock its owner controls, and it is the price of
+        /// offline.
+        /// </para>
+        /// </summary>
+        public long OfflineSeen { get; set; }
     }
 
     /// <summary>Reads and writes one product's machine binding.</summary>
@@ -346,11 +397,27 @@ namespace Talos.Sdk
                         && pr.ValueKind == JsonValueKind.Number
                             ? pr.GetInt64()
                             : 0,
+                    MachineKey = Str(root, "machineKey") is { Length: > 0 } mk ? mk : null,
+                    MachinePublicKey =
+                        Str(root, "machinePublicKey") is { Length: > 0 } mp ? mp : null,
+                    OfflineToken = Str(root, "offlineToken") is { Length: > 0 } ot ? ot : null,
+                    OfflineSeen =
+                        root.TryGetProperty("offlineSeen", out var os)
+                        && os.ValueKind == JsonValueKind.Number
+                            ? os.GetInt64()
+                            : 0,
                 };
-                // The activation secret is what makes a binding usable. The key
-                // hash serves one local comparison, and a file that somehow
-                // lacks it is still a seat this machine holds.
-                return b.ActivationSecret.Length > 0 ? b : null;
+                // What makes a binding worth keeping is that it holds a licence
+                // or the identity behind one. The activation secret is that for
+                // an online install; an air-gapped install has none — it was
+                // never issued one — and requiring it here would throw away the
+                // offline file and the machine key on every start, which is the
+                // whole state of an air-gapped install.
+                return b.ActivationSecret.Length > 0
+                    || b.OfflineToken != null
+                    || b.MachineKey != null
+                    ? b
+                    : null;
             }
             catch
             {
@@ -381,6 +448,10 @@ namespace Talos.Sdk
                         ReleaseSeqHighWater = b.ReleaseSeqHighWater,
                         PendingVersion = b.PendingVersion,
                         PendingReleaseSeq = b.PendingReleaseSeq,
+                        MachineKey = b.MachineKey,
+                        MachinePublicKey = b.MachinePublicKey,
+                        OfflineToken = b.OfflineToken,
+                        OfflineSeen = b.OfflineSeen,
                     },
                     StateJson.Default.StateFileDto);
                 var iv = new byte[IvLen];
@@ -481,6 +552,10 @@ namespace Talos.Sdk
         public long ReleaseSeqHighWater { get; set; }
         public string? PendingVersion { get; set; }
         public long PendingReleaseSeq { get; set; }
+        public string? MachineKey { get; set; }
+        public string? MachinePublicKey { get; set; }
+        public string? OfflineToken { get; set; }
+        public long OfflineSeen { get; set; }
     }
 
     /// <summary>
