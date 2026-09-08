@@ -88,8 +88,8 @@ namespace Talos.Sdk.Tests
                 _ = name;
             }
             // A file that failed to load, or a rename that emptied the list, must
-            // not read as six passing vectors.
-            Assert.Equal(6, seen);
+            // not read as seven passing vectors.
+            Assert.Equal(7, seen);
         }
 
         [Fact]

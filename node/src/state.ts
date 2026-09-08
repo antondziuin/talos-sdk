@@ -100,6 +100,42 @@ export interface StoredBinding {
    * documented and no example did.
    */
   pendingRelease?: { version: string; releaseSeq: number };
+  /**
+   * This machine's own Ed25519 private key (PKCS#8 DER, base64), generated at
+   * its first offline request.
+   *
+   * The air-gapped counterpart of `activationSecret`, and it exists for the same
+   * reason that one does: an install has to be able to prove it is the install a
+   * decision was made for. It never leaves this file — only the public half
+   * travels, inside `talos-request.json` — and losing the file means repeating
+   * the ceremony with the vendor, because the identity has exactly one copy by
+   * construction.
+   */
+  machineKey?: string;
+  /** The raw public half, standard base64. Checked against the file's `mpk`. */
+  machinePublicKey?: string;
+  /** The last verified `typ=offline` licence file. */
+  offlineToken?: string;
+  /**
+   * The highest local clock ever seen while running on an offline file, in unix
+   * seconds.
+   *
+   * Deliberately separate from {@link timeHighWater}, which holds *server*
+   * times taken from signed claims. An air-gapped install sees exactly one
+   * server time in its life — the `iat` of its file — so the server mark stops
+   * moving, and nothing would notice a clock wound back to the day after
+   * issuance to keep a year-long file alive forever.
+   *
+   * Mixing the two would be worse than useless: a machine whose clock ran fast
+   * would inflate the server mark, and correcting the clock afterwards would
+   * then read as tampering on an install that had done nothing wrong.
+   *
+   * What this bounds is **rollback, not freeze**. A user who stops their clock
+   * keeps a file past its expiry; a user who winds it back is told
+   * `clock_tampered`. That is the honest limit of enforcing a deadline against
+   * a clock its owner controls, and it is the price of offline.
+   */
+  offlineSeen?: number;
 }
 
 const MAGIC = Buffer.from("TLS1");
@@ -260,10 +296,18 @@ export class StateStore {
       ) {
         b.pendingRelease = { version: pending["version"], releaseSeq: pending["releaseSeq"] };
       }
-      // The activation secret is what makes a binding usable. The key hash is
-      // a convenience for one comparison, and an old file that somehow lacks
-      // both is still a seat this machine holds.
-      return b.activationSecret ? b : null;
+      if (typeof o["machineKey"] === "string") b.machineKey = o["machineKey"];
+      if (typeof o["machinePublicKey"] === "string") {
+        b.machinePublicKey = o["machinePublicKey"];
+      }
+      if (typeof o["offlineToken"] === "string") b.offlineToken = o["offlineToken"];
+      if (typeof o["offlineSeen"] === "number") b.offlineSeen = o["offlineSeen"];
+      // What makes a binding worth keeping is that it holds a licence or the
+      // identity behind one. The activation secret is that for an online
+      // install; an air-gapped install has none — it was never issued one — and
+      // requiring it here would throw away the offline file and the machine key
+      // on every start, which is the whole state of an air-gapped install.
+      return b.activationSecret || b.offlineToken || b.machineKey ? b : null;
     } catch {
       return null;
     }

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, readFileSync } from "node:fs";
 import { open, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import { type KeyObject } from "node:crypto";
@@ -14,6 +14,14 @@ import {
   type StoredBinding,
 } from "./state.js";
 import { SDK_ID } from "./version.js";
+import {
+  generateMachineKey,
+  signMachineDoc,
+  LICENSE_FILE_KIND,
+  REQUEST_DOMAIN,
+  type MachineKey,
+  type SignedDoc,
+} from "./offline.js";
 import {
   b64urlEncode,
   publicKeyFromBase64,
@@ -588,8 +596,17 @@ export class TalosClient {
    * construction, so this is the startup question: prompt for a licence key, or
    * go straight to {@link validate}?
    */
+  /**
+   * Whether this install holds a licence for this machine.
+   *
+   * True for an online activation (the activation secret is held) **and** for an
+   * air-gapped install that has loaded a licence file. Widened rather than
+   * split, because what a host does with this is decide whether to ask the user
+   * for a licence key — and an air-gapped machine that already holds a valid
+   * file must not be asked for one it has no way to redeem.
+   */
   get isActivated(): boolean {
-    return this.activationSecret !== null;
+    return this.activationSecret !== null || this.binding?.offlineToken != null;
   }
 
   /** The server's id for this machine, once activated. */
@@ -778,10 +795,213 @@ export class TalosClient {
       // binding; keep only the keyset, which is per product, not per machine.
       keyset: typeof body["keyset"] === "string" ? (body["keyset"] as string) : this.binding?.keyset,
       timeHighWater: this.binding?.timeHighWater,
+      // The machine's own identity survives an online activation, because it is
+      // an identity and not a verdict: an install that reaches the network once
+      // must not have to repeat the whole air-gapped ceremony with its vendor
+      // the next time it is unplugged. The clock mark survives for the same
+      // reason a mark exists at all — it only moves forward.
+      machineKey: this.binding?.machineKey,
+      machinePublicKey: this.binding?.machinePublicKey,
+      offlineSeen: this.binding?.offlineSeen,
+      // The offline *file* does not: a live activation supersedes it, and
+      // keeping it would leave two answers to "what licenses this machine".
     };
     this.advanceClock(claims);
     this.store?.save(this.binding);
     return this.adopt(stateFromClaims(claims, "valid", false));
+  }
+
+  /**
+   * This machine's own keypair, generated once and kept in the state file.
+   *
+   * The air-gapped counterpart of the activation secret: a machine that cannot
+   * reach a server is never issued one, so it makes an identity of its own and
+   * the vendor binds the file to it.
+   */
+  private machineKey(): MachineKey {
+    const held = this.binding?.machineKey;
+    const pub = this.binding?.machinePublicKey;
+    if (held && pub) return { privateKey: held, publicKey: pub };
+    const key = generateMachineKey();
+    this.binding = {
+      ...this.bindingBase(),
+      machineKey: key.privateKey,
+      machinePublicKey: key.publicKey,
+    };
+    this.store?.save(this.binding);
+    return key;
+  }
+
+  /**
+   * The binding as it stands, or an empty one to build on.
+   *
+   * An air-gapped install reaches its first write with nothing stored — no
+   * licence key, no activation secret, no machine id — so there has to be
+   * something for the offline fields to be added to.
+   */
+  private bindingBase(): StoredBinding {
+    return (
+      this.binding ?? {
+        licenseKeyHash: "",
+        activationSecret: "",
+        machineId: "",
+        fingerprint: this.fingerprint,
+      }
+    );
+  }
+
+  /**
+   * Write the request an air-gapped machine hands to its vendor.
+   *
+   * Save the returned object as `talos-request.json`, carry it to whoever sold
+   * the licence, and they upload it in the portal. What comes back is a
+   * `license.talos` for {@link loadOfflineLicense} — and only for *this*
+   * machine: the request carries the fingerprint and the public half of a
+   * keypair generated here, and the file is bound to both.
+   *
+   * Calling it twice produces two requests under the same identity. The vendor
+   * can issue against either; the second file supersedes the first without
+   * spending a second seat.
+   *
+   * ```ts
+   * writeFileSync("talos-request.json", JSON.stringify(talos.createOfflineRequest(), null, 2));
+   * ```
+   *
+   * @param licenseKey Optional. The operator picks the licence in the portal, so
+   * it is not needed — but when it is present the server checks it against the
+   * licence being issued against, which catches issuing from the wrong tab.
+   */
+  createOfflineRequest(licenseKey?: string): SignedDoc {
+    const key = this.machineKey();
+    return signMachineDoc(key, REQUEST_DOMAIN, {
+      product_token: this.options.productToken,
+      license_key: licenseKey,
+      fingerprint: { composite: this.fingerprint, components: this.fp.components },
+      machine_pubkey: key.publicKey,
+      nonce: newNonce(),
+      hostname: this.reportedHostname(),
+      os: `${os.type()} ${os.release()}`,
+      arch: os.arch(),
+      app_version: this.options.appVersion,
+      sdk_version: SDK_ID,
+      created_at: nowSeconds(),
+    });
+  }
+
+  /**
+   * Adopt an air-gapped licence file issued for this machine.
+   *
+   * Everything is verified locally, because there is nothing to ask: the
+   * anchor-signed keyset travels inside the file, the verdict is signed by a key
+   * that keyset lists, and the file names both halves of this machine's identity
+   * — its fingerprint and the public key it generated. The verdict is then kept,
+   * so later starts are licensed with no further ceremony.
+   *
+   * **Throws** only for a file that is not a licence: unreadable, not one of
+   * ours, addressed to another product, or a broken signature. A file that *is*
+   * one but cannot license this machine right now comes back as a verdict —
+   * `machine_mismatch` for another machine's file, `offline_file_expired` for
+   * one past its horizon, `expired` for a licence that has ended, and
+   * `clock_tampered` for a clock wound back behind what this install has already
+   * seen. Those are things the user can be told and can act on, and turning
+   * them into exceptions would make the launch path throw for a reason nobody
+   * can catch usefully.
+   */
+  async loadOfflineLicense(pathOrBuffer: string | Buffer | Uint8Array): Promise<LicenseState> {
+    const raw =
+      typeof pathOrBuffer === "string" ? readFileSync(pathOrBuffer) : Buffer.from(pathOrBuffer);
+    let doc: Record<string, unknown>;
+    try {
+      doc = JSON.parse(raw.toString("utf8")) as Record<string, unknown>;
+    } catch {
+      throw new TalosError("not a Talos offline licence file");
+    }
+    if (doc["kind"] !== LICENSE_FILE_KIND || typeof doc["token"] !== "string") {
+      throw new TalosError("not a Talos offline licence file");
+    }
+    // The keyset is inside the file because an air-gapped machine has nowhere
+    // to fetch one from. It is adopted only if the pinned anchor signs it, so a
+    // file carrying somebody else's keyset changes nothing about which keys
+    // this client trusts.
+    if (typeof doc["keyset"] === "string") this.adoptKeyset(doc["keyset"]);
+    return this.adoptOfflineToken(doc["token"], doc["keyset"]);
+  }
+
+  /**
+   * Verify the offline file against this machine and this clock, and adopt the
+   * verdict. Runs on load and again on every {@link validate}, because the two
+   * things that can change afterwards — the clock and the calendar — are
+   * exactly what it checks.
+   */
+  private adoptOfflineToken(token: string, keyset?: unknown): LicenseState {
+    // `verifyCachedToken` rather than `verifyToken`: it checks the signature,
+    // `typ`, `aud` and `nbf`, and leaves `exp` and the nonce to the caller. Both
+    // omissions are right here. The nonce belonged to a request document that
+    // may be weeks in the past and is not kept — it is the *server* that needs
+    // it, where it is unique per account and stops a captured request minting a
+    // second file. And `exp` is a verdict rather than an exception, below.
+    const claims = verifyCachedToken(
+      this.licenseVerifyKeys(),
+      "offline",
+      this.options.productToken,
+      token,
+    );
+
+    const mismatch = (): LicenseState =>
+      this.adopt(new LicenseState("machine_mismatch", {}, null, true, null, null));
+    // Both halves, exactly. The fingerprint is what stops the whole state
+    // directory being copied to another computer, and the key is what stops the
+    // file alone being worth anything — neither is redundant, and accepting
+    // either on its own would open the case the other one closes.
+    if (typeof claims["mpk"] !== "string" || claims["mpk"] !== this.binding?.machinePublicKey) {
+      return mismatch();
+    }
+    if (claims["fph"] !== this.fingerprint) return mismatch();
+
+    const now = nowSeconds();
+    // Both marks are lower bounds on "now" that this install has already
+    // observed: one signed by the server, one its own. A clock behind either
+    // has moved backwards.
+    const mark = Math.max(this.binding?.timeHighWater ?? 0, this.binding?.offlineSeen ?? 0);
+    if (mark > 0 && now + CLOCK_SKEW_SECONDS < mark) {
+      return this.adopt(new LicenseState("clock_tampered", {}, null, true, null, null));
+    }
+
+    const lic = (claims["lic"] ?? {}) as Record<string, unknown>;
+    const features = (lic["features"] ?? {}) as Record<string, unknown>;
+    const licExp = num(lic["lic_exp"]);
+    const exp = num(claims["exp"]);
+
+    // Persist before deciding: the file is this machine's, so it is worth
+    // keeping even when today's answer is "expired" — the licence may be
+    // renewed and a new file issued, and in the meantime the app can say which
+    // file it is holding.
+    this.machineId = typeof claims["mid"] === "string" ? claims["mid"] : this.machineId;
+    const base = this.bindingBase();
+    this.binding = {
+      ...base,
+      machineId: this.machineId ?? base.machineId,
+      offlineToken: token,
+      offlineSeen: Math.max(base.offlineSeen ?? 0, now),
+      ...(typeof keyset === "string" ? { keyset } : {}),
+    };
+    this.advanceClock(claims);
+    this.store?.save(this.binding);
+
+    // The file's own horizon, which is the whole enforcement: there is no
+    // server to re-ask, so this deadline is the only thing that ever ends it.
+    // Distinct from `expired`, which is the *licence* ending — the remedies are
+    // different (a new file versus a renewal) and the app should be able to say
+    // which one to ask for.
+    if (exp === null || now > exp) {
+      return this.adopt(
+        new LicenseState("offline_file_expired", features, licExp, true, null, exp),
+      );
+    }
+    if (licExp !== null && now > licExp) {
+      return this.adopt(new LicenseState("expired", features, licExp, true, null, exp));
+    }
+    return this.adopt(new LicenseState("valid", features, licExp, true, null, exp));
   }
 
   /**
@@ -947,6 +1167,13 @@ export class TalosClient {
   }
 
   async validate(): Promise<LicenseState> {
+    // An air-gapped install has no server to ask and no secret to ask with. Its
+    // file *is* the verdict — re-checked here rather than cached, because the
+    // two things that can have changed since it was loaded are precisely what
+    // that check is about: the clock and the calendar.
+    if (!this.activationSecret && this.binding?.offlineToken) {
+      return this.adoptOfflineToken(this.binding.offlineToken);
+    }
     this.requireActivated();
     try {
       await this.ensureKeyset();

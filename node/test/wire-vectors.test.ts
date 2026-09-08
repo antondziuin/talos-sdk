@@ -59,8 +59,8 @@ describe("frozen wire vectors", () => {
       expect(claims["aud"], v.name).toBe(doc.aud);
     }
     // A file that failed to load, or a rename that emptied the list, must not
-    // read as six passing vectors.
-    expect(doc.vectors).toHaveLength(6);
+    // read as seven passing vectors.
+    expect(doc.vectors).toHaveLength(7);
   });
 
   it("refuses a vector under a key it does not name", () => {
