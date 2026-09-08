@@ -7,6 +7,19 @@
 # and SourceLink pointing consumers at sources they cannot fetch. From here all
 # three work, and the packages point at the code they were built from.
 #
+# NuGet is published by **trusted publishing**: no API key is stored anywhere.
+# The job proves it is this workflow in this repository with an OIDC token, and
+# nuget.org exchanges that for a key valid one hour and usable once. What is left
+# in the secrets is `NUGET_USER`, a profile name that is not a credential. The
+# policy that trusts this is configured on nuget.org and names the repository
+# owner, the repository, and this file by name — so renaming this file breaks
+# publishing until the policy is updated, which is the intended tradeoff.
+#
+# npm still uses a token, because npm configures a trusted publisher on the
+# package's own settings page and the package does not exist yet. Once `0.1.0`
+# is out, that switch is worth making: it removes the last long-lived
+# publishing credential and generates provenance without the flag.
+#
 # Like the monorepo's own CI, this file is authored at
 # `sdks/.github/workflows/release.yml` in the private tree and arrives at the
 # mirror's root through `sync-sdk-mirror.sh`.
@@ -49,17 +62,22 @@ jobs:
     name: NuGet
     needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The OIDC token this job trades for a publishing key. Without it the
+      # exchange fails in a way that reads like a login problem.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
-      - name: the token this job needs exists
+      - name: the setting this job needs exists
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_USER: ${{ secrets.NUGET_USER }}
         run: |
-          if [ -z "${NUGET_API_KEY}" ]; then
-            echo "::error::NUGET_API_KEY is not set. Create an API key on nuget.org (scope: push new packages, glob Talos.*) and add it as a repository secret here." >&2
+          if [ -z "${NUGET_USER}" ]; then
+            echo "::error::NUGET_USER is not set. Add your nuget.org profile name — the username, not the email — as a repository secret, and create a trusted publishing policy on nuget.org for antondziuin/talos-sdk, workflow file release.yml." >&2
             exit 1
           fi
       - run: dotnet test csharp/Talos.Sdk.Tests/Talos.Sdk.Tests.csproj -c Release
@@ -77,14 +95,19 @@ jobs:
         with:
           name: nupkg-${{ github.ref_name }}
           path: nupkg/*
+      # Minted immediately before the push, and not a step earlier: the key
+      # nuget.org returns lives one hour and the token buying it works once.
+      - name: exchange this run's identity for a one-hour key
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
       # The `.snupkg` beside it goes up automatically: NuGet pushes the symbol
       # package that shares a name with the package being pushed.
       - name: push to nuget.org
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
           dotnet nuget push "nupkg/*.nupkg" \
-            --api-key "$NUGET_API_KEY" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
             --source https://api.nuget.org/v3/index.json \
             --skip-duplicate
 
