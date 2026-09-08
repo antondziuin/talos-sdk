@@ -9,7 +9,7 @@
 #
 # Like the monorepo's own CI, this file is authored at
 # `sdks/.github/workflows/release.yml` in the private tree and arrives at the
-# mirror's root through `sdks/sync-mirror.sh`.
+# mirror's root through `sync-sdk-mirror.sh`.
 name: release
 
 on:
