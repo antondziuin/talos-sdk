@@ -15,10 +15,11 @@
 # owner, the repository, and this file by name — so renaming this file breaks
 # publishing until the policy is updated, which is the intended tradeoff.
 #
-# npm still uses a token, because npm configures a trusted publisher on the
-# package's own settings page and the package does not exist yet. Once `0.1.0`
-# is out, that switch is worth making: it removes the last long-lived
-# publishing credential and generates provenance without the flag.
+# npm publishes the same way since `0.1.0` went out: npm configures a trusted
+# publisher on the package's own settings page, which needs the package to
+# exist, so the first release used a token and this one does not. No long-lived
+# publishing credential is left in either registry's path, and provenance is
+# generated without asking — it is what a trusted publish means.
 #
 # Like the monorepo's own CI, this file is authored at
 # `sdks/.github/workflows/release.yml` in the private tree and arrives at the
@@ -126,18 +127,25 @@ jobs:
         working-directory: node
     steps:
       - uses: actions/checkout@v4
+      # Node 24 rather than the 22 the CI job tests on, and not by preference:
+      # a trusted publish needs npm 11.5.1, and Node 22 still ships npm 10. No
+      # `cache:` input anywhere here on purpose — a release build should fetch
+      # what the lockfile says rather than what a cache kept.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
-      - name: the token this job needs exists
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: npm is new enough to publish without a token
         run: |
-          if [ -z "${NPM_TOKEN}" ]; then
-            echo "::error::NPM_TOKEN is not set. Create a granular token on npmjs.com with read and write on the @antondziuin scope and add it as a repository secret here." >&2
-            exit 1
-          fi
+          set -euo pipefail
+          have=$(npm --version)
+          echo "npm $have"
+          # Without OIDC support npm falls back to looking for a token it will
+          # not find, and says `ENEEDAUTH` — which reads like a missing secret
+          # rather than a runner image that moved backwards.
+          # `sort -V -C` succeeds only when its input is already in version
+          # order, so this asks whether 11.5.1 comes first.
+          { echo 11.5.1; echo "$have"; } | sort -V -C || { echo "::error::npm $have cannot do a trusted publish; 11.5.1 or later is required." >&2; exit 1; }
       - run: npm install --no-audit --no-fund
       # This is where `src/version.ts` is held to package.json, so it runs
       # before the publish rather than beside it.
@@ -164,9 +172,12 @@ jobs:
       # `--access public`: the package is scoped, and npm makes scoped packages
       # private by default — which on a free account is a publish that fails
       # rather than a package nobody can see.
+      # No NODE_AUTH_TOKEN: the OIDC token this job already has permission to
+      # mint is what npm trades for the right to publish, against the trusted
+      # publisher configured on the package — this repository, this workflow
+      # file. Renaming this file stops npm publishing too, the same way it
+      # stops NuGet.
       - name: publish to npmjs.com
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           # The NuGet half pushes with `--skip-duplicate`; npm has no such flag,
@@ -181,4 +192,7 @@ jobs:
             echo "$name@$version is already on the registry; nothing to publish"
             exit 0
           fi
-          npm publish --provenance --access public
+          # `--provenance` is gone because a trusted publish attests on its own;
+          # passing it is not an error, but it would suggest the attestation is
+          # the flag's doing rather than the publish's.
+          npm publish --access public
