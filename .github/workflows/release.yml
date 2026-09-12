@@ -7,13 +7,31 @@
 # and SourceLink pointing consumers at sources they cannot fetch. From here all
 # three work, and the packages point at the code they were built from.
 #
+# **A release is a version bump, and nothing else.** Every push to `main` — which
+# is what the monorepo's sync workflow does whenever its CI goes green — runs
+# `plan`, which asks each registry whether the version in that package's
+# manifest is already there. Usually both are, and both publish jobs skip in
+# seconds. When one is not, that package is tested, packed and published, and
+# the other is left alone: bumping `node/package.json` releases to npm without
+# touching NuGet.
+#
+# It used to be a tag `v*` that had to equal both manifests. That made every
+# release a joint one — a Node-only fix could not go out without a C# version
+# nobody had changed — and it made the tag a fourth place the version could be
+# wrong. The tags are still made, by the `tag` job, but *after* a publish
+# succeeds: they record what went out instead of requesting it, which is also
+# why a release that fails its tests and is fixed in a later commit no longer
+# leaves a tag on a commit nothing was published from.
+#
 # NuGet is published by **trusted publishing**: no API key is stored anywhere.
 # The job proves it is this workflow in this repository with an OIDC token, and
 # nuget.org exchanges that for a key valid one hour and usable once. What is left
 # in the secrets is `NUGET_USER`, a profile name that is not a credential. The
 # policy that trusts this is configured on nuget.org and names the repository
 # owner, the repository, and this file by name — so renaming this file breaks
-# publishing until the policy is updated, which is the intended tradeoff.
+# publishing until the policy is updated, which is the intended tradeoff. What
+# the policy does *not* name is the event, which is why moving this workflow
+# from a tag push to a branch push changed nothing about either registry's trust.
 #
 # npm publishes the same way since `0.1.0` went out: npm configures a trusted
 # publisher on the package's own settings page, which needs the package to
@@ -28,40 +46,60 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  # For the case where a publish failed on something outside the code — a
+  # registry outage, a policy that expired — and the fix is to run it again
+  # rather than to bump a version nobody consumed.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# Two pushes in quick succession would otherwise both see the same unpublished
+# version and both try to publish it. NuGet absorbs that with `--skip-duplicate`
+# and npm treats it as a hard error, so they are serialised — and never
+# cancelled, because a run interrupted between the publish and the tag leaves a
+# released version that nothing in this repository records.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  verify:
-    name: the tag agrees with the manifests
+  plan:
+    name: what the registries are missing
     runs-on: ubuntu-latest
+    outputs:
+      npm_version: ${{ steps.plan.outputs.npm_version }}
+      npm_published: ${{ steps.plan.outputs.npm_published }}
+      nuget_version: ${{ steps.plan.outputs.nuget_version }}
+      nuget_published: ${{ steps.plan.outputs.nuget_published }}
     steps:
       - uses: actions/checkout@v4
-      # A package published as 0.1.0 from a tree that says 0.2.0 is a mistake
-      # with no undo: a version, once taken on a public registry, is taken. So
-      # this runs before anything is built, not as part of publishing.
-      - name: version in the tag, the csproj and package.json is one version
+      # `release-plan.sh` prints `key=value`, which is the format `$GITHUB_OUTPUT`
+      # reads, so there is nothing here to parse and nothing to keep in step with
+      # the script. It is the same file the monorepo's sync workflow runs.
+      - id: plan
+        run: bash ./release-plan.sh | tee -a "$GITHUB_OUTPUT"
+      - name: say so in the run summary
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          csproj=$(sed -n 's|^[[:space:]]*<Version>\([^<]*\)</Version>.*|\1|p' \
-                   csharp/Talos.Sdk/Talos.Sdk.csproj)
-          npm=$(node -p "require('./node/package.json').version")
-          echo "tag=$tag csproj=$csproj npm=$npm"
-          if [ "$tag" != "$csproj" ] || [ "$tag" != "$npm" ]; then
-            echo "::error::the tag says $tag, the csproj says $csproj and package.json says $npm." >&2
-            echo "Bump the manifests in the monorepo, re-sync, and tag that; a published version cannot be recalled." >&2
-            exit 1
-          fi
-          # `node/src/version.ts` is the third copy, and it is what the SDK
-          # reports to the server — held to package.json by the Node suite,
-          # which runs below before anything is published.
+          say() {  # package, version, published
+            if [ "$3" = "true" ]; then
+              echo "- **$1** $2 — already on the registry, nothing to do"
+            else
+              echo "- **$1** $2 — **publishing**"
+            fi
+          }
+          {
+            echo "### Release plan"
+            say npm "${{ steps.plan.outputs.npm_version }}" "${{ steps.plan.outputs.npm_published }}"
+            say NuGet "${{ steps.plan.outputs.nuget_version }}" "${{ steps.plan.outputs.nuget_published }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   nuget:
     name: NuGet
-    needs: verify
+    needs: plan
+    if: needs.plan.outputs.nuget_published == 'false'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -83,6 +121,19 @@ jobs:
           fi
       - run: dotnet test csharp/Talos.Sdk.Tests/Talos.Sdk.Tests.csproj -c Release
       - run: dotnet pack csharp/Talos.Sdk/Talos.Sdk.csproj -c Release -o nupkg
+      # The package carries the version `plan` looked up, and this is not the
+      # same file read twice: a `Directory.Build.props`, a stray `-p:Version=`
+      # or a version suffix would move one and not the other, and the first
+      # anyone would know of it is a registry holding a version nothing asked
+      # for — which cannot be taken back.
+      - name: the package is the version this release is for
+        run: |
+          set -euo pipefail
+          want="${{ needs.plan.outputs.nuget_version }}"
+          test -f "nupkg/Talos.Sdk.$want.nupkg" || {
+            echo "::error::expected nupkg/Talos.Sdk.$want.nupkg, but the pack produced $(ls nupkg/*.nupkg)" >&2
+            exit 1
+          }
       - name: the package carries both frameworks, its README, symbols and a licence
         run: |
           unzip -l nupkg/Talos.Sdk.*.nupkg > listing
@@ -94,7 +145,7 @@ jobs:
             || { echo "the package does not declare the MIT licence" >&2; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
-          name: nupkg-${{ github.ref_name }}
+          name: nupkg-${{ needs.plan.outputs.nuget_version }}
           path: nupkg/*
       # Minted immediately before the push, and not a step earlier: the key
       # nuget.org returns lives one hour and the token buying it works once.
@@ -114,12 +165,13 @@ jobs:
 
   npm:
     name: npm
-    needs: verify
+    needs: plan
+    if: needs.plan.outputs.npm_published == 'false'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       # Provenance is an attestation signed with a short-lived OIDC token minted
-      # for this run. Without this permission `--provenance` fails, and the
+      # for this run. Without this permission the publish cannot attest, and the
       # failure reads like an authentication problem.
       id-token: write
     defaults:
@@ -167,7 +219,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: npm-tarball-${{ github.ref_name }}
+          name: npm-tarball-${{ needs.plan.outputs.npm_version }}
           path: node/antondziuin-talos-sdk-*.tgz
       # `--access public`: the package is scoped, and npm makes scoped packages
       # private by default — which on a free account is a publish that fails
@@ -180,12 +232,12 @@ jobs:
       - name: publish to npmjs.com
         run: |
           set -euo pipefail
-          # The NuGet half pushes with `--skip-duplicate`; npm has no such flag,
-          # and publishing a version that exists is a hard error. The two halves
-          # run in parallel, so without this the first failure of either one
-          # leaves a release that cannot be retried: the fixed re-run dies here
-          # on the version the successful half already published, and the only
-          # way forward is to burn a version number nobody consumed.
+          # `plan` asked this same question several minutes ago, and the answer
+          # can have changed since: `concurrency` serialises this run against
+          # other runs, and against nothing else — not a `npm publish` from a
+          # laptop, not a retried run of an older commit. NuGet's half rides
+          # `--skip-duplicate`; npm has no such flag and a version that exists
+          # is a hard error, so the question is asked once more here.
           name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
           if [ -n "$(npm view "$name@$version" version 2>/dev/null || true)" ]; then
@@ -196,3 +248,48 @@ jobs:
           # passing it is not an error, but it would suggest the attestation is
           # the flag's doing rather than the publish's.
           npm publish --access public
+
+  tag:
+    name: tag what went out
+    needs: [plan, npm, nuget]
+    # `always()`, because the ordinary release is one of those two jobs being
+    # skipped and the other publishing: without it this job would be skipped
+    # along with them and a real release would go untagged. The conditions
+    # inside decide per package, and a job that *failed* is not `success` and
+    # so is not tagged.
+    if: always() && (needs.npm.result == 'success' || needs.nuget.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      # One tag per package rather than one per release: the two versions move
+      # independently now, and a shared `v0.2.0` would be a claim about a
+      # package that was not part of this release.
+      #
+      # Pushed with the workflow's own token, which by design starts no further
+      # runs — and this workflow listens only to `main` in any case, so a tag
+      # could not start one here even from a credential that does.
+      - name: node-vX and csharp-vX, on the commit that was published
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tag_it() {  # package, version
+            local tag="$1-v$2"
+            # A tag that is already here means this version was released from
+            # some other commit. Moving it would erase the record of which one.
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "$tag already exists; leaving it where it is"
+              return 0
+            fi
+            git tag -a "$tag" -m "$1 SDK $2"
+            git push origin "$tag"
+            echo "- \`$tag\` at $(git rev-parse --short HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          }
+          if [ "${{ needs.npm.result }}" = "success" ]; then
+            tag_it node "${{ needs.plan.outputs.npm_version }}"
+          fi
+          if [ "${{ needs.nuget.result }}" = "success" ]; then
+            tag_it csharp "${{ needs.plan.outputs.nuget_version }}"
+          fi
