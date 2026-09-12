@@ -1,15 +1,18 @@
 # @antondziuin/talos-sdk (Node.js)
 
-Online-first client SDK for the Talos licensing platform. Node ≥18, **zero
-runtime dependencies** (`node:crypto` Ed25519, built-in `fetch`), dual ESM + CJS.
+Talos SDK for Node.js and Electron applications. Activate and validate licenses,
+read feature entitlements, manage floating seats, and download signed software
+updates. Supports offline grace periods and license files for air-gapped machines.
+
+Requires Node.js 18 or later. Includes TypeScript declarations, ESM and CommonJS
+builds, and **zero runtime dependencies**. Uses `node:crypto` for Ed25519
+verification and the built-in `fetch` for HTTP requests.
 
 ```sh
 npm install @antondziuin/talos-sdk
 ```
 
-MIT-licensed, from `0.1.0` onward. The platform it talks to is not — the split is
-deliberate: a library you install into your own application should not be
-something your legal review has to read.
+MIT-licensed.
 
 ## Quickstart
 
@@ -227,8 +230,7 @@ recalled** — revoking it in the portal frees the seat so you can issue to a
 replacement machine, but the machine holding it keeps working until the file's
 own expiry, which is why the policy's horizon is short. And hardware changes are
 not forgiven offline: the drift matcher lives on the server, so a replaced disk
-means `machine_mismatch` and a new request. Full design and the rest of the
-trade-offs: `docs/OFFLINE.md`.
+means `machine_mismatch` and a new request.
 
 ## Heartbeats, monitoring, and cadence
 
@@ -329,26 +331,12 @@ given.
 The same code arrives on the artifact download, for the same reason: the gate is
 the licence's `updates` entitlement, checked on both routes.
 
-## Hardening the shipped bundle
+## Electron integration
 
-The renderer, the bundle and the disk all belong to the person running your
-application, so nothing here is a licence check — the checks are on the server,
-and the entitlement is the thing worth gating on (see the portal's
-"Entitlements" page). What client-side hardening buys is time.
-
-- **Bundle first**, with esbuild or webpack: one file, no module boundaries, no
-  helpfully-named source files to open.
-- **Then `bytenode`**, which compiles that bundle to V8 bytecode — the practical
-  option for Node and Electron applications, and the one this SDK's C# sibling
-  reaches for with NativeAOT.
-- **Keep the client in the main process** in Electron. The renderer is the part
-  an attacker already controls; it should be told a verdict and never hold the
-  activation secret (see `examples/electron-main`).
-
-Honestly labelled: bytecode can be decompiled and every obfuscator has a
-deobfuscator. These buy an attacker's afternoon, not their ability — which is
-why the server decides seats, expiry and revocation, and why a feature that only
-exists on the server cannot be patched into existence on the client.
+Keep `TalosClient` in the main process and expose the license state to the
+renderer through IPC. Keep the activation secret in the main process. Use
+server-verified entitlements to control licensed features; client-side code
+can be modified by the person running the application.
 
 ## Hardware changes
 
@@ -373,9 +361,8 @@ const talos = new TalosClient({
 ```
 
 The value must be stable for the life of the install — one that changes per
-launch reports a hardware change on every launch. See
-[docs/FINGERPRINT.md](../../docs/FINGERPRINT.md) for the recognised ids, the
-per-platform coverage table, and the drift budget that bounds all of this.
+launch reports a hardware change on every launch. The product's fingerprint
+policy controls which hardware changes are tolerated.
 
 ## Floating (concurrent) licenses
 
@@ -444,9 +431,3 @@ that is already updated.
 
 Downloaded bytes are verified against the signed manifest's SHA-256, so the
 CDN/mirror serving them is untrusted infrastructure.
-
-## Tests
-
-- `npm test` runs the client-side verification tests (no server needed).
-- The cross-language **contract test** (`test/contract.test.ts`) runs the SDK
-  against a live Rust server; see [`../csharp/contract.sh`](../csharp/contract.sh).

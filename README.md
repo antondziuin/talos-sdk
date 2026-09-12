@@ -1,51 +1,48 @@
 # Talos SDKs
 
-Client SDKs that developers embed in their products. **MIT licensed** — the
-platform they talk to is not, and the split is deliberate: a library you compile
-into your own application should not be something your legal review has to read.
+Talos SDKs add license activation, validation, feature entitlements, and signed
+software updates to your application. Both packages support machine-bound
+licenses, offline grace periods, air-gapped activation, and floating seats.
+
+## Packages
+
+| Package | Applications | Requirements |
+|---|---|---|
+| `Talos.Sdk` | C# / .NET applications | `netstandard2.0` or `net8.0`; managed Ed25519 verification via BouncyCastle |
+| `@antondziuin/talos-sdk` | Node.js and Electron applications | Node.js 18 or later; ESM and CommonJS; no runtime dependencies |
+
+## Installation
 
 ```sh
 dotnet add package Talos.Sdk
 npm install @antondziuin/talos-sdk
 ```
 
-## Where this code lives
+## Integration
 
-The public repository you are probably reading this in is a **mirror**. The SDKs
-are developed in the Talos monorepo, which is private, because that is where
-they are tested against a real server: the cross-language contract harness
-drives the actual Rust API and verifies real signed tokens, and the frozen wire
-vectors in `contract-vectors.json` are generated there and verified here, in C#
-and in Node, against bytes that predate all three implementations.
+Configure the SDK with your Talos server URL, product token, and pinned anchor
+public key from the product's Integration page. Activate with the customer's
+license key, then validate the saved activation on later launches. Background
+check-ins keep the license state current according to the product's policy.
 
-The mirror carries the real history of these files — `git subtree split`, not a
-squashed export — and exists because npm attests provenance only against a
-public repository. Publishing from here is what makes the attestation, the
-package pages' repository links and SourceLink point at code anyone can read.
+The SDK verifies signed licensing responses and update manifests with Ed25519.
+Offline validation uses the last verified decision within the configured grace
+period; air-gapped machines use a separately issued offline license file.
 
-Pull requests are welcome and land in the monorepo, so they arrive back here on
-the next release rather than as a merge commit.
+## Activation metadata
 
-- `csharp/` — **`Talos.Sdk`** (NuGet). Multi-target `netstandard2.0;net8.0`,
-  Ed25519 via BouncyCastle (pure managed). Phase 1.
-- `node/` — **`@antondziuin/talos-sdk`** (npm). Node ≥18, zero prod dependencies
-  (`node:crypto` Ed25519), dual ESM/CJS. Phase 2.
+Both SDKs hash fingerprint components with a product-scoped key before sending
+them. They also report the following descriptive fields for the activation:
 
-Both are thin online-first clients over the same wire protocol: activate →
-validate (signed decision + nonce echo) → heartbeat → deactivate, with pinned
-per-product Ed25519 verification of every Talos-compact token. See plan §9.
-
-## What a seat reports about itself
-
-Alongside the fingerprint — whose components are HMAC'd, so raw identifiers
-never leave the machine — both SDKs send three plain, descriptive fields the
-developer's portal shows against the seat:
-
-| Field | Default | Why it is not the fingerprint's hostname |
+| Field | Default | Purpose |
 |---|---|---|
-| `hostname` | `os.hostname()` / `Environment.MachineName` | Stored and displayed as written. It is what a support agent reads when a customer says "release the one on my old laptop"; without it every seat on a licence is a hash prefix. Set the `hostname` option to `""` to send nothing. |
-| `app_version` | unset (`appVersion` option) | Your product's version, for the adoption dashboard. |
-| `sdk_version` | this SDK's own package version | Answers "how many installs are still on the old client?" — sent on heartbeat as well as activation, because activation happens once per install and the answer has to stay current. |
+| `hostname` | `os.hostname()` / `Environment.MachineName` | Identifies the machine in the portal. Sent as plain text; set `hostname` (Node.js) or `Hostname` (.NET) to `""` to omit it. |
+| `app_version` | Unset | Your application's version, configured with `appVersion` (Node.js) or `AppVersion` (.NET). |
+| `sdk_version` | Installed SDK version | Reports SDK version adoption on activation and heartbeat. |
 
 The server keeps the last value it was given for each, so an SDK that omits one
 leaves the previous value alone rather than blanking it.
+
+## License
+
+Both SDK packages are MIT-licensed.

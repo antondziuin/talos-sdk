@@ -1,16 +1,17 @@
 # Talos.Sdk (C#)
 
-Online-first client SDK for the Talos licensing platform. Multi-targets
-`netstandard2.0` (reaches .NET Framework 4.6.2+, Unity, Mono) and `net8.0`.
-Ed25519 verification via BouncyCastle (pure managed — no native binaries).
+Talos SDK for C# and .NET applications. Activate and validate licenses, read
+feature entitlements, manage floating seats, and download signed software
+updates. Supports offline grace periods and license files for air-gapped machines.
+
+Targets `netstandard2.0` and `net8.0`. Uses BouncyCastle for managed Ed25519
+verification, with no native cryptography binaries.
 
 ```sh
 dotnet add package Talos.Sdk
 ```
 
-MIT-licensed, from `0.1.0` onward. The platform it talks to is not — the split is
-deliberate: a library you compile into your own application should not be
-something your legal review has to read.
+MIT-licensed.
 
 ## Quickstart
 
@@ -58,10 +59,8 @@ the application instead of letting it keep running offline. Your *own*
 cancellation still arrives as an `OperationCanceledException` — the two are told
 apart by whose token was signalled.
 
-It does **not** cap `DownloadUpdateAsync`, for the same reason it does not in
-the Node SDK: a total-duration limit on a multi-megabyte artifact is a size
-limit disguised as a safeguard. That one is bounded by the signed manifest's
-size.
+`HttpTimeoutMs` does not apply to `DownloadUpdateAsync`. Downloads are bounded
+by the signed manifest's size and accept a cancellation token.
 
 ## Downloads stream, and report progress
 
@@ -97,23 +96,15 @@ an application shipped against an older SDK keeps working unchanged.
 
 ## Dependency injection
 
-There is no `AddTalos` extension and no `ITalosClient`, deliberately. The
-registration is one line, and the client already disposes correctly:
+Register `TalosClient` directly with your application's service container:
 
 ```csharp
 services.AddSingleton(sp => new TalosClient(new TalosOptions { /* … */ }));
 ```
 
-An extension package would add `Microsoft.Extensions.*` to a package that
-console and desktop applications also carry, to save that line. And an
-interface, in C#, breaks every implementer — every mock — the next time a member
-is added, which is a promise of stability this SDK is too young to make. If you
-want to test your licensing gate, wrap what *you* need behind your own
-one-method interface: it couples your tests to your decision rather than to our
-surface.
-
-Both are on the list to revisit once this SDK is published and its surface has
-settled — see `docs/AUDIT-BACKLOG.md`.
+The service container disposes the client when it shuts down. To isolate
+licensing in application tests, wrap the operations you use behind your own
+interface.
 
 ## Trimming and NativeAOT
 
@@ -268,8 +259,7 @@ recalled** — revoking it in the portal frees the seat so you can issue to a
 replacement machine, but the machine holding it keeps working until the file's
 own expiry, which is why the policy's horizon is short. And hardware changes are
 not forgiven offline: the drift matcher lives on the server, so a replaced disk
-means `machine_mismatch` and a new request. Full design and the rest of the
-trade-offs: `docs/OFFLINE.md`.
+means `machine_mismatch` and a new request.
 
 ## Heartbeats, monitoring, and cadence
 
@@ -392,12 +382,5 @@ var talos = new TalosClient(new TalosOptions {
 });
 ```
 
-The value must be stable for the life of the install. See
-[docs/FINGERPRINT.md](../../docs/FINGERPRINT.md) for the recognised ids, the
-per-platform coverage table, and the drift budget that bounds all of this.
-
-## Tests
-
-- `dotnet test` runs the client-side verification tests (no server needed).
-- The cross-language **contract test** runs the SDK against a live Rust server;
-  see [`contract.sh`](contract.sh) (needs Postgres + the built `talos-server`).
+The value must be stable for the life of the install. The product's fingerprint
+policy controls which hardware changes are tolerated.
