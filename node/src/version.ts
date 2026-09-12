@@ -11,7 +11,7 @@
  * literal at the call site was doing, and why the column it fills was worthless
  * for answering "who is still on the old client?".
  */
-export const SDK_VERSION = "0.1.0";
+export const SDK_VERSION = "0.2.0";
 
-/** The wire form: language tag plus version, e.g. `node/0.1.0`. */
+/** The wire form: language tag plus version, e.g. `node/0.2.0`. */
 export const SDK_ID = `node/${SDK_VERSION}`;

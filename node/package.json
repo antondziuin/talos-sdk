@@ -1,6 +1,6 @@
 {
   "name": "@antondziuin/talos-sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Talos SDK for Node.js and Electron: license activation and validation, offline licensing, feature entitlements, floating seats, and signed software updates.",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/antondziuin/talos-sdk.git" },
