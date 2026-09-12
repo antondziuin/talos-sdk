@@ -502,6 +502,18 @@ namespace Talos.Sdk
         public LicenseState? Current { get; private set; }
 
         /// <summary>
+        /// Return a local JSON support report without credentials, hardware
+        /// identifiers or exception text. Pass a caught error for classification.
+        /// Makes no requests and does not change licensing state. The decision
+        /// is the last known result, not a new validation.
+        /// </summary>
+        public string CreateDiagnosticReport(Exception? error = null)
+        {
+            var report = DiagnosticReport.Create(IsActivated, _anchorKey != null, Current, error);
+            return JsonSerializer.Serialize(report, WireJson.Default.DiagnosticReport);
+        }
+
+        /// <summary>
         /// The licence stopped being usable: <c>expired</c>, <c>revoked</c>,
         /// <c>suspended</c>, <c>deactivated</c>, <c>machine_revoked</c> or
         /// <c>invalid</c>. Raised again when the <i>reason</i> changes, since

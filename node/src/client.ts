@@ -14,6 +14,7 @@ import {
   type StoredBinding,
 } from "./state.js";
 import { SDK_ID } from "./version.js";
+import { diagnosticReport } from "./diagnostics.js";
 import {
   generateMachineKey,
   signMachineDoc,
@@ -500,6 +501,15 @@ export class TalosClient {
   /** Default instance id for floating leases: one per client object. */
   private readonly instanceId: string = b64urlEncode(randomBytes(9));
   current: LicenseState | null = null;
+
+  /**
+   * Return a local JSON support report without credentials, identifiers or
+   * exception text. Pass a caught error for classification. Makes no requests
+   * and does not change licensing state; `decision` is the last known result.
+   */
+  createDiagnosticReport(error?: unknown): string {
+    return diagnosticReport(this.isActivated, this.options.anchorPublicKey != null && this.options.anchorPublicKey !== "", this.current, error);
+  }
   private readonly listeners = new Map<TalosEventName, Set<(payload: never) => void>>();
   /** The newest release this client has already announced. */
   private announcedReleaseSeq = 0;

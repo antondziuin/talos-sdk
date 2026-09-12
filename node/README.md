@@ -37,6 +37,33 @@ if (talos.isFeatureEnabled("pdf-export")) enablePdfMenu();
 const seats = Number(talos.current?.getEntitlement("seats") ?? 1);
 ```
 
+## Local diagnostic reports
+
+After a licensing call, `talos.createDiagnosticReport()` returns JSON describing
+the last decision, offline grace deadline, SDK version and whether an activation
+is held. If the call throws, pass the caught error to classify it and get a next
+action:
+
+```ts
+try {
+  await talos.validate();
+  console.log(talos.createDiagnosticReport());
+} catch (error) {
+  console.log(talos.createDiagnosticReport(error));
+}
+```
+
+The report is a local snapshot: it makes no requests, writes no files and changes
+no licensing state. It excludes keys, tokens, server URLs, machine identifiers,
+entitlements and exception messages/stacks. Unknown error codes are replaced with
+`api_error`. An HTTP error is not a signed license decision. An offline result
+alone cannot identify the original transport or verification failure.
+
+In the portal, select the same license on **Integration → Connection progress**
+to see its devices, recorded validation, seat usage and recent activation refusals.
+Use the report for failures that the server cannot see. Do not use this report
+as authorization; continue to gate access on the SDK's verified license state.
+
 ## Supplying your own `fetch`
 
 `options.fetch` replaces the global one for **every** network call, artifact

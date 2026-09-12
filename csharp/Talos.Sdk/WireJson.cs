@@ -173,6 +173,7 @@ namespace Talos.Sdk
     /// </remarks>
     [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
     [JsonSerializable(typeof(KeysetReq))]
+    [JsonSerializable(typeof(DiagnosticReport))]
     [JsonSerializable(typeof(ActivateReq))]
     [JsonSerializable(typeof(ValidateReq))]
     [JsonSerializable(typeof(HeartbeatReq))]
