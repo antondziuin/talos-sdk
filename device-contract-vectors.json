@@ -1,0 +1,49 @@
+{
+  "certificate": {
+    "chain_id": 84532,
+    "contract": "0x0505050505050505050505050505050505050505",
+    "entitlements": "eyJwcm8iOnRydWV9",
+    "issuer": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+    "kind": "talos-device-certificate",
+    "license": {
+      "device_key": "0xca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+      "entitlements_hash": "0x42537f010c56a9b7c3109f336ee759216897b046a386474d1832624e4956f4d4",
+      "expires_at": 1800604800,
+      "fingerprint_hash": "0x5f2227d140ceb761114eb8dbe2c1b67cb640b62610ef068b34bccc0d1c09d95d",
+      "holder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+      "license_id": "0x949e5cb152a20228c5eb5634354d6cb972cbc15e0d155a085d27b909cb13c077",
+      "not_before": 1800000000,
+      "product_id": "0x02e4f789835cbd183fadd6fb55dd9f89d0c0ec420e638b6cab3d1aac0b2cab5e",
+      "revision": 1,
+      "tenant_id": "0xa329637a94c242679b66b02e5b37b018a1178abbcd0dcb8afb63dbbfee4db669"
+    },
+    "signature": "0xfd2d0fd1382ee025ceccb8f7fd19b683e1dde4d8d69ced88888f4ac0fd28cf481622a97fa61de3b48139a5569c5ee5494119d25cc0f7411056f343c770596f211b",
+    "v": 2
+  },
+  "certificate_digest": "0x36092038db52b48fc7007135f14ad5fc0a16205872e3e98df8b86ba15dbf39f8",
+  "challenge": {
+    "payload": "eyJub25jZSI6IjA5MDkwOTA5LTA5MDktMDkwOS0wOTA5LTA5MDkwOTA5MDkwOSIsImxpY2Vuc2VfcmVmIjoiMHhjY2ZlYzA4NGYxMzRjN2M5MWY5ZWZkY2E1YThhYmRhNWRjYjI2MjFjMDA1NWI3YjdmYzA0M2FjMzZmMzczMTk2IiwiZGV2aWNlX3JlZiI6IjB4MzA0ZTVmZTc4ZmM2ODY5NDgzYzIwOGY4YWM5ODMwYmY0MGYzMGJkMmNiYmI0ZjViNTg4NTRlODUzZTk3ZTAyMiIsInJldmlzaW9uIjoxLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAxMjB9",
+    "signature": "0x441e7e1ddf370f724e701194b1c145587222460563ca0003be9d124c6a17789316a31685b6203a0a206f3e71337f4ce69986a95db2d66df8cc97abb8e5ff43301b"
+  },
+  "device": {
+    "device_key": "0xca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+    "fingerprint_hash": "0x5f2227d140ceb761114eb8dbe2c1b67cb640b62610ef068b34bccc0d1c09d95d",
+    "signature": "0x5b7c2ac32ba161a80c36eab2fabc2a4865bf40b94c0d9e8e4c7cef738c62f60c439043d467a49fd808d292277f5e594cb643d9a784b5ba51bb34c2305096f6451b"
+  },
+  "enrollment": {
+    "chain_id": 84532,
+    "contract": "0x0505050505050505050505050505050505050505",
+    "holder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+    "issued_at": 1800000000,
+    "issuer": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+    "kind": "talos-wallet-enrollment",
+    "license_id": "08080808-0808-0808-0808-080808080808",
+    "product_id": "07070707-0707-0707-0707-070707070707",
+    "renewal_url": "http://127.0.0.1:8080",
+    "revision": 1,
+    "signature": "0xb11e8a1782f13dbd9fb4b465a92b1ddc2a9cd6abc7849c6214ed436ebb00c8ec68256110cf2b5ede87b662d58e91f916cf7fa313575f6c3cc7714da9909ea2711b",
+    "tenant_id": "06060606-0606-0606-0606-060606060606",
+    "v": 2
+  },
+  "enrollment_digest": "0x7d056de8553df08042df3213bd5cca7760ff4eeca9b76db0d1ca3278fd7ef2c7"
+}

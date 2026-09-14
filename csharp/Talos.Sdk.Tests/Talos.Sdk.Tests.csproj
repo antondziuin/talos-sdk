@@ -21,6 +21,8 @@
        Linked rather than copied: one file, three readers, no chance of an SDK
        verifying a stale private copy of the contract. -->
   <ItemGroup>
+    <None Include="..\..\wallet-contract-vectors.json" Link="wallet-contract-vectors.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\device-contract-vectors.json" Link="device-contract-vectors.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\contract-vectors.json" Link="contract-vectors.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

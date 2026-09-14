@@ -13,6 +13,15 @@ dotnet add package Talos.Sdk
 
 MIT-licensed.
 
+Wallet licensing is available through `DeviceLicenseClient`: a seven-day device
+certificate, offline restarts, and automatic daily renewal through Talos.
+Pin issuer/product/network/V2 verifier, import an enrollment, authorize the device
+with the owner's wallet, then `StartAsync()` and `RequireValidCertificate()` before
+protected work. On restored connectivity call `NotifyResumeAsync()`.
+A transfer stops old renewals; the previous device can work until its certificate
+expires, up to seven days. `WalletLicenseClient` remains for older coordinator policies.
+See [the guide](../../docs/WALLET-LICENSES.md) and [example](../../examples/wallet-csharp/).
+
 ## Quickstart
 
 ```csharp
