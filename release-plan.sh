@@ -17,6 +17,9 @@
 #   nuget_id=Talos.Sdk
 #   nuget_version=0.2.0
 #   nuget_published=true
+#   crate_name=talos-sdk
+#   crate_version=0.1.0
+#   crate_published=false
 #
 # Paths resolve against this file's own directory — `sdks/` in the monorepo, the
 # repository root in the mirror — so neither caller has to know which one it is
@@ -71,6 +74,27 @@ nuget_published=$(printf '%s' "$index" | node -e '
   });
 ' "$nuget_version")
 
+# The crate's own [package] table, and only that one: a dependency spelled as
+# an inline table carries a `version =` of its own further down.
+package_field() {
+  awk -v key="$1" '
+    /^\[/ { in_package = ($0 == "[package]") }
+    in_package && $1 == key && $2 == "=" { gsub(/"/, "", $3); print $3; exit }
+  ' rust/Cargo.toml
+}
+crate_name=$(package_field name)
+crate_version=$(package_field version)
+usable "$crate_version" "rust/Cargo.toml"
+
+# crates.io answers 200 for a version it holds and 404 otherwise, and refuses
+# any request without a User-Agent — which `-f` would turn into "not
+# published" and a publish that then fails loudly, the same trade as above.
+crate_published=false
+crates_ua="talos-sdk release-plan (github.com/antondziuin/talos-sdk)"
+if curl -sf -A "$crates_ua" "https://crates.io/api/v1/crates/$crate_name/$crate_version" > /dev/null; then
+  crate_published=true
+fi
+
 cat <<EOF
 npm_name=$npm_name
 npm_version=$npm_version
@@ -78,4 +102,7 @@ npm_published=$npm_published
 nuget_id=$nuget_id
 nuget_version=$nuget_version
 nuget_published=$nuget_published
+crate_name=$crate_name
+crate_version=$crate_version
+crate_published=$crate_published
 EOF

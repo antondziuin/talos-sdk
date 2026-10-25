@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Cross-language contract test: build a demo product+license via xtask, start
-# talos-server, then run the C# SDK against it (activate/validate/deactivate,
-# verifying the signed tokens with the product's real public key).
+# talos-server, then run the C#, Node and Rust SDKs against it
+# (activate/validate/deactivate, verifying the signed tokens with the
+# product's real public key).
 #
 # Requires: a running Postgres (deploy/saas/docker-compose.yml), the Rust
-# toolchain, and the .NET SDK. Run from the repo root: ./sdks/csharp/contract.sh
+# toolchain, Node.js, and the .NET SDK. Run from the repo root: ./sdks/csharp/contract.sh
 #
 # This one only works in the Talos monorepo, which is private: it builds and
 # starts the server the SDKs are being tested against. In the public SDK mirror
 # it is here for reading — the cases it drives (`ContractTest`, and the Node
-# contract suite) self-skip without TALOS_CONTRACT and a live server, so the
+# and Rust contract suites) self-skip without TALOS_CONTRACT and a live server, so the
 # mirror's CI stays green without it.
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
@@ -85,3 +86,6 @@ dotnet test sdks/csharp/Talos.Sdk.Tests/Talos.Sdk.Tests.csproj
 
 echo "== Node contract =="
 ( cd sdks/node && npm ci --no-audit --no-fund && npm test )
+
+echo "== Rust contract =="
+cargo test --manifest-path sdks/rust/Cargo.toml --locked --test contract

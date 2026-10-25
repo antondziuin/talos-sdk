@@ -1,0 +1,48 @@
+[package]
+name = "talos-sdk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Talos SDK for Rust applications: license activation and validation, offline licensing, feature entitlements, floating seats, and signed software updates."
+license = "MIT"
+repository = "https://github.com/antondziuin/talos-sdk"
+readme = "README.md"
+keywords = ["licensing", "license", "activation", "ed25519", "updates"]
+categories = ["authentication", "cryptography"]
+# What a customer downloads is the library. The tests read the frozen wire
+# vectors one directory up, which exists in this repository and not in a
+# package, so they stay here.
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+
+[features]
+default = ["ureq"]
+# The built-in HTTP transport (rustls, blocking). Turn it off and pass
+# `TalosOptions::transport` to use your own client — a corporate proxy, a custom
+# CA bundle, request logging, or a test double.
+ureq = ["dep:ureq"]
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = "2"
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+aes-gcm = "0.10"
+getrandom = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

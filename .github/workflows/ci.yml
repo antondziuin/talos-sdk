@@ -54,3 +54,57 @@ jobs:
         run: |
           node -e "const d=Object.keys(require('./package.json').dependencies||{});
                    if (d.length) { console.error('runtime dependencies found: '+d.join(', ')); process.exit(1) }"
+
+  rust:
+    name: Rust SDK (${{ matrix.os }})
+    # All three, because the fingerprint probes are three different pieces of
+    # platform code — registry and Win32 calls, sysfs, sysctl and getifaddrs —
+    # and a Linux runner compiles exactly one of them.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # Without the built-in transport, which is how an application bringing
+      # its own HTTP client builds it.
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  rust-msrv:
+    name: Rust SDK (MSRV)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      # The `rust-version` the manifest promises. A newer API slipping in is
+      # otherwise discovered by a customer on an older toolchain.
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo build --locked
+      # What `cargo publish` would upload: the library and nothing else. The
+      # tests read `../contract-vectors.json`, which exists here and not in a
+      # package, so they are deliberately left out of it.
+      - name: the package carries the library, its README and licence
+        run: |
+          cargo package --list --allow-dirty > listing
+          for want in src/lib.rs README.md LICENSE Cargo.toml; do
+            grep -qx "$want" listing || { echo "the package is missing $want" >&2; exit 1; }
+          done
+          if grep -q "^tests/" listing; then
+            echo "the package ships tests/, which read files outside the crate" >&2
+            exit 1
+          fi

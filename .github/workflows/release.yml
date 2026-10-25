@@ -10,10 +10,10 @@
 # **A release is a version bump, and nothing else.** Every push to `main` — which
 # is what the monorepo's sync workflow does whenever its CI goes green — runs
 # `plan`, which asks each registry whether the version in that package's
-# manifest is already there. Usually both are, and both publish jobs skip in
+# manifest is already there. Usually all are, and every publish job skips in
 # seconds. When one is not, that package is tested, packed and published, and
-# the other is left alone: bumping `node/package.json` releases to npm without
-# touching NuGet.
+# the others are left alone: bumping `node/package.json` releases to npm without
+# touching NuGet or crates.io.
 #
 # It used to be a tag `v*` that had to equal both manifests. That made every
 # release a joint one — a Node-only fix could not go out without a C# version
@@ -73,6 +73,8 @@ jobs:
       npm_published: ${{ steps.plan.outputs.npm_published }}
       nuget_version: ${{ steps.plan.outputs.nuget_version }}
       nuget_published: ${{ steps.plan.outputs.nuget_published }}
+      crate_version: ${{ steps.plan.outputs.crate_version }}
+      crate_published: ${{ steps.plan.outputs.crate_published }}
     steps:
       - uses: actions/checkout@v4
       # `release-plan.sh` prints `key=value`, which is the format `$GITHUB_OUTPUT`
@@ -94,6 +96,7 @@ jobs:
             echo "### Release plan"
             say npm "${{ steps.plan.outputs.npm_version }}" "${{ steps.plan.outputs.npm_published }}"
             say NuGet "${{ steps.plan.outputs.nuget_version }}" "${{ steps.plan.outputs.nuget_published }}"
+            say crates.io "${{ steps.plan.outputs.crate_version }}" "${{ steps.plan.outputs.crate_published }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
   nuget:
@@ -249,15 +252,73 @@ jobs:
           # the flag's doing rather than the publish's.
           npm publish --access public
 
+  crates:
+    name: crates.io
+    needs: plan
+    if: needs.plan.outputs.crate_published == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The OIDC token trusted publishing trades for a short-lived crates.io
+      # token, the same exchange NuGet and npm make above.
+      id-token: write
+    # A secret cannot be read in an `if:`, so whether the first-release token
+    # exists is decided here, as a string the step below compares.
+    env:
+      HAS_CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      # `plan` read the version out of the manifest with awk; this is cargo's own
+      # reading of the same file. A workspace inheriting the version, or a
+      # second `[package]`-looking table, would move one and not the other.
+      - name: the crate is the version this release is for
+        run: |
+          set -euo pipefail
+          want="${{ needs.plan.outputs.crate_version }}"
+          meta=$(cargo metadata --no-deps --format-version 1)
+          have=$(printf '%s' "$meta" | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          [ "$have" = "$want" ] || { echo "::error::cargo reads $have, the plan was for $want" >&2; exit 1; }
+      # Packs and builds the crate from the packaged sources alone — what a
+      # customer's `cargo add` gets — before anything is uploaded.
+      - run: cargo package --locked
+      # Trusted publishing needs the crate to exist before crates.io lets it be
+      # configured, which is the same chicken-and-egg npm had: the first
+      # release goes out with an API token in `CARGO_REGISTRY_TOKEN`, and every
+      # one after it with the OIDC exchange — delete the secret once the
+      # trusted publisher (this repository, `release.yml`) is configured on the
+      # crate's settings page.
+      - name: exchange this run's identity for a crates.io token
+        id: auth
+        if: env.HAS_CARGO_TOKEN != 'true'
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Asked again for the reason the npm job asks again: `concurrency`
+          # serialises this workflow, not a `cargo publish` from a laptop, and
+          # a version that exists is a hard error here.
+          ua="talos-sdk release (github.com/antondziuin/talos-sdk)"
+          if curl -sf -A "$ua" "https://crates.io/api/v1/crates/talos-sdk/${{ needs.plan.outputs.crate_version }}" > /dev/null; then
+            echo "talos-sdk ${{ needs.plan.outputs.crate_version }} is already on crates.io; nothing to publish"
+            exit 0
+          fi
+          cargo publish --locked
+
   tag:
     name: tag what went out
-    needs: [plan, npm, nuget]
-    # `always()`, because the ordinary release is one of those two jobs being
-    # skipped and the other publishing: without it this job would be skipped
-    # along with them and a real release would go untagged. The conditions
-    # inside decide per package, and a job that *failed* is not `success` and
-    # so is not tagged.
-    if: always() && (needs.npm.result == 'success' || needs.nuget.result == 'success')
+    needs: [plan, npm, nuget, crates]
+    # `always()`, because the ordinary release is all but one of these jobs
+    # being skipped: without it this job would be skipped along with them and a
+    # real release would go untagged. The conditions inside decide per
+    # package, and a job that *failed* is not `success` and so is not tagged.
+    if: always() && (needs.npm.result == 'success' || needs.nuget.result == 'success' || needs.crates.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -270,7 +331,7 @@ jobs:
       # Pushed with the workflow's own token, which by design starts no further
       # runs — and this workflow listens only to `main` in any case, so a tag
       # could not start one here even from a credential that does.
-      - name: node-vX and csharp-vX, on the commit that was published
+      - name: node-vX, csharp-vX and rust-vX, on the commit that was published
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -292,4 +353,7 @@ jobs:
           fi
           if [ "${{ needs.nuget.result }}" = "success" ]; then
             tag_it csharp "${{ needs.plan.outputs.nuget_version }}"
+          fi
+          if [ "${{ needs.crates.result }}" = "success" ]; then
+            tag_it rust "${{ needs.plan.outputs.crate_version }}"
           fi
