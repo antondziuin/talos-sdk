@@ -22,7 +22,7 @@ import { TalosClient } from "@antondziuin/talos-sdk";
 const talos = new TalosClient({
   productToken: "tpt_…",               // from the portal's Integration page
   anchorPublicKey: "base64-anchor-key", // pin THIS — the rotation-safe root
-  serverUrl: "https://api.talos.dev",
+  serverUrl: "https://talos.dziuin.dev", // Talos Cloud, or your self-hosted node
   appVersion: "1.4.2",
 });
 
@@ -382,7 +382,7 @@ an id you already hold — pass it in and the server will use it:
 const talos = new TalosClient({
   productToken: "tpt_…",
   anchorPublicKey: "…",
-  serverUrl: "https://api.talos.dev",
+  serverUrl: "https://talos.dziuin.dev",
   fingerprintComponents: { machine_guid: myNativeModule.machineId() },
 });
 ```
@@ -420,7 +420,7 @@ const talos = new TalosClient({
   productToken: "tpt_…",
   publicKey: "…",             // license key (activation/validation tokens)
   releasePublicKey: "…",      // release key (update manifests) — separate custody
-  serverUrl: "https://api.talos.dev",
+  serverUrl: "https://talos.dziuin.dev",
 });
 await talos.activate(licenseKey);
 

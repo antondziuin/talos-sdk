@@ -33,7 +33,7 @@ using Talos.Sdk;
 using var talos = new TalosClient(new TalosOptions {
     ProductToken = "tpt_…",              // from the portal's Integration page
     PublicKey    = "base64-ed25519-key", // pinned at build time
-    ServerUrl    = "https://api.talos.dev",
+    ServerUrl    = "https://talos.dziuin.dev", // Talos Cloud, or your self-hosted node
     AppVersion   = "1.4.2",
 });
 
@@ -414,7 +414,7 @@ can, supply it:
 var talos = new TalosClient(new TalosOptions {
     ProductToken = "tpt_…",
     AnchorPublicKey = "…",
-    ServerUrl = "https://api.talos.dev",
+    ServerUrl = "https://talos.dziuin.dev",
     ExtraFingerprintComponents = new Dictionary<string, string> {
         ["smbios_uuid"] = MyPlatform.HardwareUuid(),
     },

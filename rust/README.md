@@ -23,7 +23,7 @@ use talos_sdk::{Decision, TalosClient, TalosOptions};
 let talos = TalosClient::new(TalosOptions {
     product_token: "tpt_…".into(),                        // from the portal's Integration page
     anchor_public_key: Some("base64-anchor-key".into()),  // pin THIS — the rotation-safe root
-    server_url: "https://api.talos.dev".into(),
+    server_url: "https://talos.dziuin.dev".into(),           // Talos Cloud, or your self-hosted node
     app_version: Some(env!("CARGO_PKG_VERSION").into()),
     ..Default::default()
 })?;

@@ -59,7 +59,7 @@ const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 /// let talos = TalosClient::new(TalosOptions {
 ///     product_token: "tpt_…".into(),
 ///     anchor_public_key: Some("base64-anchor-key".into()),
-///     server_url: "https://api.talos.dev".into(),
+///     server_url: "https://talos.dziuin.dev".into(),
 ///     app_version: Some(env!("CARGO_PKG_VERSION").into()),
 ///     ..Default::default()
 /// })?;

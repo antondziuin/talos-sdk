@@ -22,8 +22,9 @@ cargo add talos-sdk
 
 ## Integration
 
-Configure the SDK with your Talos server URL, product token, and pinned anchor
-public key from the product's Integration page. Activate with the customer's
+Configure the SDK with the server URL — `https://talos.dziuin.dev` for Talos
+Cloud, or your self-hosted node's address — and the product token and pinned
+anchor public key from the product's Integration page. Activate with the customer's
 license key, then validate the saved activation on later launches. Background
 check-ins keep the license state current according to the product's policy.
 
