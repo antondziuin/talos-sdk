@@ -324,6 +324,23 @@ impl Server {
         )
         .unwrap()
     }
+
+    fn issue_portable(&self, tweak: impl FnOnce(&mut Value)) -> Vec<u8> {
+        let now = self.now();
+        let mut claims = json!({
+            "v": 1, "typ": "offline", "aud": TOKEN, "iat": now, "nbf": now,
+            "exp": null, "perpetual": true, "binding": "portable",
+            "server_time": now, "decision": "valid", "fid": "portable-file-1",
+            "sub": "portable-licence-1", "lic": {"features": {"pro": true}, "lic_exp": null},
+        });
+        tweak(&mut claims);
+        serde_json::to_vec(&json!({
+            "kind": LICENSE_FILE_KIND,
+            "token": mint(&self.license, "offline", &claims),
+            "keyset": self.keyset(),
+        }))
+        .unwrap()
+    }
 }
 
 impl Transport for Server {
@@ -983,6 +1000,314 @@ fn invalid_perpetual_offline_files_fail_closed() {
 }
 
 #[test]
+fn portable_offline_file_works_on_different_machines_without_requests() {
+    let first = Fixture::new();
+    let second = Fixture::new();
+    first.offline(true);
+    second.offline(true);
+    let file = first.server.issue_portable(|_| {});
+    for (f, machine) in [(&first, "hardware-a"), (&second, "hardware-b")] {
+        let mut options = f.options();
+        options
+            .fingerprint_components
+            .insert("machine_guid".into(), machine.into());
+        options
+            .fingerprint_components
+            .insert("hostname".into(), machine.into());
+        let talos = f.client_with(options.clone());
+        let state = talos.load_offline_license(&file).unwrap();
+        assert!(state.is_valid() && state.is_offline);
+        assert_eq!(state.grace_until, None);
+        assert_eq!(talos.machine_id(), None);
+        assert!(talos.is_activated());
+        assert!(matches!(talos.create_offline_deactivation(),
+            Err(Error::Usage(message)) if message.contains("portable")));
+
+        f.advance(80 * 365 * 86400);
+        let restarted = f.client_with(options);
+        let state = restarted.validate().unwrap();
+        assert!(state.is_valid() && state.is_offline);
+        assert!(state.is_feature_enabled("pro"));
+        assert!(f.server.with(|s| s.calls.is_empty()));
+    }
+}
+
+#[test]
+fn valid_offline_import_replaces_an_online_activation_durably() {
+    for portable in [true, false] {
+        let f = Fixture::new();
+        let talos = f.client();
+        assert!(talos.activate("KEY-1").unwrap().is_valid());
+        talos
+            .acquire_lease(AcquireLeaseOptions::new().auto_renew(false))
+            .unwrap();
+        assert!(talos.current_lease().is_some());
+        let file = if portable {
+            f.server.issue_portable(|_| {})
+        } else {
+            let request = talos.create_offline_request(None).unwrap();
+            f.server.issue_offline(&request, 86400, None)
+        };
+        let calls = f.server.with(|s| s.calls.len());
+        assert!(talos.load_offline_license(&file).unwrap().is_valid());
+        assert!(talos.current_lease().is_none());
+        f.offline(true);
+        assert!(talos.validate().unwrap().is_valid());
+        assert!(f.client().validate().unwrap().is_valid());
+        assert_eq!(f.server.with(|s| s.calls.len()), calls);
+        if portable {
+            assert_eq!(f.client().machine_id(), None);
+        }
+    }
+}
+
+#[test]
+fn invalid_portable_import_preserves_existing_online_activation() {
+    let f = Fixture::new();
+    let talos = f.client();
+    assert!(talos.activate("KEY-1").unwrap().is_valid());
+    let before = std::fs::read(&f.state_path).unwrap();
+    let file = f.server.issue_portable(|c| c["perpetual"] = json!(false));
+    assert!(!talos.load_offline_license(&file).unwrap().is_valid());
+    assert_eq!(std::fs::read(&f.state_path).unwrap(), before);
+    assert!(f.client().validate().unwrap().is_valid());
+    assert_eq!(f.server.calls("/v1/client/validate"), 1);
+}
+
+#[test]
+fn in_flight_online_responses_cannot_replace_an_imported_offline_file() {
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::time::Duration;
+
+    struct PausedResponse {
+        server: Arc<Server>,
+        path: &'static str,
+        gate: Mutex<Option<(SyncSender<()>, Receiver<()>)>>,
+        fail: bool,
+    }
+    impl Transport for PausedResponse {
+        fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            let pause = request.url.ends_with(self.path);
+            let response = self.server.send(request);
+            if pause {
+                if let Some((entered, release)) = self.gate.lock().unwrap().take() {
+                    entered.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(5)).unwrap();
+                    if self.fail {
+                        return Err("delayed connection failure".into());
+                    }
+                }
+            }
+            response
+        }
+    }
+
+    for path in [
+        "/v1/client/activate",
+        "/v1/client/validate",
+        "/v1/client/heartbeat",
+        "/v1/client/deactivate",
+        "/v1/client/keyset",
+    ] {
+        for fail in [false, true] {
+            let f = Fixture::new();
+            f.client().activate("KEY-1").unwrap();
+            if path == "/v1/client/keyset" {
+                f.advance(3600);
+                let replacement = f.server.keyset_at(T0 + 7200, &key(9));
+                f.server.with(|s| s.keyset_replay = Some(replacement));
+            }
+            let (entered_tx, entered_rx) = sync_channel(1);
+            let (release_tx, release_rx) = sync_channel(1);
+            let mut options = f.options();
+            options.transport = Some(Arc::new(PausedResponse {
+                server: Arc::clone(&f.server),
+                path,
+                gate: Mutex::new(Some((entered_tx, release_rx))),
+                fail,
+            }));
+            let talos = f.client_with(options);
+            f.server.with(|s| s.decision = "revoked".into());
+            let request_client = talos.clone();
+            let pending = std::thread::spawn(move || match path {
+                "/v1/client/activate" => request_client.activate("KEY-2").map(Some),
+                "/v1/client/validate" => request_client.validate().map(Some),
+                "/v1/client/keyset" => request_client.validate().map(Some),
+                "/v1/client/heartbeat" => request_client.heartbeat().map(Some),
+                _ => request_client.deactivate().map(|_| None),
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let file = f.server.issue_portable(|_| {});
+            let state = talos.load_offline_license(&file).unwrap();
+            assert!(state.is_valid() && state.is_offline);
+            let before = std::fs::read(&f.state_path).unwrap();
+            release_tx.send(()).unwrap();
+            if let Some(state) = pending.join().unwrap().unwrap() {
+                assert!(state.is_valid() && state.is_offline, "{path}: fail={fail}");
+            }
+            assert!(talos.current().unwrap().is_valid());
+            assert!(talos.current().unwrap().is_offline);
+            assert_eq!(std::fs::read(&f.state_path).unwrap(), before, "{path}");
+            f.offline(true);
+            assert!(f.client().validate().unwrap().is_valid());
+        }
+    }
+}
+
+#[test]
+fn rejected_offline_import_does_not_replace_trusted_keys() {
+    for problem in ["signature", "contract", "older_keyset"] {
+        let f = Fixture::new();
+        let talos = f.client();
+        talos.activate("KEY-1").unwrap();
+        f.advance(3600);
+        let mut file: Value = serde_json::from_slice(&f.server.issue_portable(|_| {})).unwrap();
+        // A real anchor-signed keyset from a different key rotation accompanies
+        // an invalid file. It must not poison the held activation's trust.
+        let issued = if problem == "older_keyset" {
+            T0 - 3600
+        } else {
+            T0 + 3600
+        };
+        file["keyset"] = json!(f.server.keyset_at(issued, &key(9)));
+        if problem != "signature" {
+            let parts: Vec<_> = file["token"].as_str().unwrap().split('.').collect();
+            let mut claims: Value =
+                serde_json::from_slice(&B64URL.decode(parts[3]).unwrap()).unwrap();
+            if problem == "contract" {
+                claims["perpetual"] = json!(false);
+            }
+            file["token"] = json!(mint(&key(9), "offline", &claims));
+        }
+        let before = std::fs::read(&f.state_path).unwrap();
+        let result = talos.load_offline_license(&serde_json::to_vec(&file).unwrap());
+        if problem == "contract" {
+            assert!(!result.unwrap().is_valid());
+        } else {
+            assert!(matches!(result, Err(Error::Signature(_))));
+        }
+        assert_eq!(std::fs::read(&f.state_path).unwrap(), before, "{problem}");
+        let state = talos.validate().unwrap();
+        assert!(state.is_valid() && !state.is_offline, "{problem}");
+    }
+}
+
+#[test]
+fn malformed_portable_contracts_fail_closed() {
+    for problem in [
+        "missing_binding",
+        "unknown_binding",
+        "null_binding",
+        "false_perpetual",
+        "string_perpetual",
+        "missing_decision",
+        "revoked_decision",
+        "missing_exp",
+        "finite_exp",
+        "missing_lic_exp",
+        "finite_lic_exp",
+        "null_fph",
+        "null_mpk",
+        "null_mid",
+        "missing_fid",
+        "empty_fid",
+        "missing_sub",
+        "empty_sub",
+    ] {
+        let f = Fixture::new();
+        let file = f.server.issue_portable(|c| match problem {
+            "missing_binding" => {
+                c.as_object_mut().unwrap().remove("binding");
+            }
+            "unknown_binding" => c["binding"] = json!("anything"),
+            "null_binding" => c["binding"] = Value::Null,
+            "false_perpetual" => c["perpetual"] = json!(false),
+            "string_perpetual" => c["perpetual"] = json!("true"),
+            "missing_decision" => {
+                c.as_object_mut().unwrap().remove("decision");
+            }
+            "revoked_decision" => c["decision"] = json!("revoked"),
+            "missing_exp" => {
+                c.as_object_mut().unwrap().remove("exp");
+            }
+            "finite_exp" => c["exp"] = json!(T0 + 86400),
+            "missing_lic_exp" => {
+                c["lic"].as_object_mut().unwrap().remove("lic_exp");
+            }
+            "finite_lic_exp" => c["lic"]["lic_exp"] = json!(T0 + 86400),
+            "null_fph" => c["fph"] = Value::Null,
+            "null_mpk" => c["mpk"] = Value::Null,
+            "null_mid" => c["mid"] = Value::Null,
+            "missing_fid" => {
+                c.as_object_mut().unwrap().remove("fid");
+            }
+            "empty_fid" => c["fid"] = json!(" "),
+            "missing_sub" => {
+                c.as_object_mut().unwrap().remove("sub");
+            }
+            "empty_sub" => c["sub"] = json!(""),
+            _ => unreachable!(),
+        });
+        assert!(
+            !f.client().load_offline_license(&file).unwrap().is_valid(),
+            "{problem}"
+        );
+    }
+}
+
+#[test]
+fn portable_import_verifies_signature_and_product_before_binding() {
+    let f = Fixture::new();
+    let wrong_product = f
+        .server
+        .issue_portable(|c| c["aud"] = json!("another-product"));
+    assert!(matches!(
+        f.client().load_offline_license(&wrong_product),
+        Err(Error::Signature(_))
+    ));
+
+    let mut file: Value = serde_json::from_slice(&f.server.issue_portable(|_| {})).unwrap();
+    let parts: Vec<_> = file["token"]
+        .as_str()
+        .unwrap()
+        .split('.')
+        .map(str::to_string)
+        .collect();
+    let mut claims: Value = serde_json::from_slice(&B64URL.decode(&parts[3]).unwrap()).unwrap();
+    claims["binding"] = json!("machine");
+    file["token"] = json!(format!(
+        "{}.{}.{}.{}.{}",
+        parts[0],
+        parts[1],
+        parts[2],
+        B64URL.encode(serde_json::to_vec(&claims).unwrap()),
+        parts[4]
+    ));
+    assert!(matches!(
+        f.client()
+            .load_offline_license(&serde_json::to_vec(&file).unwrap()),
+        Err(Error::Signature(_))
+    ));
+}
+
+#[test]
+fn machine_offline_files_accept_only_known_bindings() {
+    for (binding, valid) in [
+        (json!("machine"), true),
+        (json!("unknown"), false),
+        (Value::Null, false),
+    ] {
+        let f = Fixture::new();
+        let talos = f.client();
+        let request = talos.create_offline_request(None).unwrap();
+        let file = f
+            .server
+            .issue_offline_with(&request, 86400, None, |c| c["binding"] = binding);
+        assert_eq!(talos.load_offline_license(&file).unwrap().is_valid(), valid);
+    }
+}
+
+#[test]
 fn another_machines_licence_file_is_a_verdict_not_an_error() {
     let f = Fixture::new();
     let talos = f.client();
@@ -1110,6 +1435,29 @@ fn a_replayed_older_keyset_does_not_bring_a_revoked_key_back() {
     let restarted = f.client();
     let cached = restarted.validate().unwrap();
     assert!(cached.is_valid() && cached.is_offline);
+}
+
+#[test]
+fn a_conflicting_keyset_cannot_rollback_trust_within_clock_skew_or_the_same_second() {
+    for older_by in [0, 1] {
+        let f = Fixture::new();
+        let talos = f.client();
+        talos.activate("KEY-1").unwrap();
+        let conflicting = f.server.keyset_at(T0 - older_by, &key(9));
+        let mut file: Value = serde_json::from_slice(&f.server.issue_portable(|_| {})).unwrap();
+        let parts: Vec<_> = file["token"].as_str().unwrap().split('.').collect();
+        let claims: Value = serde_json::from_slice(&B64URL.decode(parts[3]).unwrap()).unwrap();
+        file["token"] = json!(mint(&key(9), "offline", &claims));
+        file["keyset"] = json!(conflicting);
+        assert!(
+            matches!(
+                talos.load_offline_license(&serde_json::to_vec(&file).unwrap()),
+                Err(Error::Signature(_))
+            ),
+            "older_by={older_by}"
+        );
+        assert!(talos.validate().unwrap().is_valid());
+    }
 }
 
 #[test]

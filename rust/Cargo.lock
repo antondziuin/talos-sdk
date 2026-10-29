@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "talos-sdk"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",

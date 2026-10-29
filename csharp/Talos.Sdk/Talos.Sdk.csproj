@@ -10,7 +10,7 @@
          runtime-guarded to Windows. -->
     <NoWarn>$(NoWarn);1591;CA1416</NoWarn>
     <PackageId>Talos.Sdk</PackageId>
-    <Version>0.2.1</Version>
+    <Version>0.3.0</Version>
     <Description>Talos SDK for .NET applications: license activation and validation, offline licensing, feature entitlements, floating seats, and signed software updates.</Description>
     <Authors>Talos</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

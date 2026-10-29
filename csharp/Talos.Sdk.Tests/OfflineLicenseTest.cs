@@ -96,6 +96,34 @@ namespace Talos.Sdk.Tests
             return JsonSerializer.Serialize(claims);
         }
 
+        private static string PortableJson(Action<Dictionary<string, object?>>? tweak = null) =>
+            OfflineJson("", c =>
+            {
+                c.Remove("fph");
+                c.Remove("mpk");
+                c.Remove("mid");
+                c["binding"] = "portable";
+                c["perpetual"] = true;
+                c["exp"] = null;
+                tweak?.Invoke(c);
+            });
+
+        private static StateStore SeedOnline(string path)
+        {
+            var fp = Fingerprint.Collect(Product, null);
+            var store = new StateStore(path, Product, StateStore.KeyMaterial(fp.Components));
+            Assert.True(store.Save(new StoredBinding
+            {
+                LicenseKeyHash = StateStore.HashLicenseKey("old-online-key"),
+                ActivationSecret = "old-online-secret",
+                MachineId = "old-online-machine",
+                Fingerprint = fp.Composite,
+                Validation = "old-online-cache",
+                ReleaseSeqHighWater = 7,
+            }));
+            return store;
+        }
+
         private static string TempFile(string name) => Path.Combine(
             Directory.CreateDirectory(
                 Path.Combine(Path.GetTempPath(), "talos-air-" + Guid.NewGuid().ToString("N"))).FullName,
@@ -127,8 +155,24 @@ namespace Talos.Sdk.Tests
             }
         }
 
+        private sealed class PendingResponse : HttpMessageHandler
+        {
+            public readonly TaskCompletionSource<bool> Started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public readonly TaskCompletionSource<HttpResponseMessage> Reply = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public string? Nonce;
+            protected override async Task<HttpResponseMessage> SendAsync(
+                HttpRequestMessage request, System.Threading.CancellationToken ct)
+            {
+                using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync());
+                Nonce = body.RootElement.TryGetProperty("nonce", out var nonce) ? nonce.GetString() : null;
+                Started.SetResult(true);
+                return await Reply.Task;
+            }
+        }
+
         private static TalosClient Client(
-            string statePath, string? publicKey = null, string? anchor = null, Dead? network = null) =>
+            string statePath, string? publicKey = null, string? anchor = null, Dead? network = null,
+            string? machineGuid = null, HttpMessageHandler? handler = null) =>
             new TalosClient(new TalosOptions
             {
                 ProductToken = Product,
@@ -136,7 +180,9 @@ namespace Talos.Sdk.Tests
                 AnchorPublicKey = anchor,
                 ServerUrl = "http://127.0.0.1:1",
                 StatePath = statePath,
-                HttpClient = new HttpClient(network ?? new Dead()),
+                HttpClient = new HttpClient(handler ?? network ?? new Dead()),
+                ExtraFingerprintComponents = machineGuid == null ? null
+                    : new Dictionary<string, string> { ["machine_guid"] = machineGuid },
             });
 
         private static JsonElement PayloadOf(OfflineDocument doc)
@@ -287,6 +333,281 @@ namespace Talos.Sdk.Tests
             Assert.True(verdict.IsFeatureEnabled("pro"));
             Assert.Null(verdict.GraceUntil);
             Assert.Equal(0, network.Calls);
+        }
+
+        [Fact]
+        public async Task TheSamePortableFileWorksOnDifferentMachinesWithoutRequestsOrNetwork()
+        {
+            var (pub, key) = Keypair();
+            var (anchor, anchorKey) = Keypair();
+            string keyset = Mint(anchorKey, "keyset", JsonSerializer.Serialize(new
+            {
+                aud = Product,
+                iat = Now() - 60,
+                keys = new[] { new { kid = "k1", purpose = "license", pk = pub, status = "active" } },
+            }));
+            string file = LicenseFile(Mint(key, "offline", PortableJson()), keyset);
+            var network = new Dead();
+            foreach (string machine in new[] { "portable-pc-a", "portable-pc-b" })
+            {
+                string path = TempFile("state.bin");
+                TalosClient talos = Client(path, anchor: anchor, network: network, machineGuid: machine);
+                Assert.False(talos.IsActivated);
+                LicenseState state = await talos.LoadOfflineLicenseAsync(file);
+                Assert.True(state.IsValid && state.IsOffline);
+                Assert.Null(state.GraceUntil);
+                Assert.Null(talos.MachineId);
+                Assert.Contains("portable", Assert.Throws<TalosException>(
+                    () => talos.CreateOfflineDeactivation()).Message);
+                Assert.True(talos.IsActivated);
+                TalosClient restarted = Client(path, anchor: anchor, network: network, machineGuid: machine);
+                Assert.True((await restarted.ValidateAsync()).IsValid);
+                Assert.True(restarted.IsFeatureEnabled("pro"));
+            }
+            Assert.Equal(0, network.Calls);
+        }
+
+        [Theory]
+        [InlineData("portable")]
+        [InlineData("machine")]
+        public async Task AValidOfflineImportReplacesAnOnlineActivation(string binding)
+        {
+            var (pub, key) = Keypair();
+            string path = TempFile("state.bin");
+            StateStore store = SeedOnline(path);
+            var network = new Dead();
+            TalosClient talos = Client(path, publicKey: pub, network: network);
+            string claims = binding == "portable" ? PortableJson() : OfflineJson(
+                PayloadOf(talos.CreateOfflineRequest()).GetProperty("machine_pubkey").GetString()!,
+                c => c["binding"] = "machine");
+            Assert.True((await talos.LoadOfflineLicenseAsync(LicenseFile(Mint(key, "offline", claims)))).IsValid);
+            Assert.True((await talos.ValidateAsync()).IsValid);
+            Assert.True((await Client(path, publicKey: pub, network: network).ValidateAsync()).IsValid);
+            StoredBinding saved = store.Load()!;
+            Assert.Equal("", saved.ActivationSecret);
+            Assert.Equal("", saved.LicenseKeyHash);
+            Assert.Null(saved.Validation);
+            Assert.Equal(7, saved.ReleaseSeqHighWater);
+            Assert.Equal(0, network.Calls);
+        }
+
+        [Theory]
+        [InlineData("missing_binding")]
+        [InlineData("unknown_binding")]
+        [InlineData("null_binding")]
+        [InlineData("missing_flag")]
+        [InlineData("false_flag")]
+        [InlineData("malformed_flag")]
+        [InlineData("missing_exp")]
+        [InlineData("malformed_exp")]
+        [InlineData("bounded_exp")]
+        [InlineData("business_expiry")]
+        [InlineData("missing_business_expiry")]
+        [InlineData("null_fph")]
+        [InlineData("null_mpk")]
+        [InlineData("null_mid")]
+        [InlineData("missing_fid")]
+        [InlineData("empty_fid")]
+        [InlineData("missing_sub")]
+        [InlineData("empty_sub")]
+        [InlineData("missing_decision")]
+        [InlineData("revoked_decision")]
+        public async Task InvalidPortableFilesDoNotEraseAnOnlineActivation(string problem)
+        {
+            var (pub, key) = Keypair();
+            string path = TempFile("state.bin");
+            StateStore store = SeedOnline(path);
+            TalosClient talos = Client(path, publicKey: pub);
+            string claims = PortableJson(c =>
+            {
+                switch (problem)
+                {
+                    case "missing_binding": c.Remove("binding"); break;
+                    case "unknown_binding": c["binding"] = "unknown"; break;
+                    case "null_binding": c["binding"] = null; break;
+                    case "missing_flag": c.Remove("perpetual"); break;
+                    case "false_flag": c["perpetual"] = false; break;
+                    case "malformed_flag": c["perpetual"] = "true"; break;
+                    case "missing_exp": c.Remove("exp"); break;
+                    case "malformed_exp": c["exp"] = "never"; break;
+                    case "bounded_exp": c["exp"] = Now() + 86_400; break;
+                    case "business_expiry":
+                        c["lic"] = new Dictionary<string, object?> { ["lic_exp"] = Now() + 86_400 };
+                        break;
+                    case "missing_business_expiry": c["lic"] = new Dictionary<string, object?>(); break;
+                    case "null_fph": c["fph"] = null; break;
+                    case "null_mpk": c["mpk"] = null; break;
+                    case "null_mid": c["mid"] = null; break;
+                    case "missing_fid": c.Remove("fid"); break;
+                    case "empty_fid": c["fid"] = " "; break;
+                    case "missing_sub": c.Remove("sub"); break;
+                    case "empty_sub": c["sub"] = ""; break;
+                    case "missing_decision": c.Remove("decision"); break;
+                    case "revoked_decision": c["decision"] = "revoked"; break;
+                }
+            });
+            Assert.False((await talos.LoadOfflineLicenseAsync(LicenseFile(Mint(key, "offline", claims)))).IsValid);
+            Assert.Equal("old-online-secret", store.Load()!.ActivationSecret);
+            Assert.Equal("old-online-cache", store.Load()!.Validation);
+            Assert.Equal("old-online-machine", Client(path, publicKey: pub).MachineId);
+        }
+
+        [Fact]
+        public async Task PortableBindingStillRequiresTheOriginalSignatureAndProduct()
+        {
+            var (pub, key) = Keypair();
+            TalosClient talos = Client(TempFile("state.bin"), publicKey: pub);
+            string[] parts = Mint(key, "offline", OfflineJson("machine-key")).Split('.');
+            parts[3] = B64Url(Encoding.UTF8.GetBytes(PortableJson()));
+            await Assert.ThrowsAsync<TalosSignatureException>(
+                () => talos.LoadOfflineLicenseAsync(LicenseFile(string.Join(".", parts))));
+            await Assert.ThrowsAsync<TalosSignatureException>(() => talos.LoadOfflineLicenseAsync(
+                LicenseFile(Mint(key, "offline", PortableJson(c => c["aud"] = "another-product")))));
+            Assert.False(talos.IsActivated);
+        }
+
+        [Theory]
+        [InlineData("activate")]
+        [InlineData("validate")]
+        [InlineData("heartbeat")]
+        public async Task OlderOnlineRepliesCannotReplaceANewPortableImport(string operation)
+        {
+            foreach (int status in new[] { 200, 403 })
+            {
+                var (pub, key) = Keypair();
+                string path = TempFile("state.bin");
+                StateStore store = SeedOnline(path);
+                var network = new PendingResponse();
+                TalosClient talos = Client(path, publicKey: pub, handler: network);
+                Task<LicenseState> pending = operation == "activate" ? talos.ActivateAsync("different-key")
+                    : operation == "validate" ? talos.ValidateAsync() : talos.HeartbeatAsync();
+                await network.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                Assert.True((await talos.LoadOfflineLicenseAsync(LicenseFile(Mint(key, "offline", PortableJson())))).IsValid);
+                string typ = operation == "activate" ? "activation" : operation == "validate" ? "validation" : "heartbeat";
+                var body = status == 403
+                    ? new Dictionary<string, object?> { ["error"] = "license_revoked" }
+                    : new Dictionary<string, object?>
+                    {
+                        [typ + "_token"] = Mint(key, typ, JsonSerializer.Serialize(new
+                        {
+                            aud = Product,
+                            non = network.Nonce,
+                            iat = Now(),
+                            nbf = Now() - 5,
+                            exp = Now() + 600,
+                            decision = "revoked",
+                            server_time = Now(),
+                            lic = new { features = new { }, lic_exp = (long?)null },
+                        })),
+                        ["activation_secret"] = "stale-online-secret",
+                        ["machine_id"] = "stale-machine",
+                    };
+                network.Reply.SetResult(new HttpResponseMessage((System.Net.HttpStatusCode)status)
+                {
+                    Content = new StringContent(JsonSerializer.Serialize(body)),
+                });
+                LicenseState state = await pending;
+                Assert.True(state.IsValid && state.IsOffline);
+                Assert.True(talos.Current!.IsValid && talos.Current.IsOffline);
+                Assert.Equal("", store.Load()!.ActivationSecret);
+                Assert.True((await Client(path, publicKey: pub).ValidateAsync()).IsValid);
+            }
+        }
+
+        private static string Keyset(Ed25519PrivateKeyParameters anchor, string signer, long iat) =>
+            Mint(anchor, "keyset", JsonSerializer.Serialize(new
+            {
+                aud = Product,
+                iat,
+                keys = new[] { new { purpose = "license", pk = signer } },
+            }));
+
+        [Fact]
+        public async Task OlderEmbeddedKeysetsCannotRestoreARevokedSigner()
+        {
+            var (anchor, anchorKey) = Keypair();
+            var (old, oldKey) = Keypair();
+            var (current, currentKey) = Keypair();
+            string path = TempFile("state.bin");
+            StateStore store = SeedOnline(path);
+            StoredBinding saved = store.Load()!;
+            long issuedAt = Now();
+            string currentKeyset = saved.Keyset = Keyset(anchorKey, current, issuedAt);
+            Assert.True(store.Save(saved));
+            TalosClient talos = Client(path, anchor: anchor);
+            foreach (long replayedAt in new[] { issuedAt - 1, issuedAt })
+            {
+                await Assert.ThrowsAsync<TalosSignatureException>(() => talos.LoadOfflineLicenseAsync(
+                    LicenseFile(Mint(oldKey, "offline", PortableJson()), Keyset(anchorKey, old, replayedAt))));
+            }
+            Assert.Equal(currentKeyset, store.Load()!.Keyset);
+            Assert.True((await talos.LoadOfflineLicenseAsync(LicenseFile(Mint(currentKey, "offline", PortableJson())))).IsValid);
+            Assert.Equal(currentKeyset, store.Load()!.Keyset);
+        }
+
+        [Fact]
+        public async Task ARejectedOfflineFileDoesNotReplaceTheCurrentTrustedKeyset()
+        {
+            var (anchor, anchorKey) = Keypair();
+            var (current, currentKey) = Keypair();
+            var (candidate, candidateKey) = Keypair();
+            string path = TempFile("state.bin");
+            StateStore store = SeedOnline(path);
+            StoredBinding saved = store.Load()!;
+            string currentKeyset = saved.Keyset = Keyset(anchorKey, current, Now() - 60);
+            Assert.True(store.Save(saved));
+            TalosClient talos = Client(path, anchor: anchor);
+            Assert.False((await talos.LoadOfflineLicenseAsync(LicenseFile(
+                Mint(candidateKey, "offline", PortableJson(c => c["decision"] = "revoked")),
+                Keyset(anchorKey, candidate, Now())))).IsValid);
+            Assert.Equal("old-online-secret", store.Load()!.ActivationSecret);
+            Assert.True((await talos.LoadOfflineLicenseAsync(LicenseFile(Mint(currentKey, "offline", PortableJson())))).IsValid);
+            Assert.Equal(currentKeyset, store.Load()!.Keyset);
+        }
+
+        [Fact]
+        public async Task OfflineStateEventsRunAfterTheLicensingLockIsReleased()
+        {
+            var (pub, key) = Keypair();
+            TalosClient talos = Client(TempFile("state.bin"), publicKey: pub);
+            bool completed = false;
+            talos.GracePeriodStarted += (_, _) =>
+            {
+                var validation = Task.Run(() => talos.ValidateAsync());
+                completed = validation.Wait(TimeSpan.FromSeconds(2)) && validation.Result.IsValid;
+            };
+            Assert.True((await talos.LoadOfflineLicenseAsync(LicenseFile(Mint(key, "offline", PortableJson())))).IsValid);
+            Assert.True(completed, "a state event may synchronously invoke SDK work on another thread");
+        }
+
+        [Fact]
+        public async Task AnOlderInFlightRefreshCannotReplaceTheNewOfflineTrust()
+        {
+            var (anchor, anchorKey) = Keypair();
+            var (online, _) = Keypair();
+            var (portable, portableKey) = Keypair();
+            var (later, _) = Keypair();
+            long issuedAt = Now();
+            string path = TempFile("state.bin");
+            StateStore store = SeedOnline(path);
+            StoredBinding saved = store.Load()!;
+            saved.Keyset = Keyset(anchorKey, online, issuedAt - 60);
+            Assert.True(store.Save(saved));
+            var network = new PendingResponse();
+            TalosClient talos = Client(path, anchor: anchor, handler: network);
+            Task pending = talos.RefreshKeysetAsync();
+            await network.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            string portableKeyset = Keyset(anchorKey, portable, issuedAt);
+            Assert.True((await talos.LoadOfflineLicenseAsync(LicenseFile(
+                Mint(portableKey, "offline", PortableJson()), portableKeyset))).IsValid);
+            network.Reply.SetResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(JsonSerializer.Serialize(new { keyset = Keyset(anchorKey, later, issuedAt + 60) })),
+            });
+            await pending;
+            Assert.True((await talos.ValidateAsync()).IsValid);
+            Assert.Equal(portableKeyset, store.Load()!.Keyset);
+            Assert.True((await Client(path, anchor: anchor).ValidateAsync()).IsValid);
         }
 
         [Theory]

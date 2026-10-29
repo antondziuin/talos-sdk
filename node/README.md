@@ -240,6 +240,19 @@ so an anchor-only pin still works with no server to fetch one from. The verdict
 is kept, so later starts need nothing — `validate()` re-checks the stored file
 instead of reaching for the network, and `isActivated` is true.
 
+A **portable** permanent file is issued directly by the vendor. Import it with
+`loadOfflineLicense("license.talos")` on each computer; no request or machine
+key is needed. Its signed `binding: "portable"` explicitly permits use on
+different computers. Each computer keeps its own local state; carry the licence
+file rather than copying machine-encrypted state. Portable files can be copied
+and remain usable indefinitely. `createOfflineDeactivation()` refuses them
+because they have no bound seat to return.
+
+A valid offline import replaces any existing online activation locally, so
+later `validate()` calls and restarts use the file without contacting Talos.
+Rejected imports preserve the previous stored activation. Keep state
+persistence enabled for automatic restore.
+
 For trusted users, a perpetual policy can opt into permanent offline files with
 `offline_checkout_max_days: 0`. The issued file has a signed `perpetual: true`
 and explicit null file and licence expiries. It needs no renewal or server
@@ -261,9 +274,9 @@ receipt changes nothing.
 Two things to know before you offer this to customers. A file **cannot be
 recalled** — revoking it in the portal frees the seat so you can issue to a
 replacement machine, but the machine holding it keeps working until the file's
-own expiry, or indefinitely for a permanent file. And hardware changes are
-not forgiven offline: the drift matcher lives on the server, so a replaced disk
-means `machine_mismatch` and a new request.
+own expiry, or indefinitely for a permanent file. Hardware changes to a
+machine-bound install are not forgiven offline: the drift matcher lives on the
+server, so a replaced disk means `machine_mismatch` and a new request.
 
 ## Heartbeats, monitoring, and cadence
 

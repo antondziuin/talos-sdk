@@ -204,6 +204,35 @@ namespace Talos.Sdk
         /// </para>
         /// </summary>
         private long _keysetIssuedAt;
+        private string? _keysetToken;
+        private readonly object _licensingSync = new object();
+        private long _licensingGeneration;
+        private int _licensingScopeDepth;
+        private List<Action> _licensingEvents = new List<Action>();
+
+        // Publish synchronous state events only after the outer transaction
+        // releases the lock: a UI handler may call back from another thread.
+        private sealed class LicensingScope : IDisposable
+        {
+            private readonly TalosClient _owner;
+            public LicensingScope(TalosClient owner)
+            {
+                _owner = owner;
+                System.Threading.Monitor.Enter(owner._licensingSync);
+                owner._licensingScopeDepth++;
+            }
+            public void Dispose()
+            {
+                List<Action>? events = null;
+                if (--_owner._licensingScopeDepth == 0)
+                {
+                    events = _owner._licensingEvents;
+                    _owner._licensingEvents = new List<Action>();
+                }
+                System.Threading.Monitor.Exit(_owner._licensingSync);
+                if (events != null) foreach (Action publish in events) publish();
+            }
+        }
 
         /// <summary>
         /// How long an adopted keyset is trusted before a refresh is attempted:
@@ -389,14 +418,19 @@ namespace Talos.Sdk
         public async Task RefreshKeysetAsync(CancellationToken ct = default)
         {
             if (_anchorKey == null) return;
+            long generation = System.Threading.Interlocked.Read(ref _licensingGeneration);
             var body = new KeysetReq { ProductToken = _options.ProductToken };
             using var doc = await PostAsync("/v1/client/keyset", body, WireJson.Default.KeysetReq, ct)
                 .ConfigureAwait(false);
-            if (doc.RootElement.TryGetProperty("keyset", out var ks) && ks.ValueKind == JsonValueKind.String)
+            using (new LicensingScope(this))
             {
-                AdoptKeyset(ks.GetString());
-                _keysetFromCache = false;
-                Persist(b => b.Keyset = ks.GetString());
+                if (generation != _licensingGeneration) return;
+                if (doc.RootElement.TryGetProperty("keyset", out var ks) && ks.ValueKind == JsonValueKind.String)
+                {
+                    AdoptKeyset(ks.GetString());
+                    _keysetFromCache = false;
+                    Persist(b => b.Keyset = _keysetToken);
+                }
             }
         }
 
@@ -460,11 +494,13 @@ namespace Talos.Sdk
             // From the signed claims, not from a local clock reading taken when
             // the fetch happened: a client whose clock is wrong would otherwise
             // decide its keyset is fresh forever, or refetch on every call.
-            _keysetIssuedAt = claims.TryGetProperty("iat", out var iat)
+            long issuedAt = claims.TryGetProperty("iat", out var iat)
                 && iat.ValueKind == JsonValueKind.Number
                 && iat.TryGetInt64(out long v)
                 ? v
                 : 0;
+            if (issuedAt < _keysetIssuedAt
+                || (issuedAt == _keysetIssuedAt && _keysetToken != null && token != _keysetToken)) return;
             var licenseKeys = new List<byte[]>();
             var releaseKeys = new List<byte[]>();
             if (claims.TryGetProperty("keys", out var keys) && keys.ValueKind == JsonValueKind.Array)
@@ -482,6 +518,8 @@ namespace Talos.Sdk
             }
             _keysetLicenseKeys = licenseKeys;
             _keysetReleaseKeys = releaseKeys;
+            _keysetIssuedAt = issuedAt;
+            _keysetToken = token;
         }
 
         private IReadOnlyList<byte[]> LicenseVerifyKeys()
@@ -617,28 +655,34 @@ namespace Talos.Sdk
         /// </remarks>
         private LicenseState Adopt(LicenseState state)
         {
-            EventKind kind = TransitionOf(Current, state);
-            Current = state;
-            EventHandler<LicenseState>? handler = kind switch
+            using (new LicensingScope(this))
             {
-                EventKind.Invalid => LicenseInvalid,
-                EventKind.GraceStarted => GracePeriodStarted,
-                EventKind.GraceExpired => GracePeriodExpired,
-                EventKind.ClockTamper => ClockTamperDetected,
-                _ => null,
-            };
-            if (handler != null)
-            {
-                try
+                EventKind kind = TransitionOf(Current, state);
+                Current = state;
+                EventHandler<LicenseState>? handler = kind switch
                 {
-                    handler(this, state);
-                }
-                catch
+                    EventKind.Invalid => LicenseInvalid,
+                    EventKind.GraceStarted => GracePeriodStarted,
+                    EventKind.GraceExpired => GracePeriodExpired,
+                    EventKind.ClockTamper => ClockTamperDetected,
+                    _ => null,
+                };
+                if (handler != null)
                 {
-                    // Deliberate: see the remarks on LicenseInvalid.
+                    _licensingEvents.Add(() =>
+                    {
+                        try
+                        {
+                            handler(this, state);
+                        }
+                        catch
+                        {
+                            // Deliberate: see the remarks on LicenseInvalid.
+                        }
+                    });
                 }
+                return state;
             }
-            return state;
         }
 
         /// <summary>Whether a feature is enabled per the last verified state.</summary>
@@ -665,84 +709,99 @@ namespace Talos.Sdk
         /// </summary>
         public async Task<LicenseState> ActivateAsync(string licenseKey, CancellationToken ct = default)
         {
-            if (IsActivated && _licenseKeyHash == StateStore.HashLicenseKey(licenseKey))
+            long generation = System.Threading.Interlocked.Read(ref _licensingGeneration);
+            try
             {
-                try
+                if (IsActivated && _licenseKeyHash == StateStore.HashLicenseKey(licenseKey))
                 {
-                    LicenseState state = await ValidateAsync(ct).ConfigureAwait(false);
-                    // `deactivated` means the developer released the seat; taking
-                    // it again is exactly what re-activating is for. Every other
-                    // verdict — including machine_revoked — is the server's
-                    // answer, and re-activating would only replace it with a less
-                    // specific error.
-                    if (state.Decision != "deactivated") return state;
+                    try
+                    {
+                        LicenseState state = await ValidateAsync(ct).ConfigureAwait(false);
+                        // `deactivated` means the developer released the seat; taking
+                        // it again is exactly what re-activating is for. Every other
+                        // verdict — including machine_revoked — is the server's
+                        // answer, and re-activating would only replace it with a less
+                        // specific error.
+                        if (state.Decision != "deactivated") return state;
+                    }
+                    catch (TalosApiException e) when (e.StatusCode == 401 || e.StatusCode == 404)
+                    {
+                        // 401: the secret was rotated elsewhere. 404: the machine (or
+                        // licence) is gone. Anything else is a real failure and must
+                        // not be papered over by silently spending a seat.
+                    }
+                    ForgetBinding();
                 }
-                catch (TalosApiException e) when (e.StatusCode == 401 || e.StatusCode == 404)
+
+                string nonce = NewNonce();
+                var body = new ActivateReq
                 {
-                    // 401: the secret was rotated elsewhere. 404: the machine (or
-                    // licence) is gone. Anything else is a real failure and must
-                    // not be papered over by silently spending a seat.
+                    ProductToken = _options.ProductToken,
+                    LicenseKey = licenseKey,
+                    Fingerprint = FingerprintBody(),
+                    Nonce = nonce,
+                    Hostname = ReportedHostname(),
+                    Os = RuntimeInformation.OSDescription,
+                    Arch = RuntimeInformation.OSArchitecture.ToString(),
+                    AppVersion = _options.AppVersion,
+                    SdkVersion = SdkVersion.Id,
+                };
+                using var doc = await PostAsync(
+                    "/v1/client/activate", body, WireJson.Default.ActivateReq, ct).ConfigureAwait(false);
+                using (new LicensingScope(this))
+                {
+                    LicenseState? switched = OfflineSince(generation);
+                    if (switched != null) return switched;
+                    JsonElement root = doc.RootElement;
+
+                    // Adopt the keyset delivered with activation, then verify against the
+                    // current license keys (so a rotated key still works).
+                    if (root.TryGetProperty("keyset", out var ks) && ks.ValueKind == JsonValueKind.String)
+                        AdoptKeyset(ks.GetString());
+                    string token = root.GetProperty("activation_token").GetString()!;
+                    JsonElement claims = TalosCompact.Verify(
+                        LicenseVerifyKeys(), "activation", _options.ProductToken, nonce, token);
+
+                    // The key is not kept. From here the activation secret identifies
+                    // both the machine and its licence.
+                    _licenseKeyHash = StateStore.HashLicenseKey(licenseKey);
+                    _activationSecret = root.GetProperty("activation_secret").GetString();
+                    _machineId = root.GetProperty("machine_id").GetString();
+                    _binding = new StoredBinding
+                    {
+                        LicenseKeyHash = _licenseKeyHash,
+                        ActivationSecret = _activationSecret ?? "",
+                        MachineId = _machineId ?? "",
+                        Fingerprint = _fingerprint,
+                        // A fresh activation invalidates any cached verdict for the
+                        // previous binding; keep only the keyset, which is per product,
+                        // not per machine.
+                        Keyset = _keysetToken ?? _binding?.Keyset,
+                        TimeHighWater = _binding?.TimeHighWater ?? 0,
+                        // The machine's own identity survives an online activation,
+                        // because it is an identity and not a verdict: an install that
+                        // reaches the network once must not have to repeat the whole
+                        // air-gapped ceremony with its vendor the next time it is
+                        // unplugged. The clock mark survives for the same reason a mark
+                        // exists at all — it only moves forward. The offline *file* does
+                        // not: a live activation supersedes it, and keeping it would
+                        // leave two answers to "what licenses this machine".
+                        MachineKey = _binding?.MachineKey,
+                        MachinePublicKey = _binding?.MachinePublicKey,
+                        OfflineSeen = _binding?.OfflineSeen ?? 0,
+                    };
+                    AdvanceClock(claims);
+                    _store?.Save(_binding);
+
+                    return Adopt(StateFromClaims(claims, "valid", false));
                 }
-                ForgetBinding();
             }
-
-            string nonce = NewNonce();
-            var body = new ActivateReq
+            catch (Exception e) when (!(e is OperationCanceledException))
             {
-                ProductToken = _options.ProductToken,
-                LicenseKey = licenseKey,
-                Fingerprint = FingerprintBody(),
-                Nonce = nonce,
-                Hostname = ReportedHostname(),
-                Os = RuntimeInformation.OSDescription,
-                Arch = RuntimeInformation.OSArchitecture.ToString(),
-                AppVersion = _options.AppVersion,
-                SdkVersion = SdkVersion.Id,
-            };
-            using var doc = await PostAsync(
-                "/v1/client/activate", body, WireJson.Default.ActivateReq, ct).ConfigureAwait(false);
-            JsonElement root = doc.RootElement;
-
-            // Adopt the keyset delivered with activation, then verify against the
-            // current license keys (so a rotated key still works).
-            if (root.TryGetProperty("keyset", out var ks) && ks.ValueKind == JsonValueKind.String)
-                AdoptKeyset(ks.GetString());
-            string token = root.GetProperty("activation_token").GetString()!;
-            JsonElement claims = TalosCompact.Verify(
-                LicenseVerifyKeys(), "activation", _options.ProductToken, nonce, token);
-
-            // The key is not kept. From here the activation secret identifies
-            // both the machine and its licence.
-            _licenseKeyHash = StateStore.HashLicenseKey(licenseKey);
-            _activationSecret = root.GetProperty("activation_secret").GetString();
-            _machineId = root.GetProperty("machine_id").GetString();
-            _binding = new StoredBinding
-            {
-                LicenseKeyHash = _licenseKeyHash,
-                ActivationSecret = _activationSecret ?? "",
-                MachineId = _machineId ?? "",
-                Fingerprint = _fingerprint,
-                // A fresh activation invalidates any cached verdict for the
-                // previous binding; keep only the keyset, which is per product,
-                // not per machine.
-                Keyset = ks.ValueKind == JsonValueKind.String ? ks.GetString() : _binding?.Keyset,
-                TimeHighWater = _binding?.TimeHighWater ?? 0,
-                // The machine's own identity survives an online activation,
-                // because it is an identity and not a verdict: an install that
-                // reaches the network once must not have to repeat the whole
-                // air-gapped ceremony with its vendor the next time it is
-                // unplugged. The clock mark survives for the same reason a mark
-                // exists at all — it only moves forward. The offline *file* does
-                // not: a live activation supersedes it, and keeping it would
-                // leave two answers to "what licenses this machine".
-                MachineKey = _binding?.MachineKey,
-                MachinePublicKey = _binding?.MachinePublicKey,
-                OfflineSeen = _binding?.OfflineSeen ?? 0,
-            };
-            AdvanceClock(claims);
-            _store?.Save(_binding);
-
-            return Adopt(StateFromClaims(claims, "valid", false));
+                LicenseState? switched = OfflineSince(generation);
+                if (switched != null) return switched;
+                throw;
+            }
         }
 
         /// <summary>
@@ -828,16 +887,15 @@ namespace Talos.Sdk
         }
 
         /// <summary>
-        /// Adopt an air-gapped licence file issued for this machine.
+        /// Adopt a machine-bound or portable offline licence file.
         /// </summary>
         /// <remarks>
         /// <para>
         /// Everything is verified locally, because there is nothing to ask: the
         /// anchor-signed keyset travels inside the file, the verdict is signed by
-        /// a key that keyset lists, and the file names both halves of this
-        /// machine's identity — its fingerprint and the public key it generated.
-        /// The verdict is then kept, so later starts are licensed with no further
-        /// ceremony.
+        /// a key that keyset lists. Machine-bound files name this machine's
+        /// fingerprint and public key; explicitly portable files need no machine
+        /// request. The verdict is kept, so later starts need no further ceremony.
         /// </para>
         /// <para>
         /// <b>Throws</b> only for a file that is not a licence: unreadable, not
@@ -879,6 +937,11 @@ namespace Talos.Sdk
         /// </summary>
         public LicenseState LoadOfflineLicense(byte[] fileContents)
         {
+            using (new LicensingScope(this)) return LoadOfflineLicenseCore(fileContents);
+        }
+
+        private LicenseState LoadOfflineLicenseCore(byte[] fileContents)
+        {
             if (fileContents == null) throw new ArgumentNullException(nameof(fileContents));
             string? token;
             string? keyset;
@@ -902,8 +965,28 @@ namespace Talos.Sdk
             // nowhere to fetch one from. It is adopted only if the pinned anchor
             // signs it, so a file carrying somebody else's keyset changes nothing
             // about which keys this client trusts.
-            if (!string.IsNullOrEmpty(keyset)) AdoptKeyset(keyset);
-            return AdoptOfflineToken(token!, keyset);
+            var previousLicense = _keysetLicenseKeys;
+            var previousRelease = _keysetReleaseKeys;
+            long previousIssuedAt = _keysetIssuedAt;
+            string? previousToken = _keysetToken;
+            bool accepted = false;
+            try
+            {
+                if (!string.IsNullOrEmpty(keyset)) AdoptKeyset(keyset);
+                LicenseState state = AdoptOfflineToken(token!, _keysetToken);
+                accepted = state.IsValid;
+                return state;
+            }
+            finally
+            {
+                if (!accepted)
+                {
+                    _keysetLicenseKeys = previousLicense;
+                    _keysetReleaseKeys = previousRelease;
+                    _keysetIssuedAt = previousIssuedAt;
+                    _keysetToken = previousToken;
+                }
+            }
         }
 
         /// <summary>
@@ -935,8 +1018,7 @@ namespace Talos.Sdk
         public OfflineDocument CreateOfflineDeactivation()
         {
             string? token = _binding?.OfflineToken;
-            string? key = _binding?.MachineKey;
-            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(key))
+            if (string.IsNullOrEmpty(token))
                 throw new TalosException("no offline licence to hand back");
 
             // Read what the file says about itself before dropping it: the
@@ -952,6 +1034,11 @@ namespace Talos.Sdk
             {
                 throw new TalosException("the stored offline licence no longer verifies", e);
             }
+            if (GetStr(claims, "binding") == "portable")
+                throw new TalosException("portable offline licences have no bound seat to return");
+            string? key = _binding?.MachineKey;
+            if (string.IsNullOrEmpty(key))
+                throw new TalosException("no offline licence to hand back");
             var payload = new OfflineReceiptPayload
             {
                 Fid = GetStr(claims, "fid") ?? "",
@@ -981,6 +1068,11 @@ namespace Talos.Sdk
         /// </summary>
         private LicenseState AdoptOfflineToken(string token, string? keyset)
         {
+            using (new LicensingScope(this)) return AdoptOfflineTokenCore(token, keyset);
+        }
+
+        private LicenseState AdoptOfflineTokenCore(string token, string? keyset)
+        {
             // VerifyCached rather than Verify: it checks the signature, `typ`,
             // `aud` and `nbf`, and leaves `exp` and the nonce to the caller. Both
             // omissions are right here. The nonce belonged to a request document
@@ -991,32 +1083,9 @@ namespace Talos.Sdk
             JsonElement claims = TalosCompact.VerifyCached(
                 LicenseVerifyKeys(), "offline", _options.ProductToken, token);
 
-            // Both halves, exactly. The fingerprint is what stops the whole state
-            // directory being copied to another computer, and the key is what
-            // stops the file alone being worth anything — neither is redundant,
-            // and accepting either on its own would open the case the other one
-            // closes.
-            string? mpk = GetStr(claims, "mpk");
-            if (string.IsNullOrEmpty(mpk)
-                || mpk != _binding?.MachinePublicKey
-                || GetStr(claims, "fph") != _fingerprint)
-            {
-                return Adopt(new LicenseState { Decision = "machine_mismatch", IsOffline = true });
-            }
-
-            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            // Both marks are lower bounds on "now" that this install has already
-            // observed: one signed by the server, one its own. A clock behind
-            // either has moved backwards.
-            long mark = Math.Max(_binding!.TimeHighWater, _binding.OfflineSeen);
-            if (mark > 0 && now + ClockSkewSeconds < mark)
-            {
-                return Adopt(new LicenseState { Decision = "clock_tampered", IsOffline = true });
-            }
-
             long? exp = Num(claims, "exp");
-            // Null deadlines require an explicit signed opt-in, including a
-            // licence with no business expiry. Missing/malformed fields fail closed.
+            // Null deadlines require an explicit signed opt-in and a licence
+            // with no business expiry. Missing/malformed fields fail closed.
             bool perpetual = claims.TryGetProperty("perpetual", out var forever)
                 && forever.ValueKind == JsonValueKind.True
                 && claims.TryGetProperty("exp", out var fileExpiry)
@@ -1025,24 +1094,48 @@ namespace Talos.Sdk
                 && licence.ValueKind == JsonValueKind.Object
                 && licence.TryGetProperty("lic_exp", out var licenceExpiry)
                 && licenceExpiry.ValueKind == JsonValueKind.Null;
+            string? binding = GetStr(claims, "binding");
+            bool portable = binding == "portable";
+            bool bindingPresent = claims.TryGetProperty("binding", out _);
+            if ((portable && (!perpetual
+                    || GetStr(claims, "decision") != "valid"
+                    || claims.TryGetProperty("fph", out _)
+                    || claims.TryGetProperty("mpk", out _)
+                    || claims.TryGetProperty("mid", out _)
+                    || string.IsNullOrWhiteSpace(GetStr(claims, "fid"))
+                    || string.IsNullOrWhiteSpace(GetStr(claims, "sub"))))
+                || (!portable && bindingPresent && binding != "machine"))
+            {
+                return Adopt(new LicenseState { Decision = "machine_mismatch", IsOffline = true });
+            }
+
+            // Machine-bound files require both halves. The fingerprint stops the state
+            // directory being copied to another computer, and the key is what
+            // stops the file alone being worth anything — neither is redundant,
+            // and accepting either on its own would open the case the other one
+            // closes.
+            string? mpk = GetStr(claims, "mpk");
+            if (!portable && (string.IsNullOrEmpty(mpk)
+                || mpk != _binding?.MachinePublicKey
+                || GetStr(claims, "fph") != _fingerprint))
+            {
+                return Adopt(new LicenseState { Decision = "machine_mismatch", IsOffline = true });
+            }
+
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            // Both marks are lower bounds on "now" that this install has already
+            // observed: one signed by the server, one its own. A clock behind
+            // either has moved backwards.
+            long mark = Math.Max(_binding?.TimeHighWater ?? 0, _binding?.OfflineSeen ?? 0);
+            if (mark > 0 && now + ClockSkewSeconds < mark)
+            {
+                return Adopt(new LicenseState { Decision = "clock_tampered", IsOffline = true });
+            }
+
             LicenseState state = StateFromClaims(claims, "valid", true);
             // No cadence to return to; the file's own horizon is the window.
             state.RevalidateAfter = null;
             state.GraceUntil = exp;
-
-            // Persist before deciding: the file is this machine's, so it is worth
-            // keeping even when today's answer is "expired" — the licence may be
-            // renewed and a new file issued, and in the meantime the app can say
-            // which file it is holding.
-            if (GetStr(claims, "mid") is { Length: > 0 } mid) _machineId = mid;
-            StoredBinding b = BindingBase();
-            b.MachineId = _machineId ?? b.MachineId;
-            b.OfflineToken = token;
-            b.OfflineSeen = Math.Max(b.OfflineSeen, now);
-            if (!string.IsNullOrEmpty(keyset)) b.Keyset = keyset;
-            _binding = b;
-            AdvanceClock(claims);
-            _store?.Save(b);
 
             // Bounded files end at their horizon; explicit perpetual files need
             // no renewal. Distinct from `expired`, which is the *licence* ending — the
@@ -1051,6 +1144,30 @@ namespace Talos.Sdk
             if (!perpetual && (exp == null || now > exp.Value)) state.Decision = "offline_file_expired";
             else if (state.LicenseExpiresAt != null && now > state.LicenseExpiresAt.Value)
                 state.Decision = "expired";
+            if (!state.IsValid) return Adopt(state);
+
+            // Only a valid import replaces an online activation. Keep machine
+            // keys and update trust/anti-downgrade marks for this installation.
+            System.Threading.Interlocked.Increment(ref _licensingGeneration);
+            _licenseKeyHash = null;
+            _activationSecret = null;
+            HeartbeatIntervalSeconds = null;
+            _leaseGeneration++;
+            StopRenew();
+            CurrentLease = null;
+            _machineId = portable ? null : GetStr(claims, "mid");
+            StoredBinding b = BindingBase();
+            b.LicenseKeyHash = "";
+            b.ActivationSecret = "";
+            b.Validation = null;
+            b.MachineId = _machineId ?? "";
+            b.Fingerprint = _fingerprint;
+            b.OfflineToken = token;
+            b.OfflineSeen = Math.Max(b.OfflineSeen, now);
+            if (!string.IsNullOrEmpty(keyset)) b.Keyset = keyset;
+            _binding = b;
+            AdvanceClock(claims);
+            _store?.Save(b);
             return Adopt(state);
         }
 
@@ -1177,6 +1294,7 @@ namespace Talos.Sdk
         /// <summary>Drop the machine binding, in memory and on disk.</summary>
         private void ForgetBinding()
         {
+            System.Threading.Interlocked.Increment(ref _licensingGeneration);
             _licenseKeyHash = null;
             _activationSecret = null;
             _machineId = null;
@@ -1238,9 +1356,12 @@ namespace Talos.Sdk
                 return AdoptOfflineToken(offlineToken, null);
             }
             RequireActivated();
+            long generation = System.Threading.Interlocked.Read(ref _licensingGeneration);
             try
             {
                 await EnsureKeysetAsync(ct).ConfigureAwait(false);
+                LicenseState? switchedBeforeRequest = OfflineSince(generation);
+                if (switchedBeforeRequest != null) return switchedBeforeRequest;
                 string nonce = NewNonce();
                 var body = new ValidateReq
                 {
@@ -1258,19 +1379,27 @@ namespace Talos.Sdk
                 using var doc = await PostAsync(
                     "/v1/client/validate", body, WireJson.Default.ValidateReq, ct)
                     .ConfigureAwait(false);
-                string token = doc.RootElement.GetProperty("validation_token").GetString()!;
-                JsonElement claims = TalosCompact.Verify(
-                    LicenseVerifyKeys(), "validation", _options.ProductToken, nonce, token);
+                using (new LicensingScope(this))
+                {
+                    LicenseState? switched = OfflineSince(generation);
+                    if (switched != null) return switched;
+                    string token = doc.RootElement.GetProperty("validation_token").GetString()!;
+                    JsonElement claims = TalosCompact.Verify(
+                        LicenseVerifyKeys(), "validation", _options.ProductToken, nonce, token);
 
-                string decision = claims.TryGetProperty("decision", out var d)
-                    ? d.GetString() ?? "invalid"
-                    : "invalid";
-                AdvanceClock(claims);
-                Persist(b => b.Validation = token);
-                return Adopt(StateFromClaims(claims, decision, false));
+                    string decision = claims.TryGetProperty("decision", out var d)
+                        ? d.GetString() ?? "invalid"
+                        : "invalid";
+                    AdvanceClock(claims);
+                    Persist(b => b.Validation = token);
+                    return Adopt(StateFromClaims(claims, decision, false));
+                }
             }
-            catch (Exception e) when (!(e is TalosApiException) && !(e is OperationCanceledException))
+            catch (Exception e) when (!(e is OperationCanceledException))
             {
+                LicenseState? switched = OfflineSince(generation);
+                if (switched != null) return switched;
+                if (e is TalosApiException) throw;
                 // An HTTP status is an *answer* — "revoked", "no such machine",
                 // "tenant suspended". Honouring a cached verdict over one would
                 // turn every negative answer into hours of grace, which is the
@@ -1356,54 +1485,75 @@ namespace Talos.Sdk
         public async Task<LicenseState> HeartbeatAsync(CancellationToken ct = default)
         {
             RequireActivated();
-            await EnsureKeysetAsync(ct).ConfigureAwait(false);
-            string nonce = NewNonce();
-            var body = new HeartbeatReq
+            long generation = System.Threading.Interlocked.Read(ref _licensingGeneration);
+            try
             {
-                ProductToken = _options.ProductToken,
-                Fingerprint = FingerprintBody(),
-                ActivationSecret = _activationSecret,
-                Nonce = nonce,
-                AppVersion = _options.AppVersion,
-                Os = RuntimeInformation.OSDescription,
-                Arch = RuntimeInformation.OSArchitecture.ToString(),
-                SdkVersion = SdkVersion.Id,
-                // Naming the channel is what asks the server for the update
-                // hint, and it costs two queries there — so it is asked for
-                // only when somebody is listening for the answer.
-                UpdateChannel = UpdateAvailable == null ? null : UpdateChannel(),
-            };
-            using var doc = await PostAsync(
-                "/v1/client/heartbeat", body, WireJson.Default.HeartbeatReq, ct)
-                .ConfigureAwait(false);
-            JsonElement claims = TalosCompact.Verify(
-                LicenseVerifyKeys(), "heartbeat", _options.ProductToken, nonce,
-                doc.RootElement.GetProperty("heartbeat_token").GetString()!);
+                await EnsureKeysetAsync(ct).ConfigureAwait(false);
+                LicenseState? switchedBeforeRequest = OfflineSince(generation);
+                if (switchedBeforeRequest != null) return switchedBeforeRequest;
+                string nonce = NewNonce();
+                var body = new HeartbeatReq
+                {
+                    ProductToken = _options.ProductToken,
+                    Fingerprint = FingerprintBody(),
+                    ActivationSecret = _activationSecret,
+                    Nonce = nonce,
+                    AppVersion = _options.AppVersion,
+                    Os = RuntimeInformation.OSDescription,
+                    Arch = RuntimeInformation.OSArchitecture.ToString(),
+                    SdkVersion = SdkVersion.Id,
+                    // Naming the channel is what asks the server for the update
+                    // hint, and it costs two queries there — so it is asked for
+                    // only when somebody is listening for the answer.
+                    UpdateChannel = UpdateAvailable == null ? null : UpdateChannel(),
+                };
+                using var doc = await PostAsync(
+                    "/v1/client/heartbeat", body, WireJson.Default.HeartbeatReq, ct)
+                    .ConfigureAwait(false);
+                LicenseState state;
+                JsonElement claims;
+                using (new LicensingScope(this))
+                {
+                    LicenseState? switched = OfflineSince(generation);
+                    if (switched != null) return switched;
+                    claims = TalosCompact.Verify(
+                        LicenseVerifyKeys(), "heartbeat", _options.ProductToken, nonce,
+                        doc.RootElement.GetProperty("heartbeat_token").GetString()!);
 
-            string decision = GetStr(claims, "decision") ?? "invalid";
-            // The cadence comes from the SIGNED claims, never the response
-            // envelope: the whole point of signing it is that nobody in the
-            // middle can tell a fleet to check in less often.
-            long? interval = Num(claims, "heartbeat_interval_s");
-            if (interval != null && interval.Value > 0)
-                HeartbeatIntervalSeconds = (int)interval.Value;
-            // Every signed server clock we see pushes the high-water mark
-            // forward, not just validation's — a heartbeat is the most frequent
-            // call there is.
-            AdvanceClock(claims);
-            Persist(_ => { });
-            // A heartbeat carries the decision but not the entitlement bag; keep
-            // the features from the last activate/validate.
-            LicenseState state = Adopt(new LicenseState
+                    string decision = GetStr(claims, "decision") ?? "invalid";
+                    // The cadence comes from the SIGNED claims, never the response
+                    // envelope: the whole point of signing it is that nobody in the
+                    // middle can tell a fleet to check in less often.
+                    long? interval = Num(claims, "heartbeat_interval_s");
+                    if (interval != null && interval.Value > 0)
+                        HeartbeatIntervalSeconds = (int)interval.Value;
+                    // Every signed server clock we see pushes the high-water mark
+                    // forward, not just validation's — a heartbeat is the most frequent
+                    // call there is.
+                    AdvanceClock(claims);
+                    Persist(_ => { });
+                    // A heartbeat carries the decision but not the entitlement bag; keep
+                    // the features from the last activate/validate.
+                    state = Adopt(new LicenseState
+                    {
+                        Decision = decision,
+                        Features = Current?.Features ?? default,
+                        LicenseExpiresAt = Current?.LicenseExpiresAt,
+                        RevalidateAfter = Current?.RevalidateAfter,
+                        GraceUntil = Current?.GraceUntil,
+                    });
+                }
+                await AnnounceUpdateAsync(claims, ct).ConfigureAwait(false);
+                LicenseState? switchedAfterUpdate = OfflineSince(generation);
+                if (switchedAfterUpdate != null) return switchedAfterUpdate;
+                return state;
+            }
+            catch (Exception e) when (!(e is OperationCanceledException))
             {
-                Decision = decision,
-                Features = Current?.Features ?? default,
-                LicenseExpiresAt = Current?.LicenseExpiresAt,
-                RevalidateAfter = Current?.RevalidateAfter,
-                GraceUntil = Current?.GraceUntil,
-            });
-            await AnnounceUpdateAsync(claims, ct).ConfigureAwait(false);
-            return state;
+                LicenseState? switched = OfflineSince(generation);
+                if (switched != null) return switched;
+                throw;
+            }
         }
 
         /// <summary>This machine's fingerprint, as every request carries it.</summary>
@@ -1463,6 +1613,7 @@ namespace Talos.Sdk
         public async Task DeactivateAsync(CancellationToken ct = default)
         {
             RequireActivated();
+            long generation = System.Threading.Interlocked.Read(ref _licensingGeneration);
             var body = new DeactivateReq
             {
                 ProductToken = _options.ProductToken,
@@ -1472,7 +1623,10 @@ namespace Talos.Sdk
             using var _ = await PostAsync(
                 "/v1/client/deactivate", body, WireJson.Default.DeactivateReq, ct)
                 .ConfigureAwait(false);
-            ForgetBinding();
+            using (new LicensingScope(this))
+            {
+                if (generation == _licensingGeneration) ForgetBinding();
+            }
         }
 
         /// <summary>
@@ -2040,6 +2194,16 @@ namespace Talos.Sdk
         {
             if (_activationSecret == null)
                 throw new TalosException("not activated: call ActivateAsync first");
+        }
+
+        private LicenseState? OfflineSince(long generation)
+        {
+            using (new LicensingScope(this))
+            {
+                if (generation == _licensingGeneration || _activationSecret != null
+                    || string.IsNullOrEmpty(_binding?.OfflineToken)) return null;
+                return AdoptOfflineToken(_binding!.OfflineToken!, null);
+            }
         }
 
         private LicenseState StateFromClaims(JsonElement claims, string decision, bool isOffline)

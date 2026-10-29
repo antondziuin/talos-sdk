@@ -207,7 +207,7 @@ impl Ticker {
 }
 
 /// Everything about the client that changes.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Mutable {
     keyset_license_keys: Vec<PublicKey>,
     keyset_release_keys: Vec<PublicKey>,
@@ -222,6 +222,8 @@ struct Mutable {
     keyset_token: Option<String>,
     license_key_hash: Option<String>,
     activation_secret: Option<String>,
+    /// Invalidates requests started before a local activation-mode change.
+    licensing_generation: u64,
     machine_id: Option<String>,
     binding: Option<StoredBinding>,
     heartbeat_interval: Option<i64>,
@@ -779,6 +781,9 @@ impl TalosClient {
     /// another product's, a broken signature. A licence that cannot license this
     /// machine comes back as a verdict to show the user: `MachineMismatch`,
     /// `OfflineFileExpired`, `Expired`, `ClockTampered`.
+    /// Portable perpetual files require no prior request and can be imported
+    /// independently on different computers. A valid import replaces a held
+    /// online activation locally; rejected files leave it stored.
     pub fn load_offline_license(&self, file: &[u8]) -> Result<LicenseState> {
         self.inner.load_offline_license(file)
     }
@@ -792,7 +797,7 @@ impl TalosClient {
     /// Hand this machine's air-gapped seat back: write the result to
     /// `talos-deactivation.json` for the vendor. **The licence is dropped
     /// before this returns**, so an app that loses the file has still stopped
-    /// using the seat.
+    /// using the seat. Portable files have no bound seat and return a usage error.
     pub fn create_offline_deactivation(&self) -> Result<SignedDoc> {
         self.inner.create_offline_deactivation()
     }
@@ -861,13 +866,20 @@ impl Inner {
     }
 
     fn forget_binding(&self) {
+        self.forget_binding_at(None);
+    }
+
+    fn forget_binding_at(&self, generation: Option<u64>) {
         let mut m = lock(&self.m);
+        if generation.is_some_and(|g| g != m.licensing_generation) {
+            return;
+        }
+        m.licensing_generation = m.licensing_generation.wrapping_add(1);
         m.license_key_hash = None;
         m.activation_secret = None;
         m.machine_id = None;
         m.current = None;
         m.binding = None;
-        drop(m);
         if let Some(store) = &self.store {
             store.clear();
         }
@@ -947,8 +959,9 @@ impl Inner {
     /// adopted. The server signs a keyset with the time it is asked for one, so
     /// an older one can only be a recording — and a recording from before a key
     /// was revoked is exactly how a revoked key would come back, on every
-    /// refresh, for as long as somebody kept replaying it. The allowance is for
-    /// two replicas' clocks, not for anything an attacker could use.
+    /// refresh, for as long as somebody kept replaying it. Keysets stamped in
+    /// the same second must also match: timestamps cannot order two different
+    /// key rotations within that second, so keep the keys already trusted.
     fn adopt_keyset(&self, m: &mut Mutable, token: &Value) -> Result<bool> {
         let (Some(anchor), Some(token)) = (&self.anchor, token.as_str()) else {
             return Ok(false);
@@ -957,7 +970,10 @@ impl Inner {
         // From the signed claims, not a local reading: a wrong clock would
         // otherwise call its keyset fresh forever, or stale on every call.
         let issued_at = number(claims.get("iat")).unwrap_or(0);
-        if issued_at + CLOCK_SKEW_SECONDS < m.keyset_issued_at {
+        if m.keyset_token.is_some()
+            && (issued_at < m.keyset_issued_at
+                || (issued_at == m.keyset_issued_at && m.keyset_token.as_deref() != Some(token)))
+        {
             return Ok(false);
         }
         let mut license = Vec::new();
@@ -988,15 +1004,31 @@ impl Inner {
     }
 
     fn refresh_keyset(&self) -> Result<()> {
+        self.refresh_keyset_at(None)
+    }
+
+    fn refresh_keyset_at(&self, expected: Option<u64>) -> Result<()> {
         if self.anchor.is_none() {
             return Ok(());
         }
-        let body = self.post(
+        let generation = {
+            let m = lock(&self.m);
+            let generation = expected.unwrap_or(m.licensing_generation);
+            if generation != m.licensing_generation {
+                return Ok(());
+            }
+            generation
+        };
+        let response = self.post(
             "/v1/client/keyset",
             json!({ "product_token": self.product_token }),
-        )?;
-        let keyset = body.get("keyset").cloned().unwrap_or(Value::Null);
+        );
         let mut m = lock(&self.m);
+        if generation != m.licensing_generation {
+            return Ok(());
+        }
+        let body = response?;
+        let keyset = body.get("keyset").cloned().unwrap_or(Value::Null);
         let adopted = self.adopt_keyset(&mut m, &keyset)?;
         m.keyset_from_cache = false;
         if adopted {
@@ -1009,18 +1041,31 @@ impl Inner {
     /// Make sure a verification key exists before a response has to be
     /// verified, refreshing a cached or stale keyset when the server is there.
     fn ensure_keyset(&self) -> Result<()> {
+        self.ensure_keyset_at(None)
+    }
+
+    fn ensure_keyset_at(&self, expected: Option<u64>) -> Result<()> {
         if self.anchor.is_none() {
             return Ok(());
         }
-        {
+        let generation = {
             let m = lock(&self.m);
+            if expected.is_some_and(|g| g != m.licensing_generation)
+                || (m.activation_secret.is_none()
+                    && m.binding
+                        .as_ref()
+                        .is_some_and(|b| b.offline_token.is_some()))
+            {
+                return Ok(());
+            }
             let stale =
                 m.keyset_issued_at == 0 || self.now() - m.keyset_issued_at > KEYSET_MAX_AGE_SECONDS;
             if !m.keyset_license_keys.is_empty() && !m.keyset_from_cache && !stale {
                 return Ok(());
             }
-        }
-        match self.refresh_keyset() {
+            m.licensing_generation
+        };
+        match self.refresh_keyset_at(Some(generation)) {
             Ok(()) => Ok(()),
             // A refresh that cannot reach the server must not break a client
             // that already holds keys it trusts — that would make a network
@@ -1054,12 +1099,13 @@ impl Inner {
     /// The single funnel every path goes through, which is what makes the
     /// events trustworthy.
     fn adopt(&self, state: LicenseState) -> LicenseState {
-        let event = {
-            let mut m = lock(&self.m);
-            let event = transition_event(m.current.as_ref(), &state);
-            m.current = Some(state.clone());
-            event
-        };
+        self.adopt_locked(lock(&self.m), state)
+    }
+
+    fn adopt_locked(&self, mut m: MutexGuard<'_, Mutable>, state: LicenseState) -> LicenseState {
+        let event = transition_event(m.current.as_ref(), &state);
+        m.current = Some(state.clone());
+        drop(m);
         if let Some(kind) = event {
             let payload = match kind {
                 EventKind::LicenseInvalid => TalosEvent::LicenseInvalid(state.clone()),
@@ -1124,6 +1170,7 @@ impl Inner {
     // ---- the licensing calls -------------------------------------------------
 
     fn activate(&self, license_key: &str) -> Result<LicenseState> {
+        let mut generation = lock(&self.m).licensing_generation;
         let key_hash = hash_license_key(license_key);
         let same_key = lock(&self.m).license_key_hash.as_deref() == Some(key_hash.as_str());
         if same_key && self.require_activated().is_ok() {
@@ -1142,10 +1189,11 @@ impl Inner {
                 Err(e) => return Err(e),
             }
             self.forget_binding();
+            generation = lock(&self.m).licensing_generation;
         }
 
         let nonce = new_nonce();
-        let body = self.post(
+        let response = self.post(
             "/v1/client/activate",
             json!({
                 "product_token": self.product_token,
@@ -1158,9 +1206,16 @@ impl Inner {
                 "app_version": self.app_version,
                 "sdk_version": sdk_id(),
             }),
-        )?;
+        );
 
         let mut m = lock(&self.m);
+        if generation != m.licensing_generation {
+            return Ok(m
+                .current
+                .clone()
+                .unwrap_or_else(|| LicenseState::bare(Decision::Deactivated, true)));
+        }
+        let body = response?;
         // Adopt the keyset delivered with activation first, so a rotated key
         // verifies the activation token.
         let keyset = body.get("keyset").cloned().unwrap_or(Value::Null);
@@ -1188,6 +1243,7 @@ impl Inner {
             .and_then(Value::as_str)
             .map(str::to_string);
         let previous = m.binding.take();
+        m.licensing_generation = m.licensing_generation.wrapping_add(1);
         let keyset = m
             .keyset_token
             .clone()
@@ -1217,29 +1273,34 @@ impl Inner {
         });
         Self::advance_clock(&mut m, &claims);
         self.save(&m);
-        drop(m);
-        Ok(self.adopt(self.state_from_claims(&claims, Decision::Valid, false)))
+        let state = self.state_from_claims(&claims, Decision::Valid, false);
+        Ok(self.adopt_locked(m, state))
     }
 
     fn validate(&self) -> Result<LicenseState> {
         // An air-gapped install has no server to ask and no secret to ask with:
         // its file is the verdict, re-checked here because the clock and the
         // calendar are exactly what may have changed.
-        let offline_token = {
+        let (offline_token, generation, secret) = {
             let m = lock(&self.m);
-            match (
+            let offline_token = match (
                 &m.activation_secret,
                 m.binding.as_ref().and_then(|b| b.offline_token.clone()),
             ) {
                 (None, Some(token)) => Some(token),
                 _ => None,
-            }
+            };
+            (
+                offline_token,
+                m.licensing_generation,
+                m.activation_secret.clone(),
+            )
         };
         if let Some(token) = offline_token {
-            return self.adopt_offline_token(&token);
+            return self.adopt_offline_token(&token, Some(generation), None);
         }
-        let secret = self.require_activated()?;
-        match self.validate_online(&secret) {
+        let secret = secret.ok_or(Error::NotActivated)?;
+        match self.validate_online(&secret, generation) {
             Ok(state) => Ok(state),
             // An HTTP status is an answer. Falling back here would turn every
             // negative verdict into hours of grace.
@@ -1254,10 +1315,10 @@ impl Inner {
         }
     }
 
-    fn validate_online(&self, secret: &str) -> Result<LicenseState> {
-        self.ensure_keyset()?;
+    fn validate_online(&self, secret: &str, generation: u64) -> Result<LicenseState> {
+        self.ensure_keyset_at(Some(generation))?;
         let nonce = new_nonce();
-        let body = self.post(
+        let response = self.post(
             "/v1/client/validate",
             json!({
                 "product_token": self.product_token,
@@ -1269,9 +1330,16 @@ impl Inner {
                 "app_version": self.app_version,
                 "sdk_version": sdk_id(),
             }),
-        )?;
-        let token = str_field(&body, "validation_token").to_string();
+        );
         let mut m = lock(&self.m);
+        if generation != m.licensing_generation {
+            return Ok(m
+                .current
+                .clone()
+                .unwrap_or_else(|| LicenseState::bare(Decision::Deactivated, true)));
+        }
+        let body = response?;
+        let token = str_field(&body, "validation_token").to_string();
         let claims = verify_token_at(
             &self.license_keys(&m)?,
             "validation",
@@ -1284,8 +1352,8 @@ impl Inner {
         let decision = decision_of(&claims);
         Self::advance_clock(&mut m, &claims);
         self.persist(&mut m, |b| b.validation = Some(token));
-        drop(m);
-        Ok(self.adopt(self.state_from_claims(&claims, decision, false)))
+        let state = self.state_from_claims(&claims, decision, false);
+        Ok(self.adopt_locked(m, state))
     }
 
     /// The verdict from the local cache, or `None` when nothing is usable.
@@ -1329,25 +1397,41 @@ impl Inner {
     }
 
     fn deactivate(&self) -> Result<()> {
-        let secret = self.require_activated()?;
-        self.post(
+        let (generation, secret) = {
+            let m = lock(&self.m);
+            (
+                m.licensing_generation,
+                m.activation_secret.clone().ok_or(Error::NotActivated)?,
+            )
+        };
+        let response = self.post(
             "/v1/client/deactivate",
             json!({
                 "product_token": self.product_token,
                 "fingerprint": self.fingerprint_json(),
                 "activation_secret": secret,
             }),
-        )?;
-        self.forget_binding();
+        );
+        if generation != lock(&self.m).licensing_generation {
+            return Ok(());
+        }
+        response?;
+        self.forget_binding_at(Some(generation));
         Ok(())
     }
 
     fn heartbeat(&self) -> Result<LicenseState> {
-        let secret = self.require_activated()?;
-        self.ensure_keyset()?;
+        let (generation, secret) = {
+            let m = lock(&self.m);
+            (
+                m.licensing_generation,
+                m.activation_secret.clone().ok_or(Error::NotActivated)?,
+            )
+        };
+        self.ensure_keyset_at(Some(generation))?;
         let nonce = new_nonce();
         let wants_update = self.has_listener(EventKind::UpdateAvailable);
-        let body = self.post(
+        let response = self.post(
             "/v1/client/heartbeat",
             json!({
                 "product_token": self.product_token,
@@ -1362,8 +1446,15 @@ impl Inner {
                 // costs the server two queries — so only when somebody listens.
                 "update_channel": wants_update.then(|| self.channel()),
             }),
-        )?;
+        );
         let mut m = lock(&self.m);
+        if generation != m.licensing_generation {
+            return Ok(m
+                .current
+                .clone()
+                .unwrap_or_else(|| LicenseState::bare(Decision::Deactivated, true)));
+        }
+        let body = response?;
         let claims = verify_token_at(
             &self.license_keys(&m)?,
             "heartbeat",
@@ -1385,12 +1476,14 @@ impl Inner {
         // A heartbeat carries the decision but not the entitlement bag; keep
         // the rest of the last activate/validate.
         let previous = m.current.clone();
-        drop(m);
-        let state = self.adopt(LicenseState {
-            decision: decision_of(&claims),
-            is_offline: false,
-            ..previous.unwrap_or_else(|| LicenseState::bare(Decision::Valid, false))
-        });
+        let state = self.adopt_locked(
+            m,
+            LicenseState {
+                decision: decision_of(&claims),
+                is_offline: false,
+                ..previous.unwrap_or_else(|| LicenseState::bare(Decision::Valid, false))
+            },
+        );
         self.announce_update(&claims);
         Ok(state)
     }
@@ -1785,41 +1878,80 @@ impl Inner {
         // nowhere to fetch one. Adopted only if the pinned anchor signed it,
         // and only if it is not older than the one already held — an old file
         // must not bring back a key revoked since.
-        if let Some(keyset) = doc.get("keyset").filter(|k| k.is_string()) {
-            self.adopt_keyset(&mut lock(&self.m), keyset)?;
-        }
-        self.adopt_offline_token(token)
+        self.adopt_offline_token(token, None, doc.get("keyset").filter(|k| k.is_string()))
     }
 
     /// Verify the offline file against this machine and this clock, and adopt
     /// the verdict. Runs on load and on every `validate`.
-    fn adopt_offline_token(&self, token: &str) -> Result<LicenseState> {
+    fn adopt_offline_token(
+        &self,
+        token: &str,
+        generation: Option<u64>,
+        keyset: Option<&Value>,
+    ) -> Result<LicenseState> {
         let now = self.now();
         let mut m = lock(&self.m);
+        if generation.is_some_and(|g| g != m.licensing_generation) {
+            return Ok(m
+                .current
+                .clone()
+                .unwrap_or_else(|| LicenseState::bare(Decision::Deactivated, true)));
+        }
+        // An embedded keyset is tentative until the whole file is accepted.
+        // A broken or wrong-machine import must not change existing trust.
+        let mut candidate = m.clone();
+        if let Some(keyset) = keyset {
+            self.adopt_keyset(&mut candidate, keyset)?;
+        }
         // The nonce belonged to a request that may be weeks old — the server
         // is what needed it. `exp` is a verdict rather than an error, below.
         let claims = verify_cached_token_at(
-            &self.license_keys(&m)?,
+            &self.license_keys(&candidate)?,
             "offline",
             &self.product_token,
             token,
             now,
         )?;
 
-        // Both halves, exactly: the fingerprint stops the whole state directory
-        // being copied to another computer, and the key stops the file alone
-        // being worth anything.
+        let empty = Map::new();
+        let lic = claims
+            .get("lic")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+        let perpetual = claims.get("perpetual") == Some(&Value::Bool(true))
+            && claims.get("exp") == Some(&Value::Null)
+            && lic.get("lic_exp") == Some(&Value::Null);
+        let portable = claims.get("binding").and_then(Value::as_str) == Some("portable");
+        let machine_bound = claims.get("binding").is_none()
+            || claims.get("binding").and_then(Value::as_str) == Some("machine");
+        // Portable files deliberately carry no machine identity and require an
+        // explicit perpetual authorization and nonempty provenance identifiers.
+        // Any other binding keeps the existing exact machine checks.
+        let portable_valid = perpetual
+            && claims.get("decision").and_then(Value::as_str) == Some("valid")
+            && ["fph", "mpk", "mid"]
+                .iter()
+                .all(|k| !claims.contains_key(*k))
+            && ["fid", "sub"].iter().all(|k| {
+                claims
+                    .get(*k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty())
+            });
         let mpk = claims.get("mpk").and_then(Value::as_str);
         let ours = m
             .binding
             .as_ref()
             .and_then(|b| b.machine_public_key.as_deref());
-        if mpk.is_none()
-            || mpk != ours
-            || claims.get("fph").and_then(Value::as_str) != Some(self.fp.composite.as_str())
+        if (portable && !portable_valid)
+            || (!portable
+                && (!machine_bound
+                    || mpk.is_none()
+                    || mpk != ours
+                    || claims.get("fph").and_then(Value::as_str)
+                        != Some(self.fp.composite.as_str())))
         {
-            drop(m);
-            return Ok(self.adopt(LicenseState::bare(Decision::MachineMismatch, true)));
+            return Ok(self.adopt_locked(m, LicenseState::bare(Decision::MachineMismatch, true)));
         }
 
         // Two lower bounds on "now" this install has observed: one signed by
@@ -1830,15 +1962,9 @@ impl Inner {
             .map_or((0, 0), |b| (b.time_high_water, b.offline_seen));
         let mark = high_water.max(seen);
         if mark > 0 && now + CLOCK_SKEW_SECONDS < mark {
-            drop(m);
-            return Ok(self.adopt(LicenseState::bare(Decision::ClockTampered, true)));
+            return Ok(self.adopt_locked(m, LicenseState::bare(Decision::ClockTampered, true)));
         }
 
-        let empty = Map::new();
-        let lic = claims
-            .get("lic")
-            .and_then(Value::as_object)
-            .unwrap_or(&empty);
         let features = lic
             .get("features")
             .and_then(Value::as_object)
@@ -1846,31 +1972,6 @@ impl Inner {
             .unwrap_or_default();
         let lic_exp = number(lic.get("lic_exp"));
         let exp = number(claims.get("exp"));
-        // No deadline is intentional only with a signed opt-in and explicit
-        // JSON null for both the file and the licence's business expiry.
-        let perpetual = claims.get("perpetual") == Some(&Value::Bool(true))
-            && claims.get("exp") == Some(&Value::Null)
-            && lic.get("lic_exp") == Some(&Value::Null);
-
-        // Kept even when today's answer is "expired": the file is this
-        // machine's, and the app can say which file it is holding.
-        if let Some(mid) = claims.get("mid").and_then(Value::as_str) {
-            m.machine_id = Some(mid.to_string());
-        }
-        let mut b = self.binding_base(&m);
-        if let Some(mid) = &m.machine_id {
-            b.machine_id = mid.clone();
-        }
-        b.offline_token = Some(token.to_string());
-        b.offline_seen = b.offline_seen.max(now);
-        if let Some(k) = m.keyset_token.clone() {
-            b.keyset = Some(k);
-        }
-        m.binding = Some(b);
-        Self::advance_clock(&mut m, &claims);
-        self.save(&m);
-        drop(m);
-
         // Bounded files end at their horizon; explicit perpetual files need no
         // renewal. Distinct from `Expired`, which is the licence ending —
         // a new file versus a renewal.
@@ -1881,25 +1982,61 @@ impl Inner {
         } else {
             Decision::Valid
         };
-        Ok(self.adopt(LicenseState {
-            decision,
-            features,
-            license_expires_at: lic_exp,
-            is_offline: true,
-            revalidate_after: None,
-            grace_until: exp,
-        }))
+        // Switch to the accepted offline file only after all checks pass. A
+        // failed import must not discard an existing online activation/cache.
+        if decision == Decision::Valid {
+            *m = candidate;
+            if generation.is_none() {
+                m.licensing_generation = m.licensing_generation.wrapping_add(1);
+            }
+            m.activation_secret = None;
+            m.license_key_hash = None;
+            m.heartbeat_interval = None;
+            m.lease = None;
+            m.lease_generation += 1;
+            self.renewals.bump();
+            m.machine_id = if portable {
+                None
+            } else {
+                claims
+                    .get("mid")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            let mut b = self.binding_base(&m);
+            b.activation_secret.clear();
+            b.license_key_hash.clear();
+            b.validation = None;
+            b.machine_id = m.machine_id.clone().unwrap_or_default();
+            b.offline_token = Some(token.to_string());
+            b.offline_seen = b.offline_seen.max(now);
+            if let Some(k) = m.keyset_token.clone() {
+                b.keyset = Some(k);
+            }
+            m.binding = Some(b);
+            Self::advance_clock(&mut m, &claims);
+            self.save(&m);
+        }
+        Ok(self.adopt_locked(
+            m,
+            LicenseState {
+                decision,
+                features,
+                license_expires_at: lic_exp,
+                is_offline: true,
+                revalidate_after: None,
+                grace_until: exp,
+            },
+        ))
     }
 
     fn create_offline_deactivation(&self) -> Result<SignedDoc> {
         let mut m = lock(&self.m);
-        let (token, seed) = match m.binding.as_ref() {
-            Some(b) => match (&b.offline_token, &b.machine_key, &b.machine_public_key) {
-                (Some(t), Some(k), Some(_)) => (t.clone(), k.clone()),
-                _ => return Err(Error::usage("no offline licence to hand back")),
-            },
-            None => return Err(Error::usage("no offline licence to hand back")),
-        };
+        let token = m
+            .binding
+            .as_ref()
+            .and_then(|b| b.offline_token.clone())
+            .ok_or_else(|| Error::usage("no offline licence to hand back"))?;
         // Read what the file says about itself before dropping it: the receipt
         // names the file and the machine.
         let claims = self
@@ -1908,8 +2045,19 @@ impl Inner {
                 verify_cached_token_at(&keys, "offline", &self.product_token, &token, self.now())
             })
             .map_err(|_| Error::usage("the stored offline licence no longer verifies"))?;
+        if claims.get("binding").and_then(Value::as_str) == Some("portable") {
+            return Err(Error::usage(
+                "portable offline licences have no bound seat to return",
+            ));
+        }
+        let seed = m
+            .binding
+            .as_ref()
+            .and_then(|b| b.machine_public_key.as_ref().and(b.machine_key.clone()))
+            .ok_or_else(|| Error::usage("no offline licence to hand back"))?;
 
         // Dropped first. The order is the point.
+        m.licensing_generation = m.licensing_generation.wrapping_add(1);
         if let Some(b) = m.binding.as_mut() {
             b.offline_token = None;
         }

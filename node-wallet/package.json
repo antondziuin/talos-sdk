@@ -12,6 +12,6 @@
   "engines": { "node": ">=18" },
   "scripts": { "build": "tsup src/index.ts --format esm,cjs --dts --target node18", "test": "vitest run", "typecheck": "tsc --noEmit" },
   "dependencies": { "viem": "^2.37.0", "proper-lockfile": "^4.1.2" },
-  "peerDependencies": { "@antondziuin/talos-sdk": "^0.2.0" },
+  "peerDependencies": { "@antondziuin/talos-sdk": "^0.2.0 || ^0.3.0" },
   "devDependencies": { "@antondziuin/talos-sdk": "file:../node", "@types/node": "^22.9.0", "@types/proper-lockfile": "^4.1.4", "typescript": "^5.6.3", "tsup": "^8.3.5", "vitest": "2.1.9" }
 }

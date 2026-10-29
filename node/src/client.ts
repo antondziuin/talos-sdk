@@ -489,6 +489,9 @@ export class TalosClient {
    * for weeks. A key revoked in the portal would never reach it.
    */
   private keysetIssuedAt = 0;
+  private keysetToken: string | null = null;
+  /** Invalidates online work started before a local licensing-mode change. */
+  private licensingGeneration = 0;
   /** The policy's heartbeat cadence, from the last heartbeat's signed claims. */
   private heartbeatInterval: number | null = null;
   private checkInTimer: ReturnType<typeof setTimeout> | null = null;
@@ -643,12 +646,14 @@ export class TalosClient {
    */
   async refreshKeyset(): Promise<void> {
     if (!this.anchorKey) return;
+    const generation = this.licensingGeneration;
     const body = await this.post("/v1/client/keyset", {
       product_token: this.options.productToken,
     });
+    if (generation !== this.licensingGeneration) return;
     this.adoptKeyset(body["keyset"]);
     this.keysetFromCache = false;
-    if (typeof body["keyset"] === "string") this.persist({ keyset: body["keyset"] });
+    if (this.keysetToken) this.persist({ keyset: this.keysetToken });
   }
 
   /**
@@ -710,7 +715,9 @@ export class TalosClient {
     // fetch happened: a client whose clock is wrong would otherwise decide its
     // keyset is fresh forever, or refetch on every call.
     const iat = claims["iat"];
-    this.keysetIssuedAt = typeof iat === "number" ? iat : 0;
+    const issuedAt = typeof iat === "number" ? iat : 0;
+    if (issuedAt < this.keysetIssuedAt
+      || (issuedAt === this.keysetIssuedAt && this.keysetToken !== null && token !== this.keysetToken)) return;
     const licenseKeys: KeyObject[] = [];
     const releaseKeys: KeyObject[] = [];
     for (const entry of asArray(claims["keys"])) {
@@ -722,6 +729,8 @@ export class TalosClient {
     }
     this.keysetLicenseKeys = licenseKeys;
     this.keysetReleaseKeys = releaseKeys;
+    this.keysetIssuedAt = issuedAt;
+    this.keysetToken = token;
   }
 
   /** Keys to verify license tokens with: the keyset if loaded, else the direct pin. */
@@ -756,76 +765,86 @@ export class TalosClient {
    * elsewhere.
    */
   async activate(licenseKey: string): Promise<LicenseState> {
-    if (this.isActivated && this.licenseKeyHash === hashLicenseKey(licenseKey)) {
-      try {
-        const state = await this.validate();
-        // `deactivated` means the developer released the seat; taking it again
-        // is exactly what re-activating is for. Every other verdict —
-        // including `machine_revoked` — is the server's answer, and re-
-        // activating would only replace it with a less specific error.
-        if (state.decision !== "deactivated") return state;
-      } catch (e) {
-        // 401: the secret was rotated elsewhere. 404: the machine (or licence)
-        // is gone. Anything else is a real failure and must not be papered
-        // over by silently spending a seat.
-        const stale =
-          e instanceof TalosApiError && (e.statusCode === 401 || e.statusCode === 404);
-        if (!stale) throw e;
+    const generation = this.licensingGeneration;
+    try {
+      if (this.isActivated && this.licenseKeyHash === hashLicenseKey(licenseKey)) {
+        try {
+          const state = await this.validate();
+          // `deactivated` means the developer released the seat; taking it again
+          // is exactly what re-activating is for. Every other verdict —
+          // including `machine_revoked` — is the server's answer, and re-
+          // activating would only replace it with a less specific error.
+          if (state.decision !== "deactivated") return state;
+        } catch (e) {
+          // 401: the secret was rotated elsewhere. 404: the machine (or licence)
+          // is gone. Anything else is a real failure and must not be papered
+          // over by silently spending a seat.
+          const stale =
+            e instanceof TalosApiError && (e.statusCode === 401 || e.statusCode === 404);
+          if (!stale) throw e;
+        }
+        this.forgetBinding();
       }
-      this.forgetBinding();
-    }
-    const nonce = newNonce();
-    const body = await this.post("/v1/client/activate", {
-      product_token: this.options.productToken,
-      license_key: licenseKey,
-      fingerprint: { composite: this.fingerprint, components: this.fp.components },
-      nonce,
-      hostname: this.reportedHostname(),
-      os: `${os.type()} ${os.release()}`,
-      arch: os.arch(),
-      app_version: this.options.appVersion,
-      sdk_version: SDK_ID,
-    });
+      const nonce = newNonce();
+      const body = await this.post("/v1/client/activate", {
+        product_token: this.options.productToken,
+        license_key: licenseKey,
+        fingerprint: { composite: this.fingerprint, components: this.fp.components },
+        nonce,
+        hostname: this.reportedHostname(),
+        os: `${os.type()} ${os.release()}`,
+        arch: os.arch(),
+        app_version: this.options.appVersion,
+        sdk_version: SDK_ID,
+      });
 
-    // Adopt the keyset delivered with activation, then verify the activation
-    // token against the current license keys (so a rotated key still works).
-    this.adoptKeyset(body["keyset"]);
-    const claims = verifyToken(
-      this.licenseVerifyKeys(),
-      "activation",
-      this.options.productToken,
-      nonce,
-      body["activation_token"] as string,
-    );
-    // The key is not kept. From here the activation secret identifies both the
-    // machine and its licence, so nothing needs the key again until somebody
-    // types a different one.
-    this.licenseKeyHash = hashLicenseKey(licenseKey);
-    this.activationSecret = body["activation_secret"] as string;
-    this.machineId = (body["machine_id"] as string) ?? null;
-    this.binding = {
-      licenseKeyHash: this.licenseKeyHash,
-      activationSecret: this.activationSecret,
-      machineId: this.machineId ?? "",
-      fingerprint: this.fingerprint,
-      // A fresh activation invalidates any cached verdict for the previous
-      // binding; keep only the keyset, which is per product, not per machine.
-      keyset: typeof body["keyset"] === "string" ? (body["keyset"] as string) : this.binding?.keyset,
-      timeHighWater: this.binding?.timeHighWater,
-      // The machine's own identity survives an online activation, because it is
-      // an identity and not a verdict: an install that reaches the network once
-      // must not have to repeat the whole air-gapped ceremony with its vendor
-      // the next time it is unplugged. The clock mark survives for the same
-      // reason a mark exists at all — it only moves forward.
-      machineKey: this.binding?.machineKey,
-      machinePublicKey: this.binding?.machinePublicKey,
-      offlineSeen: this.binding?.offlineSeen,
-      // The offline *file* does not: a live activation supersedes it, and
-      // keeping it would leave two answers to "what licenses this machine".
-    };
-    this.advanceClock(claims);
-    this.store?.save(this.binding);
-    return this.adopt(stateFromClaims(claims, "valid", false));
+      const switched = this.offlineSince(generation);
+      if (switched) return switched;
+
+      // Adopt the keyset delivered with activation, then verify the activation
+      // token against the current license keys (so a rotated key still works).
+      this.adoptKeyset(body["keyset"]);
+      const claims = verifyToken(
+        this.licenseVerifyKeys(),
+        "activation",
+        this.options.productToken,
+        nonce,
+        body["activation_token"] as string,
+      );
+      // The key is not kept. From here the activation secret identifies both the
+      // machine and its licence, so nothing needs the key again until somebody
+      // types a different one.
+      this.licenseKeyHash = hashLicenseKey(licenseKey);
+      this.activationSecret = body["activation_secret"] as string;
+      this.machineId = (body["machine_id"] as string) ?? null;
+      this.binding = {
+        licenseKeyHash: this.licenseKeyHash,
+        activationSecret: this.activationSecret,
+        machineId: this.machineId ?? "",
+        fingerprint: this.fingerprint,
+        // A fresh activation invalidates any cached verdict for the previous
+        // binding; keep only the keyset, which is per product, not per machine.
+        keyset: this.keysetToken ?? this.binding?.keyset,
+        timeHighWater: this.binding?.timeHighWater,
+        // The machine's own identity survives an online activation, because it is
+        // an identity and not a verdict: an install that reaches the network once
+        // must not have to repeat the whole air-gapped ceremony with its vendor
+        // the next time it is unplugged. The clock mark survives for the same
+        // reason a mark exists at all — it only moves forward.
+        machineKey: this.binding?.machineKey,
+        machinePublicKey: this.binding?.machinePublicKey,
+        offlineSeen: this.binding?.offlineSeen,
+        // The offline *file* does not: a live activation supersedes it, and
+        // keeping it would leave two answers to "what licenses this machine".
+      };
+      this.advanceClock(claims);
+      this.store?.save(this.binding);
+      return this.adopt(stateFromClaims(claims, "valid", false));
+    } catch (e) {
+      const switched = this.offlineSince(generation);
+      if (switched) return switched;
+      throw e;
+    }
   }
 
   /**
@@ -906,13 +925,13 @@ export class TalosClient {
   }
 
   /**
-   * Adopt an air-gapped licence file issued for this machine.
+   * Adopt a machine-bound or portable offline licence file.
    *
    * Everything is verified locally, because there is nothing to ask: the
    * anchor-signed keyset travels inside the file, the verdict is signed by a key
-   * that keyset lists, and the file names both halves of this machine's identity
-   * — its fingerprint and the public key it generated. The verdict is then kept,
-   * so later starts are licensed with no further ceremony.
+   * that keyset lists. Machine-bound files name this machine's fingerprint and
+   * public key; explicitly portable files need no machine request. The verdict
+   * is kept, so later starts are licensed with no further ceremony.
    *
    * **Throws** only for a file that is not a licence: unreadable, not one of
    * ours, addressed to another product, or a broken signature. A file that *is*
@@ -940,8 +959,25 @@ export class TalosClient {
     // to fetch one from. It is adopted only if the pinned anchor signs it, so a
     // file carrying somebody else's keyset changes nothing about which keys
     // this client trusts.
-    if (typeof doc["keyset"] === "string") this.adoptKeyset(doc["keyset"]);
-    return this.adoptOfflineToken(doc["token"], doc["keyset"]);
+    const previous = {
+      license: this.keysetLicenseKeys, release: this.keysetReleaseKeys,
+      iat: this.keysetIssuedAt, token: this.keysetToken,
+    };
+    const restore = (): void => {
+      this.keysetLicenseKeys = previous.license;
+      this.keysetReleaseKeys = previous.release;
+      this.keysetIssuedAt = previous.iat;
+      this.keysetToken = previous.token;
+    };
+    try {
+      if (typeof doc["keyset"] === "string") this.adoptKeyset(doc["keyset"]);
+      const state = this.adoptOfflineToken(doc["token"], this.keysetToken);
+      if (!state.isValid) restore();
+      return state;
+    } catch (e) {
+      restore();
+      throw e;
+    }
   }
 
   /**
@@ -964,9 +1000,7 @@ export class TalosClient {
    */
   createOfflineDeactivation(): SignedDoc {
     const token = this.binding?.offlineToken;
-    const key = this.binding?.machineKey;
-    const pub = this.binding?.machinePublicKey;
-    if (!token || !key || !pub) {
+    if (!token) {
       throw new TalosError("no offline licence to hand back");
     }
     // Read what the file says about itself before dropping it: the receipt has
@@ -983,6 +1017,12 @@ export class TalosClient {
     } catch {
       throw new TalosError("the stored offline licence no longer verifies");
     }
+    if (claims["binding"] === "portable") {
+      throw new TalosError("portable offline licences have no bound seat to return");
+    }
+    const key = this.binding?.machineKey;
+    const pub = this.binding?.machinePublicKey;
+    if (!key || !pub) throw new TalosError("no offline licence to hand back");
 
     // Drop it first. The order is the point: see above.
     this.binding = { ...this.bindingBase(), offlineToken: undefined };
@@ -1019,14 +1059,33 @@ export class TalosClient {
 
     const mismatch = (): LicenseState =>
       this.adopt(new LicenseState("machine_mismatch", {}, null, true, null, null));
-    // Both halves, exactly. The fingerprint is what stops the whole state
+    const lic = (claims["lic"] ?? {}) as Record<string, unknown>;
+    const features = (lic["features"] ?? {}) as Record<string, unknown>;
+    const licExp = num(lic["lic_exp"]);
+    const exp = num(claims["exp"]);
+    const perpetual = claims["perpetual"] === true
+      && claims["exp"] === null && lic["lic_exp"] === null;
+    const portable = claims["binding"] === "portable";
+    if (portable) {
+      // Portability is a distinct signed grant, never a fallback for a file
+      // with incomplete machine claims. Null machine claims are invalid too.
+      const present = (key: string): boolean => Object.hasOwn(claims, key);
+      const named = (key: string): boolean =>
+        typeof claims[key] === "string" && (claims[key] as string).trim().length > 0;
+      if (!perpetual || claims["decision"] !== "valid"
+        || present("fph") || present("mpk") || present("mid")
+        || !named("fid") || !named("sub")) return mismatch();
+    } else if (claims["binding"] !== undefined && claims["binding"] !== "machine") {
+      return mismatch();
+    }
+    // Machine-bound files require both halves. The fingerprint stops the state
     // directory being copied to another computer, and the key is what stops the
     // file alone being worth anything — neither is redundant, and accepting
     // either on its own would open the case the other one closes.
-    if (typeof claims["mpk"] !== "string" || claims["mpk"] !== this.binding?.machinePublicKey) {
+    if (!portable && (typeof claims["mpk"] !== "string" || claims["mpk"] !== this.binding?.machinePublicKey)) {
       return mismatch();
     }
-    if (claims["fph"] !== this.fingerprint) return mismatch();
+    if (!portable && claims["fph"] !== this.fingerprint) return mismatch();
 
     const now = nowSeconds();
     // Both marks are lower bounds on "now" that this install has already
@@ -1036,31 +1095,6 @@ export class TalosClient {
     if (mark > 0 && now + CLOCK_SKEW_SECONDS < mark) {
       return this.adopt(new LicenseState("clock_tampered", {}, null, true, null, null));
     }
-
-    const lic = (claims["lic"] ?? {}) as Record<string, unknown>;
-    const features = (lic["features"] ?? {}) as Record<string, unknown>;
-    const licExp = num(lic["lic_exp"]);
-    const exp = num(claims["exp"]);
-    // No expiry is intentional only when the signer explicitly authorizes it
-    // and both the file and its underlying licence carry JSON null deadlines.
-    const perpetual = claims["perpetual"] === true
-      && claims["exp"] === null && lic["lic_exp"] === null;
-
-    // Persist before deciding: the file is this machine's, so it is worth
-    // keeping even when today's answer is "expired" — the licence may be
-    // renewed and a new file issued, and in the meantime the app can say which
-    // file it is holding.
-    this.machineId = typeof claims["mid"] === "string" ? claims["mid"] : this.machineId;
-    const base = this.bindingBase();
-    this.binding = {
-      ...base,
-      machineId: this.machineId ?? base.machineId,
-      offlineToken: token,
-      offlineSeen: Math.max(base.offlineSeen ?? 0, now),
-      ...(typeof keyset === "string" ? { keyset } : {}),
-    };
-    this.advanceClock(claims);
-    this.store?.save(this.binding);
 
     // Bounded files end at their own horizon. Explicit perpetual files need no
     // renewal; an omitted or malformed deadline still fails closed.
@@ -1075,6 +1109,32 @@ export class TalosClient {
     if (licExp !== null && now > licExp) {
       return this.adopt(new LicenseState("expired", features, licExp, true, null, exp));
     }
+
+    // A valid offline file replaces an online activation. Invalid imports must
+    // leave that activation and its cache intact. Keep machine keys and update
+    // trust/anti-downgrade marks, which belong to the installation.
+    this.licensingGeneration += 1;
+    this.licenseKeyHash = null;
+    this.activationSecret = null;
+    this.heartbeatInterval = null;
+    this.leaseGeneration += 1;
+    this.stopRenew();
+    this.lease = null;
+    this.machineId = !portable && typeof claims["mid"] === "string" ? claims["mid"] : null;
+    const base = this.bindingBase();
+    this.binding = {
+      ...base,
+      licenseKeyHash: "",
+      activationSecret: "",
+      validation: undefined,
+      machineId: this.machineId ?? "",
+      fingerprint: this.fingerprint,
+      offlineToken: token,
+      offlineSeen: Math.max(base.offlineSeen ?? 0, now),
+      ...(typeof keyset === "string" ? { keyset } : {}),
+    };
+    this.advanceClock(claims);
+    this.store?.save(this.binding);
     return this.adopt(new LicenseState("valid", features, licExp, true, null, exp));
   }
 
@@ -1209,6 +1269,7 @@ export class TalosClient {
 
   /** Drop the machine binding, in memory and on disk. */
   private forgetBinding(): void {
+    this.licensingGeneration += 1;
     this.licenseKeyHash = null;
     this.activationSecret = null;
     this.machineId = null;
@@ -1249,8 +1310,11 @@ export class TalosClient {
       return this.adoptOfflineToken(this.binding.offlineToken);
     }
     this.requireActivated();
+    const generation = this.licensingGeneration;
     try {
       await this.ensureKeyset();
+      const switchedBeforeRequest = this.offlineSince(generation);
+      if (switchedBeforeRequest) return switchedBeforeRequest;
       const nonce = newNonce();
       const body = await this.post("/v1/client/validate", {
         product_token: this.options.productToken,
@@ -1264,6 +1328,8 @@ export class TalosClient {
         app_version: this.options.appVersion,
         sdk_version: SDK_ID,
       });
+      const switched = this.offlineSince(generation);
+      if (switched) return switched;
       const token = body["validation_token"] as string;
       const claims = verifyToken(
         this.licenseVerifyKeys(),
@@ -1278,6 +1344,8 @@ export class TalosClient {
       this.persist({ validation: token, timeHighWater: this.binding?.timeHighWater });
       return this.adopt(stateFromClaims(claims, decision, false));
     } catch (e) {
+      const switched = this.offlineSince(generation);
+      if (switched) return switched;
       // An HTTP status is an *answer* — "revoked", "no such machine", "tenant
       // suspended". Honouring a cached verdict over one would turn every
       // negative answer into 72 hours of grace, which is the opposite of what
@@ -1365,12 +1433,13 @@ export class TalosClient {
 
   async deactivate(): Promise<void> {
     this.requireActivated();
+    const generation = this.licensingGeneration;
     await this.post("/v1/client/deactivate", {
       product_token: this.options.productToken,
       fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
     });
-    this.forgetBinding();
+    if (generation === this.licensingGeneration) this.forgetBinding();
   }
 
   /**
@@ -1396,56 +1465,69 @@ export class TalosClient {
 
   async heartbeat(): Promise<LicenseState> {
     this.requireActivated();
-    await this.ensureKeyset();
-    const nonce = newNonce();
-    const body = await this.post("/v1/client/heartbeat", {
-      product_token: this.options.productToken,
-      fingerprint: { composite: this.fingerprint, components: this.fp.components },
-      activation_secret: this.activationSecret,
-      nonce,
-      app_version: this.options.appVersion,
-      os: `${os.type()} ${os.release()}`,
-      arch: os.arch(),
-      sdk_version: SDK_ID,
-      // Naming the channel is what asks the server for the update hint, and it
-      // costs two queries there — so it is asked for only when somebody is
-      // listening for the answer.
-      update_channel: this.listeners.get("updateAvailable")?.size
-        ? this.updateChannel()
-        : undefined,
-    });
-    const claims = verifyToken(
-      this.licenseVerifyKeys(),
-      "heartbeat",
-      this.options.productToken,
-      nonce,
-      body["heartbeat_token"] as string,
-    );
-    const decision =
-      typeof claims["decision"] === "string" ? (claims["decision"] as string) : "invalid";
-    // The cadence comes from the SIGNED claims, never the response envelope:
-    // the whole point of signing it is that nobody in the middle can tell a
-    // fleet to check in less often.
-    const interval = num(claims["heartbeat_interval_s"]);
-    if (interval !== null && interval > 0) this.heartbeatInterval = interval;
-    // Every signed server clock we see pushes the high-water mark forward, not
-    // just validation's — a heartbeat is the most frequent call there is.
-    this.advanceClock(claims);
-    this.persist({ timeHighWater: this.binding?.timeHighWater });
-    // A heartbeat carries the decision but not the entitlement bag; keep the
-    // features from the last activate/validate.
-    const state = this.adopt(
-      new LicenseState(
-        decision,
-        this.current?.features ?? {},
-        this.current?.licenseExpiresAt ?? null,
-        false,
-        this.current?.revalidateAfter ?? null,
-        this.current?.graceUntil ?? null,
-      ),
-    );
-    await this.announceUpdate(claims);
-    return state;
+    const generation = this.licensingGeneration;
+    try {
+      await this.ensureKeyset();
+      const switchedBeforeRequest = this.offlineSince(generation);
+      if (switchedBeforeRequest) return switchedBeforeRequest;
+      const nonce = newNonce();
+      const body = await this.post("/v1/client/heartbeat", {
+        product_token: this.options.productToken,
+        fingerprint: { composite: this.fingerprint, components: this.fp.components },
+        activation_secret: this.activationSecret,
+        nonce,
+        app_version: this.options.appVersion,
+        os: `${os.type()} ${os.release()}`,
+        arch: os.arch(),
+        sdk_version: SDK_ID,
+        // Naming the channel is what asks the server for the update hint, and it
+        // costs two queries there — so it is asked for only when somebody is
+        // listening for the answer.
+        update_channel: this.listeners.get("updateAvailable")?.size
+          ? this.updateChannel()
+          : undefined,
+      });
+      const switched = this.offlineSince(generation);
+      if (switched) return switched;
+      const claims = verifyToken(
+        this.licenseVerifyKeys(),
+        "heartbeat",
+        this.options.productToken,
+        nonce,
+        body["heartbeat_token"] as string,
+      );
+      const decision =
+        typeof claims["decision"] === "string" ? (claims["decision"] as string) : "invalid";
+      // The cadence comes from the SIGNED claims, never the response envelope:
+      // the whole point of signing it is that nobody in the middle can tell a
+      // fleet to check in less often.
+      const interval = num(claims["heartbeat_interval_s"]);
+      if (interval !== null && interval > 0) this.heartbeatInterval = interval;
+      // Every signed server clock we see pushes the high-water mark forward, not
+      // just validation's — a heartbeat is the most frequent call there is.
+      this.advanceClock(claims);
+      this.persist({ timeHighWater: this.binding?.timeHighWater });
+      // A heartbeat carries the decision but not the entitlement bag; keep the
+      // features from the last activate/validate.
+      const state = this.adopt(
+        new LicenseState(
+          decision,
+          this.current?.features ?? {},
+          this.current?.licenseExpiresAt ?? null,
+          false,
+          this.current?.revalidateAfter ?? null,
+          this.current?.graceUntil ?? null,
+        ),
+      );
+      await this.announceUpdate(claims);
+      const switchedAfterUpdate = this.offlineSince(generation);
+      if (switchedAfterUpdate) return switchedAfterUpdate;
+      return state;
+    } catch (e) {
+      const switched = this.offlineSince(generation);
+      if (switched) return switched;
+      throw e;
+    }
   }
 
   /** The channel this install follows; `stable` unless set. */
@@ -1909,6 +1991,14 @@ export class TalosClient {
     if (!this.activationSecret) {
       throw new TalosError("not activated: call activate() first");
     }
+  }
+
+  /** Keep a newly imported offline licence authoritative over older requests. */
+  private offlineSince(generation: number): LicenseState | null {
+    if (generation === this.licensingGeneration || this.activationSecret || !this.binding?.offlineToken) {
+      return null;
+    }
+    return this.adoptOfflineToken(this.binding.offlineToken);
   }
 
   private post(path: string, body: unknown): Promise<Record<string, unknown>> {

@@ -179,7 +179,21 @@ For trusted users, a perpetual policy can opt into permanent offline files with
 explicit null file and licence expiries. It needs no renewal or connection;
 `grace_until` and `license_expires_at` are `None`. Import it using the same calls
 above. Older SDK versions reject these files and must be upgraded. Permanent
-files cannot be recalled, and hardware changes still require a new request.
+files cannot be recalled, and machine-bound files still require a new request
+after hardware changes.
+
+A **portable** permanent file has signed `binding: "portable"` and no machine
+fingerprint or device key. Import it directly with `load_offline_license_file`;
+no request is needed. The same file works on different computers, each keeping
+its own local state. Portable files have no seat to return, so
+`create_offline_deactivation()` refuses them. Copies remain usable indefinitely.
+Use portable policies only when this unrestricted sharing is intentional.
+
+A valid offline import replaces the client's online activation locally. Later
+`validate()` calls and restarts use the stored file without contacting Talos.
+Rejected imports retain the previous stored activation. Keep state persistence
+enabled for automatic restore; moving a portable file to another computer means
+importing that file there, rather than copying its machine-encrypted state.
 
 `load_offline_license` fails only for a file that is not a licence. One that
 cannot license this machine comes back as a verdict: `MachineMismatch`,

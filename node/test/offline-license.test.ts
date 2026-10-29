@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { TalosClient, type FetchLike, type TalosOptions } from "../src/client.js";
 import { collectFingerprint } from "../src/fingerprint.js";
+import { StateStore, hashLicenseKey, stateKeyMaterial } from "../src/state.js";
 import {
   LICENSE_FILE_KIND,
   RECEIPT_DOMAIN,
@@ -83,6 +84,14 @@ function offlineClaims(mpk: string, over: Record<string, unknown> = {}): Record<
     lic: { features: { pro: true }, lic_exp: null },
     ...over,
   };
+}
+
+function portableClaims(over: Record<string, unknown> = {}): Record<string, unknown> {
+  const claims = offlineClaims("");
+  delete claims["fph"];
+  delete claims["mpk"];
+  delete claims["mid"];
+  return { ...claims, binding: "portable", perpetual: true, exp: null, ...over };
 }
 
 /** `license.talos`, as the portal hands it back. */
@@ -203,6 +212,222 @@ describe("loading an offline licence file", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+
+  it("imports the same portable file on different machines without requests or network", async () => {
+    const signing = keypair();
+    const anchor = keypair();
+    const keyset = mint(anchor.privateKey, "keyset", {
+      aud: PRODUCT, iat: NOW() - 60,
+      keys: [{ kid: "k1", purpose: "license", pk: signing.pubB64, status: "active" }],
+    });
+    const file = licenseFile(mint(signing.privateKey, "offline", portableClaims()), keyset);
+    const fetch = vi.fn(deadNetwork);
+    for (const machine_guid of ["portable-pc-a", "portable-pc-b"]) {
+      const options = {
+        statePath: statePath(), anchorPublicKey: anchor.pubB64, fetch,
+        fingerprintComponents: { machine_guid },
+      };
+      const talos = client(options);
+      expect(talos.isActivated).toBe(false);
+      const state = await talos.loadOfflineLicense(file);
+      expect(state.isValid && state.isOffline).toBe(true);
+      expect(state.graceUntil).toBeNull();
+      expect(talos.currentMachineId).toBeNull();
+      expect(() => talos.createOfflineDeactivation()).toThrow(/portable.*no bound seat/);
+      expect(talos.isActivated).toBe(true);
+      const restarted = client(options);
+      expect((await restarted.validate()).isValid).toBe(true);
+      expect(restarted.isFeatureEnabled("pro")).toBe(true);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(["portable", "machine"])("switches an existing online activation to a valid %s file", async (binding) => {
+    const signing = keypair();
+    const path = statePath();
+    const fp = collectFingerprint(PRODUCT);
+    const store = new StateStore(path, PRODUCT, stateKeyMaterial(fp));
+    store.save({
+      licenseKeyHash: hashLicenseKey("old-online-key"), activationSecret: "old-online-secret",
+      machineId: "old-online-machine", fingerprint: fp.composite, validation: "old-online-cache",
+      releaseSeqHighWater: 7,
+    });
+    const fetch = vi.fn(deadNetwork);
+    const options = { statePath: path, publicKey: signing.pubB64, fetch };
+    const talos = client(options);
+    const claims = binding === "portable" ? portableClaims() : offlineClaims(
+      requestPayload(talos.createOfflineRequest())["machine_pubkey"] as string,
+      { binding: "machine" },
+    );
+    expect((await talos.loadOfflineLicense(licenseFile(mint(signing.privateKey, "offline", claims)))).isValid).toBe(true);
+    expect((await talos.validate()).isValid).toBe(true);
+    expect((await client(options).validate()).isValid).toBe(true);
+    const saved = store.load()!;
+    expect(saved.activationSecret).toBe("");
+    expect(saved.licenseKeyHash).toBe("");
+    expect(saved.validation).toBeUndefined();
+    expect(saved.releaseSeqHighWater).toBe(7);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { binding: undefined }, { binding: "unknown" }, { binding: null },
+    { perpetual: undefined }, { perpetual: false }, { perpetual: "true" },
+    { exp: undefined }, { exp: "never" }, { exp: NOW() + 86_400 },
+    { lic: { features: {}, lic_exp: NOW() + 86_400 } },
+    { lic: { features: {} } },
+    { fph: null }, { mpk: null }, { mid: null },
+    { fid: undefined }, { fid: " " }, { sub: undefined }, { sub: "" },
+    { decision: undefined }, { decision: "revoked" },
+  ])("rejects malformed portable grants without erasing an online activation: %j", async (over) => {
+    const signing = keypair();
+    const path = statePath();
+    const fp = collectFingerprint(PRODUCT);
+    const store = new StateStore(path, PRODUCT, stateKeyMaterial(fp));
+    store.save({
+      licenseKeyHash: hashLicenseKey("old-online-key"), activationSecret: "old-online-secret",
+      machineId: "old-online-machine", fingerprint: fp.composite, validation: "old-online-cache",
+    });
+    const talos = client({ statePath: path, publicKey: signing.pubB64 });
+    const state = await talos.loadOfflineLicense(licenseFile(mint(
+      signing.privateKey, "offline", portableClaims(over),
+    )));
+    expect(state.isValid).toBe(false);
+    expect(store.load()?.activationSecret).toBe("old-online-secret");
+    expect(store.load()?.validation).toBe("old-online-cache");
+    expect(client({ statePath: path, publicKey: signing.pubB64 }).currentMachineId).toBe("old-online-machine");
+  });
+
+  it("verifies signature and product before accepting portable binding", async () => {
+    const signing = keypair();
+    const talos = client({ statePath: statePath(), publicKey: signing.pubB64 });
+    const original = mint(signing.privateKey, "offline", offlineClaims("machine-key"));
+    const parts = original.split(".");
+    parts[3] = b64url(Buffer.from(JSON.stringify(portableClaims())));
+    await expect(talos.loadOfflineLicense(licenseFile(parts.join(".")))).rejects.toThrow(/signature/i);
+    await expect(talos.loadOfflineLicense(licenseFile(mint(
+      signing.privateKey, "offline", portableClaims({ aud: "another-product" }),
+    )))).rejects.toThrow(/audience/i);
+    expect(talos.isActivated).toBe(false);
+  });
+
+  it.each(["activate", "validate", "heartbeat"] as const)(
+    "keeps an imported portable file when an older %s request completes",
+    async (operation) => {
+      for (const status of [200, 403]) {
+        const signing = keypair();
+        const file = statePath();
+        const fp = collectFingerprint(PRODUCT);
+        const store = new StateStore(file, PRODUCT, stateKeyMaterial(fp));
+        store.save({ licenseKeyHash: hashLicenseKey("old"), activationSecret: "old-secret",
+          machineId: "old-machine", fingerprint: fp.composite });
+        let entered!: () => void;
+        const started = new Promise<void>((resolve) => { entered = resolve; });
+        let complete!: (response: Response) => void;
+        let nonce: unknown;
+        const fetch: FetchLike = async (_url, init) => {
+          nonce = JSON.parse(String(init?.body))["nonce"];
+          entered();
+          return new Promise<Response>((resolve) => { complete = resolve; });
+        };
+        const options = { statePath: file, publicKey: signing.pubB64, fetch };
+        const talos = client(options);
+        const pending = operation === "activate" ? talos.activate("new-online-key")
+          : operation === "validate" ? talos.validate() : talos.heartbeat();
+        await started;
+        const portable = licenseFile(mint(signing.privateKey, "offline", portableClaims()));
+        expect((await talos.loadOfflineLicense(portable)).isValid).toBe(true);
+        const typ = operation === "activate" ? "activation" : operation === "validate" ? "validation" : "heartbeat";
+        const response = status === 403 ? { error: "license_revoked" } : {
+          [`${typ}_token`]: mint(signing.privateKey, typ, {
+            aud: PRODUCT, non: nonce, iat: NOW(), nbf: NOW() - 5, exp: NOW() + 600,
+            decision: "revoked", server_time: NOW(), lic: { features: {}, lic_exp: null },
+          }), activation_secret: "stale-online-secret", machine_id: "stale-machine",
+        };
+        complete(new Response(JSON.stringify(response), { status }));
+        expect(await pending).toMatchObject({ decision: "valid", isOffline: true });
+        expect(talos.current).toMatchObject({ decision: "valid", isOffline: true });
+        expect(store.load()?.activationSecret).toBe("");
+        expect((await client({ ...options, fetch: deadNetwork }).validate()).isValid).toBe(true);
+      }
+    },
+  );
+
+  it("does not restore a revoked signing key from an older embedded keyset", async () => {
+    const anchor = keypair(), old = keypair(), current = keypair();
+    const keyset = (signing: typeof old, iat: number): string => mint(anchor.privateKey, "keyset", {
+      aud: PRODUCT, iat, keys: [{ purpose: "license", pk: signing.pubB64 }],
+    });
+    const file = statePath();
+    const fp = collectFingerprint(PRODUCT);
+    const store = new StateStore(file, PRODUCT, stateKeyMaterial(fp));
+    const issuedAt = NOW();
+    const currentKeyset = keyset(current, issuedAt);
+    store.save({ activationSecret: "online-secret", licenseKeyHash: "old", machineId: "old",
+      fingerprint: fp.composite, keyset: currentKeyset });
+    const talos = client({ statePath: file, anchorPublicKey: anchor.pubB64 });
+    for (const replayedAt of [issuedAt - 1, issuedAt]) {
+      await expect(talos.loadOfflineLicense(licenseFile(
+        mint(old.privateKey, "offline", portableClaims()), keyset(old, replayedAt),
+      ))).rejects.toThrow(/signature/i);
+    }
+    expect(store.load()?.keyset).toBe(currentKeyset);
+    expect((await talos.loadOfflineLicense(licenseFile(
+      mint(current.privateKey, "offline", portableClaims()),
+    ))).isValid).toBe(true);
+    expect(store.load()?.keyset).toBe(currentKeyset);
+  });
+
+  it("rolls back an embedded keyset when its offline file is rejected", async () => {
+    const anchor = keypair(), current = keypair(), candidate = keypair();
+    const keyset = (signing: typeof current, iat: number): string => mint(anchor.privateKey, "keyset", {
+      aud: PRODUCT, iat, keys: [{ purpose: "license", pk: signing.pubB64 }],
+    });
+    const file = statePath();
+    const fp = collectFingerprint(PRODUCT);
+    const store = new StateStore(file, PRODUCT, stateKeyMaterial(fp));
+    const currentKeyset = keyset(current, NOW() - 60);
+    store.save({ activationSecret: "online-secret", licenseKeyHash: "old", machineId: "old",
+      fingerprint: fp.composite, keyset: currentKeyset });
+    const talos = client({ statePath: file, anchorPublicKey: anchor.pubB64 });
+    expect((await talos.loadOfflineLicense(licenseFile(
+      mint(candidate.privateKey, "offline", portableClaims({ decision: "revoked" })), keyset(candidate, NOW()),
+    ))).isValid).toBe(false);
+    expect(store.load()?.activationSecret).toBe("online-secret");
+    expect((await talos.loadOfflineLicense(licenseFile(
+      mint(current.privateKey, "offline", portableClaims()),
+    ))).isValid).toBe(true);
+    expect(store.load()?.keyset).toBe(currentKeyset);
+  });
+
+  it("ignores an older in-flight refresh even when its response has a later keyset", async () => {
+    const anchor = keypair(), online = keypair(), portable = keypair(), later = keypair();
+    const keyset = (signing: typeof online, iat: number): string => mint(anchor.privateKey, "keyset", {
+      aud: PRODUCT, iat, keys: [{ purpose: "license", pk: signing.pubB64 }],
+    });
+    const file = statePath(), issuedAt = NOW();
+    const fp = collectFingerprint(PRODUCT);
+    const store = new StateStore(file, PRODUCT, stateKeyMaterial(fp));
+    store.save({ activationSecret: "online-secret", licenseKeyHash: "old", machineId: "old",
+      fingerprint: fp.composite, keyset: keyset(online, issuedAt - 60) });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let complete!: (response: Response) => void;
+    const fetch: FetchLike = async () => { entered(); return new Promise<Response>((resolve) => { complete = resolve; }); };
+    const options = { statePath: file, anchorPublicKey: anchor.pubB64, fetch };
+    const talos = client(options);
+    const pending = talos.refreshKeyset();
+    await started;
+    const portableKeyset = keyset(portable, issuedAt);
+    expect((await talos.loadOfflineLicense(licenseFile(
+      mint(portable.privateKey, "offline", portableClaims()), portableKeyset,
+    ))).isValid).toBe(true);
+    complete(new Response(JSON.stringify({ keyset: keyset(later, issuedAt + 60) }), { status: 200 }));
+    await pending;
+    expect((await talos.validate()).isValid).toBe(true);
+    expect(store.load()?.keyset).toBe(portableKeyset);
+    expect((await client({ ...options, fetch: deadNetwork }).validate()).isValid).toBe(true);
   });
 
   it.each([
