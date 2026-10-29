@@ -1015,6 +1015,16 @@ namespace Talos.Sdk
             }
 
             long? exp = Num(claims, "exp");
+            // Null deadlines require an explicit signed opt-in, including a
+            // licence with no business expiry. Missing/malformed fields fail closed.
+            bool perpetual = claims.TryGetProperty("perpetual", out var forever)
+                && forever.ValueKind == JsonValueKind.True
+                && claims.TryGetProperty("exp", out var fileExpiry)
+                && fileExpiry.ValueKind == JsonValueKind.Null
+                && claims.TryGetProperty("lic", out var licence)
+                && licence.ValueKind == JsonValueKind.Object
+                && licence.TryGetProperty("lic_exp", out var licenceExpiry)
+                && licenceExpiry.ValueKind == JsonValueKind.Null;
             LicenseState state = StateFromClaims(claims, "valid", true);
             // No cadence to return to; the file's own horizon is the window.
             state.RevalidateAfter = null;
@@ -1034,12 +1044,11 @@ namespace Talos.Sdk
             AdvanceClock(claims);
             _store?.Save(b);
 
-            // The file's own horizon, which is the whole enforcement: there is no
-            // server to re-ask, so this deadline is the only thing that ever ends
-            // it. Distinct from `expired`, which is the *licence* ending — the
+            // Bounded files end at their horizon; explicit perpetual files need
+            // no renewal. Distinct from `expired`, which is the *licence* ending — the
             // remedies differ (a new file versus a renewal) and the app should be
             // able to say which one to ask for.
-            if (exp == null || now > exp.Value) state.Decision = "offline_file_expired";
+            if (!perpetual && (exp == null || now > exp.Value)) state.Decision = "offline_file_expired";
             else if (state.LicenseExpiresAt != null && now > state.LicenseExpiresAt.Value)
                 state.Decision = "expired";
             return Adopt(state);

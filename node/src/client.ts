@@ -1041,6 +1041,10 @@ export class TalosClient {
     const features = (lic["features"] ?? {}) as Record<string, unknown>;
     const licExp = num(lic["lic_exp"]);
     const exp = num(claims["exp"]);
+    // No expiry is intentional only when the signer explicitly authorizes it
+    // and both the file and its underlying licence carry JSON null deadlines.
+    const perpetual = claims["perpetual"] === true
+      && claims["exp"] === null && lic["lic_exp"] === null;
 
     // Persist before deciding: the file is this machine's, so it is worth
     // keeping even when today's answer is "expired" — the licence may be
@@ -1058,12 +1062,12 @@ export class TalosClient {
     this.advanceClock(claims);
     this.store?.save(this.binding);
 
-    // The file's own horizon, which is the whole enforcement: there is no
-    // server to re-ask, so this deadline is the only thing that ever ends it.
+    // Bounded files end at their own horizon. Explicit perpetual files need no
+    // renewal; an omitted or malformed deadline still fails closed.
     // Distinct from `expired`, which is the *licence* ending — the remedies are
     // different (a new file versus a renewal) and the app should be able to say
     // which one to ask for.
-    if (exp === null || now > exp) {
+    if (!perpetual && (exp === null || now > exp)) {
       return this.adopt(
         new LicenseState("offline_file_expired", features, licExp, true, null, exp),
       );

@@ -174,6 +174,13 @@ state file; the returned file is bound to it and to the fingerprint. Everything
 is verified locally — the keyset travels inside the file — and later starts need
 nothing: `validate()` re-checks the stored file and `is_activated()` is true.
 
+For trusted users, a perpetual policy can opt into permanent offline files with
+`offline_checkout_max_days: 0`. The signed file carries `perpetual: true` and
+explicit null file and licence expiries. It needs no renewal or connection;
+`grace_until` and `license_expires_at` are `None`. Import it using the same calls
+above. Older SDK versions reject these files and must be upgraded. Permanent
+files cannot be recalled, and hardware changes still require a new request.
+
 `load_offline_license` fails only for a file that is not a licence. One that
 cannot license this machine comes back as a verdict: `MachineMismatch`,
 `OfflineFileExpired` (get a new file), `Expired` (renew), `ClockTampered`.

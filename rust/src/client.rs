@@ -1846,6 +1846,11 @@ impl Inner {
             .unwrap_or_default();
         let lic_exp = number(lic.get("lic_exp"));
         let exp = number(claims.get("exp"));
+        // No deadline is intentional only with a signed opt-in and explicit
+        // JSON null for both the file and the licence's business expiry.
+        let perpetual = claims.get("perpetual") == Some(&Value::Bool(true))
+            && claims.get("exp") == Some(&Value::Null)
+            && lic.get("lic_exp") == Some(&Value::Null);
 
         // Kept even when today's answer is "expired": the file is this
         // machine's, and the app can say which file it is holding.
@@ -1866,10 +1871,10 @@ impl Inner {
         self.save(&m);
         drop(m);
 
-        // The file's own horizon is the whole enforcement: no server will ever
-        // be asked again. Distinct from `Expired`, which is the licence ending —
+        // Bounded files end at their horizon; explicit perpetual files need no
+        // renewal. Distinct from `Expired`, which is the licence ending —
         // a new file versus a renewal.
-        let decision = if exp.is_none_or(|e| now > e) {
+        let decision = if !perpetual && exp.is_none_or(|e| now > e) {
             Decision::OfflineFileExpired
         } else if lic_exp.is_some_and(|e| now > e) {
             Decision::Expired

@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { TalosClient, type FetchLike, type TalosOptions } from "../src/client.js";
 import { collectFingerprint } from "../src/fingerprint.js";
@@ -179,6 +179,47 @@ describe("loading an offline licence file", () => {
     const state = await restarted.validate();
     expect(state.decision).toBe("valid");
     expect(state.isOffline).toBe(true);
+  });
+
+  it("keeps an explicitly perpetual file valid across decades and offline restarts", async () => {
+    const fetch = vi.fn(deadNetwork);
+    const { talos, mpk, file, licenseKey, pubB64 } = requested({ fetch });
+    const state = await talos.loadOfflineLicense(licenseFile(mint(
+      licenseKey, "offline", offlineClaims(mpk, { exp: null, perpetual: true }),
+    )));
+    expect(state.isValid).toBe(true);
+    expect(state.graceUntil).toBeNull();
+    expect(state.licenseExpiresAt).toBeNull();
+    const future = Date.now() + 80 * 365 * 86_400_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(future);
+    try {
+      const restarted = client({ statePath: file, publicKey: pubB64, fetch });
+      const verdict = await restarted.validate();
+      expect(verdict.isValid).toBe(true);
+      expect(verdict.isOffline).toBe(true);
+      expect(verdict.isFeatureEnabled("pro")).toBe(true);
+      expect(verdict.graceUntil).toBeNull();
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each([
+    { exp: null },
+    { exp: undefined, perpetual: true },
+    { exp: "never", perpetual: true },
+    { exp: null, perpetual: "true" },
+    { exp: null, perpetual: true, lic: { features: {}, lic_exp: NOW() + 86_400 } },
+    { exp: null, perpetual: true, lic: { features: {} } },
+    { exp: NOW() - 1, perpetual: true },
+  ])("fails closed for an invalid perpetual file: %j", async (over) => {
+    const { talos, mpk, licenseKey } = requested();
+    const state = await talos.loadOfflineLicense(licenseFile(mint(
+      licenseKey, "offline", offlineClaims(mpk, over),
+    )));
+    expect(state.decision).toBe("offline_file_expired");
+    expect(state.isValid).toBe(false);
   });
 
   it("refuses a file cut for another machine's fingerprint", async () => {

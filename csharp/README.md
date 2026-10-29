@@ -281,6 +281,12 @@ so an anchor-only pin still works with no server to fetch one from. The verdict
 is kept, so later starts need nothing — `ValidateAsync()` re-checks the stored
 file instead of reaching for the network, and `IsActivated` is true.
 
+For trusted users, a perpetual policy can opt into permanent offline files with
+`offline_checkout_max_days: 0`. The issued file has a signed `perpetual: true`
+and explicit null file and licence expiries. It needs no renewal or server
+connection; `GraceUntil` and `LicenseExpiresAt` are null. Import it using the
+same calls above. Older SDK versions reject these files and must be upgraded.
+
 `LoadOfflineLicenseAsync` **throws** only for a file that is not a licence:
 unreadable, not one of ours, addressed to another product, or a signature that
 does not verify. A file that is one but cannot license this machine comes back as
@@ -296,7 +302,7 @@ receipt changes nothing.
 Two things to know before you offer this to customers. A file **cannot be
 recalled** — revoking it in the portal frees the seat so you can issue to a
 replacement machine, but the machine holding it keeps working until the file's
-own expiry, which is why the policy's horizon is short. And hardware changes are
+own expiry, or indefinitely for a permanent file. And hardware changes are
 not forgiven offline: the drift matcher lives on the server, so a replaced disk
 means `machine_mismatch` and a new request.
 

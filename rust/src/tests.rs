@@ -298,19 +298,27 @@ impl Server {
         horizon: i64,
         fph_override: Option<&str>,
     ) -> Vec<u8> {
+        self.issue_offline_with(request, horizon, fph_override, |_| {})
+    }
+
+    fn issue_offline_with(
+        &self,
+        request: &SignedDoc,
+        horizon: i64,
+        fph_override: Option<&str>,
+        tweak: impl FnOnce(&mut Value),
+    ) -> Vec<u8> {
         let payload: Value = serde_json::from_slice(&B64URL.decode(&request.req).unwrap()).unwrap();
         let now = self.now();
-        let token = mint(
-            &self.license,
-            "offline",
-            &json!({
-                "v": 1, "typ": "offline", "aud": TOKEN, "iat": now, "nbf": now, "exp": now + horizon,
-                "server_time": now, "decision": "valid", "fid": "file-1", "mid": "machine-air",
-                "fph": fph_override.map_or(payload["fingerprint"]["composite"].clone(), |f| json!(f)),
-                "mpk": payload["machine_pubkey"],
-                "lic": {"features": {"pro": true}, "lic_exp": null},
-            }),
-        );
+        let mut claims = json!({
+            "v": 1, "typ": "offline", "aud": TOKEN, "iat": now, "nbf": now, "exp": now + horizon,
+            "server_time": now, "decision": "valid", "fid": "file-1", "mid": "machine-air",
+            "fph": fph_override.map_or(payload["fingerprint"]["composite"].clone(), |f| json!(f)),
+            "mpk": payload["machine_pubkey"],
+            "lic": {"features": {"pro": true}, "lic_exp": null},
+        });
+        tweak(&mut claims);
+        let token = mint(&self.license, "offline", &claims);
         serde_json::to_vec(
             &json!({"kind": LICENSE_FILE_KIND, "token": token, "keyset": self.keyset()}),
         )
@@ -906,6 +914,72 @@ fn an_air_gapped_machine_licenses_itself_from_a_file() {
     assert!(!restarted.is_activated());
     assert!(!f.client().is_activated());
     assert!(restarted.create_offline_deactivation().is_err());
+}
+
+#[test]
+fn perpetual_offline_files_survive_decades_and_restarts_without_network() {
+    let f = Fixture::new();
+    f.offline(true);
+    let talos = f.client();
+    let request = talos.create_offline_request(None).unwrap();
+    let file = f.server.issue_offline_with(&request, 86400, None, |c| {
+        c["exp"] = Value::Null;
+        c["perpetual"] = json!(true);
+    });
+    let state = talos.load_offline_license(&file).unwrap();
+    assert!(state.is_valid() && state.is_offline);
+    assert_eq!(state.grace_until, None);
+    assert_eq!(state.license_expires_at, None);
+
+    f.advance(80 * 365 * 86400);
+    let restarted = f.client();
+    let state = restarted.validate().unwrap();
+    assert!(state.is_valid() && state.is_offline);
+    assert_eq!(state.grace_until, None);
+    assert!(state.is_feature_enabled("pro"));
+    assert!(f.server.with(|s| s.calls.is_empty()));
+}
+
+#[test]
+fn invalid_perpetual_offline_files_fail_closed() {
+    for problem in [
+        "missing_flag",
+        "missing_exp",
+        "malformed_exp",
+        "malformed_flag",
+        "business_expiry",
+        "missing_business_expiry",
+        "bounded_expired",
+    ] {
+        let f = Fixture::new();
+        let talos = f.client();
+        let request = talos.create_offline_request(None).unwrap();
+        let file = f.server.issue_offline_with(&request, 86400, None, |c| {
+            c["exp"] = Value::Null;
+            c["perpetual"] = json!(true);
+            match problem {
+                "missing_flag" => {
+                    c.as_object_mut().unwrap().remove("perpetual");
+                }
+                "missing_exp" => {
+                    c.as_object_mut().unwrap().remove("exp");
+                }
+                "malformed_exp" => c["exp"] = json!("never"),
+                "malformed_flag" => c["perpetual"] = json!("true"),
+                "business_expiry" => c["lic"]["lic_exp"] = json!(T0 + 86400),
+                "missing_business_expiry" => {
+                    c["lic"].as_object_mut().unwrap().remove("lic_exp");
+                }
+                "bounded_expired" => c["exp"] = json!(T0 - 1),
+                _ => unreachable!(),
+            }
+        });
+        assert_eq!(
+            talos.load_offline_license(&file).unwrap().decision,
+            Decision::OfflineFileExpired,
+            "{problem}"
+        );
+    }
 }
 
 #[test]

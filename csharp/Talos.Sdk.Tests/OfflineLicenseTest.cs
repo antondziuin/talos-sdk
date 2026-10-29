@@ -118,13 +118,17 @@ namespace Talos.Sdk.Tests
         /// <summary>A network that is simply not there — which is the whole point.</summary>
         private sealed class Dead : HttpMessageHandler
         {
+            public int Calls { get; private set; }
             protected override Task<HttpResponseMessage> SendAsync(
                 HttpRequestMessage request, System.Threading.CancellationToken ct)
-                => throw new HttpRequestException("ENOTFOUND");
+            {
+                Calls++;
+                throw new HttpRequestException("ENOTFOUND");
+            }
         }
 
         private static TalosClient Client(
-            string statePath, string? publicKey = null, string? anchor = null) =>
+            string statePath, string? publicKey = null, string? anchor = null, Dead? network = null) =>
             new TalosClient(new TalosOptions
             {
                 ProductToken = Product,
@@ -132,7 +136,7 @@ namespace Talos.Sdk.Tests
                 AnchorPublicKey = anchor,
                 ServerUrl = "http://127.0.0.1:1",
                 StatePath = statePath,
-                HttpClient = new HttpClient(new Dead()),
+                HttpClient = new HttpClient(network ?? new Dead()),
             });
 
         private static JsonElement PayloadOf(OfflineDocument doc)
@@ -251,6 +255,73 @@ namespace Talos.Sdk.Tests
             LicenseState verdict = await restarted.ValidateAsync();
             Assert.Equal("valid", verdict.Decision);
             Assert.True(verdict.IsOffline);
+        }
+
+        [Fact]
+        public async Task ExplicitlyPerpetualFilesSurviveDecadesAndOfflineRestarts()
+        {
+            var (pub, key) = Keypair();
+            string path = TempFile("state.bin");
+            var network = new Dead();
+            TalosClient talos = Client(path, publicKey: pub, network: network);
+            string mpk = PayloadOf(talos.CreateOfflineRequest())
+                .GetProperty("machine_pubkey").GetString()!;
+            long issued = Now() - 80L * 365 * 86_400;
+            LicenseState state = await talos.LoadOfflineLicenseAsync(LicenseFile(Mint(
+                key, "offline", OfflineJson(mpk, c =>
+                {
+                    c["iat"] = issued;
+                    c["nbf"] = issued;
+                    c["server_time"] = issued;
+                    c["exp"] = null;
+                    c["perpetual"] = true;
+                }))));
+            Assert.True(state.IsValid);
+            Assert.Null(state.GraceUntil);
+            Assert.Null(state.LicenseExpiresAt);
+
+            TalosClient restarted = Client(path, publicKey: pub, network: network);
+            LicenseState verdict = await restarted.ValidateAsync();
+            Assert.True(verdict.IsValid);
+            Assert.True(verdict.IsOffline);
+            Assert.True(verdict.IsFeatureEnabled("pro"));
+            Assert.Null(verdict.GraceUntil);
+            Assert.Equal(0, network.Calls);
+        }
+
+        [Theory]
+        [InlineData("missing_flag")]
+        [InlineData("missing_exp")]
+        [InlineData("malformed_exp")]
+        [InlineData("malformed_flag")]
+        [InlineData("business_expiry")]
+        [InlineData("missing_business_expiry")]
+        [InlineData("bounded_expired")]
+        public async Task InvalidPerpetualFilesFailClosed(string problem)
+        {
+            var (talos, mpk, _, key) = Requested();
+            LicenseState state = await talos.LoadOfflineLicenseAsync(LicenseFile(Mint(
+                key, "offline", OfflineJson(mpk, c =>
+                {
+                    c["exp"] = null;
+                    c["perpetual"] = true;
+                    switch (problem)
+                    {
+                        case "missing_flag": c.Remove("perpetual"); break;
+                        case "missing_exp": c.Remove("exp"); break;
+                        case "malformed_exp": c["exp"] = "never"; break;
+                        case "malformed_flag": c["perpetual"] = "true"; break;
+                        case "business_expiry":
+                            c["lic"] = new Dictionary<string, object?> { ["lic_exp"] = Now() + 86_400 };
+                            break;
+                        case "missing_business_expiry":
+                            c["lic"] = new Dictionary<string, object?>();
+                            break;
+                        case "bounded_expired": c["exp"] = Now() - 1; break;
+                    }
+                }))));
+            Assert.Equal("offline_file_expired", state.Decision);
+            Assert.False(state.IsValid);
         }
 
         [Fact]
