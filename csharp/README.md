@@ -1,5 +1,97 @@
 # Talos.Sdk (C#)
 
+## Direct on-chain registry
+
+### License code activation
+
+For an automatically published policy, configure the trusted activation service
+and public product token, then accept a code through the application's input UI:
+
+```csharp
+using var client = new RegistryLicenseClient(new RegistryLicenseOptions {
+    Issuer = PINNED_ISSUER, ProductId = PINNED_PRODUCT_ID,
+    ChainId = 11155111, Contract = PINNED_REGISTRY,
+    RpcUrls = new[] { TRUSTED_RPC }, StatePath = DEVICE_STATE_PATH,
+    ActivationUrl = TRUSTED_TALOS_BASE_URL, ProductToken = PRODUCT_PUBLIC_TOKEN
+});
+if (client.IsActivated) await client.RequireValidLicenseAsync();
+else if (client.HasPendingActivation) await client.ResumeActivationAsync();
+else await client.ActivateAsync(codeEnteredInApplication,
+    new RegistryActivationOptions {
+        Timeout = TimeSpan.FromMinutes(2),
+        OnProgress = progress => ShowActivationProgress(progress.Status)
+    }, cancellationToken);
+```
+
+The client uses its own encrypted Ed25519 device identity. It never requests a
+customer wallet or sends an Ethereum transaction; publication is arranged and paid
+for by the publisher. Activation returns only after ready plus fresh RPC validity.
+The code is not persisted or included in status polls. Public manifests and pending
+activation IDs survive restart, cancellation and timeout. `IsActivated` means a
+manifest is present, not that it authorizes work. Recheck before protected operations.
+After activation, runtime validation uses RPC independently of Talos availability.
+
+Registry mode explicitly supports Base Mainnet (`8453`), Ethereum Sepolia
+(`11155111`), and local Anvil (`31337`). Pin a deployed contract and trusted RPCs
+for the selected chain; never reuse a Sepolia address on Base. Base publication
+waits for the L1 `safe` head, so activation defaults to ten minutes on Base and
+two minutes elsewhere. An explicit timeout overrides that default; show pending
+progress and resume saved activation after a timeout instead of issuing a new code.
+Runtime checks read the latest head for prompt revocations.
+
+The deployed Base `TalosLicenseRegistryV1` is
+[`0xf6ea444a6b152ed6c8b63d53a38bb9921ab95c0c`](https://basescan.org/address/0xf6ea444a6b152ed6c8b63d53a38bb9921ab95c0c),
+chain `8453` ([deployment transaction](https://basescan.org/tx/0xf95fa58e134f1855cdbc0e1b18cdefdd0752625cdb5689cf4fbdf5be9a077363)).
+Issuer and product pins still come from the publisher's integration configuration.
+
+The encrypted device state also records the highest checked block number/hash and
+license revision, including authoritative refusals. A provider one block behind
+may receive one one-second retry, or the next pinned RPC is tried. Access is never
+authorized at a lower head. A changed canonical hash can recover only at the known
+height or higher, after a fresh canonical recheck and a nondecreasing license
+revision. Conflicting state fails closed (`registry_reorg_conflict`); an observed
+terminal revocation cannot become active again through a reorg or restart. RPC
+trust and bounded freshness still apply; this is not a consensus or light client.
+
+If a status poll returns `activation_not_found`, the SDK clears only the pending
+activation ID and rethrows that error. After restart, the app can ask for a valid
+new code using the same encrypted device identity. Temporary service/RPC failures
+keep the saved job resumable; they do not trigger another code claim.
+
+### Manual holder binding
+
+The separate `RegistryLicenseClient` checks `TalosLicenseRegistryV1` directly
+through trusted Ethereum RPC providers. It does not contact Talos or a coordinator.
+
+```csharp
+using var registry = new RegistryLicenseClient(new RegistryLicenseOptions {
+    Issuer = PINNED_ISSUER, ProductId = PINNED_PRODUCT_ID,
+    ChainId = 11155111, Contract = PINNED_REGISTRY,
+    RpcUrls = new[] { TRUSTED_SEPOLIA_RPC }, StatePath = DEVICE_STATE_PATH
+});
+registry.ImportLicense(publicManifestJson);
+// First use: the holder's wallet sends registry.CreateDeviceBinding().
+// Wait for a successful receipt, then check before each bounded protected operation.
+await registry.RequireValidLicenseAsync();
+var pro = await registry.GetEntitlementAsync("pro");
+```
+
+Pin trust anchors independently of the public manifest. Each validation or
+entitlement lookup reads fresh chain state and checks holder, device, permissions
+hash, expiry, registry version and a block age of at most five minutes. Transient
+RPC failures may use another configured provider; authoritative invalidity cannot.
+All providers unavailable means access is denied. There is no offline permit cache.
+RPC providers remain trusted; these reads are not independent blockchain proofs.
+
+The generated device key uses the existing encrypted state store. Losing it needs
+a new holder-wallet binding; one registered key is active per license. Issuance,
+binding, renewal and revocation are wallet transactions requiring gas; validation
+uses read-only `eth_call`. Use public test data, never keys, personal information,
+or secrets in manifests or chain transactions. A modified client or cloned device
+key can still bypass local software checks.
+
+## Standard Talos licensing
+
 Talos SDK for C# and .NET applications. Activate and validate licenses, read
 feature entitlements, manage floating seats, and download signed software
 updates. Supports offline grace periods and license files for air-gapped machines.

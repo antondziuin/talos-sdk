@@ -149,6 +149,12 @@ namespace Talos.Sdk
 
         /// <summary>The last verified <c>typ=offline</c> licence file.</summary>
         public string? OfflineToken { get; set; }
+        /// <summary>Public registry manifest; never an authorization cache or a customer code.</summary>
+        public string? RegistryManifest { get; set; }
+        /// <summary>Public identifier for a device-authenticated pending activation.</summary>
+        public string? RegistryActivationId { get; set; }
+        /// <summary>Public canonical head and revision/revocation observations; not an offline permit.</summary>
+        public string? RegistryChainState { get; set; }
 
         /// <summary>
         /// The highest <b>local</b> clock ever seen while running on an offline
@@ -401,6 +407,9 @@ namespace Talos.Sdk
                     MachinePublicKey =
                         Str(root, "machinePublicKey") is { Length: > 0 } mp ? mp : null,
                     OfflineToken = Str(root, "offlineToken") is { Length: > 0 } ot ? ot : null,
+                    RegistryManifest = Str(root, "registryManifest") is { Length: > 0 } rm && rm.Length <= 65536 ? rm : null,
+                    RegistryActivationId = Str(root, "registryActivationId") is { Length: > 0 } ra && ra.Length <= 36 ? ra : null,
+                    RegistryChainState = Str(root, "registryChainState") is { Length: > 0 } rc ? rc : null,
                     OfflineSeen =
                         root.TryGetProperty("offlineSeen", out var os)
                         && os.ValueKind == JsonValueKind.Number
@@ -451,6 +460,9 @@ namespace Talos.Sdk
                         MachineKey = b.MachineKey,
                         MachinePublicKey = b.MachinePublicKey,
                         OfflineToken = b.OfflineToken,
+                        RegistryManifest = b.RegistryManifest,
+                        RegistryActivationId = b.RegistryActivationId,
+                        RegistryChainState = b.RegistryChainState,
                         OfflineSeen = b.OfflineSeen,
                     },
                     StateJson.Default.StateFileDto);
@@ -555,6 +567,9 @@ namespace Talos.Sdk
         public string? MachineKey { get; set; }
         public string? MachinePublicKey { get; set; }
         public string? OfflineToken { get; set; }
+        public string? RegistryManifest { get; set; }
+        public string? RegistryActivationId { get; set; }
+        public string? RegistryChainState { get; set; }
         public long OfflineSeen { get; set; }
     }
 

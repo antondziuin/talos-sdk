@@ -40,6 +40,8 @@ import {
 export * from "./protocol.js";
 export * from "./device-protocol.js";
 export * from "./device-client.js";
+export * from "./registry-protocol.js";
+export * from "./registry-client.js";
 
 export interface WalletOptions extends Trust {
   statePath?: string;

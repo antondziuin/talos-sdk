@@ -40,19 +40,25 @@ public class DeviceClientTest
             var verify=new Ed25519Signer();verify.Init(false,new Ed25519PublicKeyParameters(Bytes(key,32),0));var text=Encoding.UTF8.GetBytes("talos-wallet.2.proof."+b["challenge"]!["payload"]!.GetValue<string>());verify.BlockUpdate(text,0,text.Length);Assert.True(verify.VerifySignature(Bytes(b["proof"]!.GetValue<string>(),64)));
             if(Bound!=null&&Bound!=key)return new HttpResponseMessage(HttpStatusCode.Conflict){Content=new StringContent("{}")};Bound=key;
             var node=JsonNode.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory,"device-contract-vectors.json")))!["certificate"]!;
+            node["chain_id"]=Trust.ChainId;
             node["license"]!["device_key"]=key;node["license"]!["fingerprint_hash"]=fp;node["license"]!["not_before"]=now;node["license"]!["expires_at"]=now+Duration;
             node["signature"]=WalletSessionTest.Sign(1,DeviceProtocol.CertificateDigest(new DeviceCertificate(node.ToJsonString())),s=>{if(!DeviceProtocol.Eq(Recover(DeviceProtocol.CertificateDigest(new DeviceCertificate(node.ToJsonString())),s),Trust.Issuer))throw new ArgumentException();});
             if(Invalid)node["license"]!["expires_at"]=now+999999;
             Renewals++;return new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(node.ToJsonString())};
         }
     }
-    [Fact]
-    public async Task FirstActivationOfflineRestartCopyAndFailedRenewal()
+    [Theory]
+    [InlineData(84532L)]
+    [InlineData(11155111L)]
+    public async Task FirstActivationOfflineRestartCopyAndFailedRenewal(long chainId)
     {
         string directory=Path.Combine(Path.GetTempPath(),"talos-device-cs-"+Guid.NewGuid());
         try {
             var raw=JsonNode.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory,"device-contract-vectors.json")))!;
-            var e=new DeviceEnrollment(raw["enrollment"]!.ToJsonString());var options=new WalletOptions{Issuer=e.Context.Issuer,ProductId=Str(e.Context.License,"product_id"),ChainId=84532,Contract=Str(e.Root,"contract"),StatePath=Path.Combine(directory,"state"),FingerprintComponents=new Dictionary<string,string>{{"test","one"}}};
+            var enrollment=raw["enrollment"]!;enrollment["chain_id"]=chainId;
+            string digest=DeviceProtocol.EnrollmentDigest(new DeviceEnrollment(enrollment.ToJsonString()));
+            enrollment["signature"]=WalletSessionTest.Sign(1,digest,s=>{if(!DeviceProtocol.Eq(Recover(digest,s),enrollment["issuer"]!.GetValue<string>()))throw new ArgumentException();});
+            var e=new DeviceEnrollment(enrollment.ToJsonString());var options=new WalletOptions{Issuer=e.Context.Issuer,ProductId=Str(e.Context.License,"product_id"),ChainId=chainId,Contract=Str(e.Root,"contract"),StatePath=Path.Combine(directory,"state"),FingerprintComponents=new Dictionary<string,string>{{"test","one"}}};
             using var handler=new IssuerHandler{Trust=options};using var http=new HttpClient(handler);
             using(var c=new DeviceLicenseClient(options,http)){
                 c.ImportEnrollment(e.Json);c.AcceptDeviceAuthorization(WalletSessionTest.Sign(2,DeviceDigest(e.Context,c.DeviceKey,c.FingerprintHash),s=>VerifyDevice(e.Context,c.DeviceKey,c.FingerprintHash,s)));

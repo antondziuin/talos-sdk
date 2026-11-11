@@ -31,6 +31,28 @@ describe("state store", () => {
     expect(store.load()).toBeNull();
   });
 
+  it("preserves registry pending, manifest and chain observations through fresh state-store instances", () => {
+    const p = tmpFile();
+    const licenseId = `0x${"08".repeat(32)}`;
+    const fields = {
+      registryActivationId: "12345678-1234-4234-8234-123456789abc",
+      registryManifest: JSON.stringify({ v: 1, kind: "talos-registry-license", chain_id: 11155111,
+        contract: `0x${"05".repeat(20)}`, issuer: `0x${"01".repeat(20)}`, product_id: `0x${"07".repeat(32)}`,
+        license_id: licenseId, holder: `0x${"02".repeat(20)}`, entitlements: "eyJwcm8iOnRydWV9" }),
+      registryChainState: JSON.stringify({ v: 1, head: { number: "100", hash: `0x${"aa".repeat(32)}`, timestamp: 1800000000 },
+        licenses: { [licenseId]: { revision: 2, revoked: false } } }),
+    };
+    expect(new StateStore(p, "tpt_registry", "machine").save({ ...BINDING, ...fields })).toBe(true);
+    const restored = new StateStore(p, "tpt_registry", "machine").load()!;
+    expect(restored).toMatchObject(fields);
+    delete restored.registryActivationId;
+    expect(new StateStore(p, "tpt_registry", "machine").save(restored)).toBe(true);
+    const restarted = new StateStore(p, "tpt_registry", "machine").load()!;
+    expect(restarted.registryActivationId).toBeUndefined();
+    expect(restarted.registryManifest).toBe(fields.registryManifest);
+    expect(restarted.registryChainState).toBe(fields.registryChainState);
+  });
+
   it("does not write the licence key in the clear", () => {
     const p = tmpFile();
     new StateStore(p, "tpt_one", "km").save(BINDING);

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { createPublicKey, verify } from "node:crypto";
 import { afterEach, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
-import { hashTypedData, keccak256, toHex, type Hex } from "viem";
+import { encodeAbiParameters, hashTypedData, keccak256, toHex, type Hex } from "viem";
 import { DeviceLicenseClient } from "../src/device-client.js";
 import {
   consentContext,
@@ -44,11 +44,14 @@ afterEach(async () => {
   for (const c of clients.splice(0)) await c.stop();
   for (const p of paths.splice(0)) rmSync(p, { recursive: true, force: true });
 });
-async function setup() {
+async function setup(chainId = 84532, contract = vector.enrollment.contract, rpcUrl?: string, certificateTime?: number) {
+  const protocolTrust = { ...trust, chainId, contract };
   const directory = mkdtempSync(join(tmpdir(), "talos-device-"));
   paths.push(directory);
   const e: Enrollment = {
     ...vector.enrollment,
+    chain_id: chainId,
+    contract,
     issued_at: Math.floor(Date.now() / 1000),
   };
   e.signature = await issuer.signTypedData(enrollmentTypedData(e));
@@ -58,12 +61,13 @@ async function setup() {
     revoked = false,
     renewals = 0;
   const http = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (rpcUrl && String(input) === rpcUrl) return globalThis.fetch(input, init);
     if (offline) throw new Error("offline");
     if (revoked) return new Response("{}", { status: 409 });
     const body = JSON.parse(init!.body as string),
       now = Math.floor(Date.now() / 1000);
     if (String(input).endsWith("/challenge")) {
-      await verifyEnrollment(body.enrollment, trust);
+      await verifyEnrollment(body.enrollment, protocolTrust);
       await verifyDevice(consentContext(body.enrollment), body.device);
       const payload = Buffer.from(
         JSON.stringify({
@@ -106,25 +110,27 @@ async function setup() {
     bound = d.device_key;
     const c: DeviceCertificate = {
       ...vector.certificate,
+      chain_id: chainId,
+      contract,
       license: {
         ...vector.certificate.license,
         device_key: d.device_key,
         fingerprint_hash: d.fingerprint_hash,
         revision,
-        not_before: now,
-        expires_at: now + 604800,
+        not_before: certificateTime ?? now,
+        expires_at: (certificateTime ?? now) + 604800,
       },
     };
     c.signature = await issuer.signTypedData(deviceCertificateTypedData(c));
     renewals++;
     return Response.json(c);
-  }) as unknown as typeof fetch;
+  });
   const create = async (
     path = join(directory, "state"),
     fingerprint = "one",
   ) => {
     const c = await DeviceLicenseClient.create({
-      ...trust,
+      ...protocolTrust,
       statePath: path,
       fingerprintComponents: { test: fingerprint },
       fetch: http,
@@ -183,6 +189,59 @@ it("matches the Rust and Solidity device signature vectors and exact expiry", as
   await expect(
     verifyDeviceCertificate(tooLong, e, d, trust, c.license.not_before),
   ).rejects.toThrow();
+});
+it("activates and renews on Ethereum Sepolia, preserving pinned trust and RPC chain checks", async () => {
+  const s = await setup(11155111),
+    c = await s.create();
+  await s.authorize(c);
+  await c.start();
+  expect(c.canRun).toBe(true);
+  expect(c.getEntitlement("pro")).toBe(true);
+  const expiry = c.expiresAt!;
+  vi.spyOn(Date, "now").mockReturnValue(Date.now() + 86400000);
+  await c.refresh();
+  expect(c.expiresAt).toBeGreaterThan(expiry);
+  await expect(verifyEnrollment(s.e, trust)).rejects.toThrow("invalid_enrollment");
+
+  s.http.mockImplementationOnce(async () => Response.json({ jsonrpc: "2.0", id: 1, result: "0xaa36a7" }));
+  s.http.mockImplementationOnce(async () => Response.json({ jsonrpc: "2.0", id: 2, result: encodeAbiParameters([{ type: "bool" }], [true]) }));
+  await c.stop();
+  expect(await c.verifyViaContract("http://127.0.0.1:8545")).toBe(true);
+  expect(c.canRun).toBe(false);
+  const call = JSON.parse(s.http.mock.calls.at(-1)![1]!.body as string);
+  expect(call.method).toBe("eth_call");
+  expect(call.params[0].to).toBe(s.e.contract);
+
+  const before = s.http.mock.calls.length;
+  s.http.mockImplementationOnce(async () => Response.json({ jsonrpc: "2.0", id: 1, result: "0x1" }));
+  await expect(c.verifyViaContract("http://127.0.0.1:8545")).rejects.toThrow("wrong_rpc_chain");
+  expect(s.http.mock.calls.length - before).toBe(1);
+});
+it.each(["issuer", "contract", "product", "mainnet"])("rejects an enrollment outside the application's pinned %s", async (field) => {
+  const pinned = { ...trust };
+  if (field === "issuer") pinned.issuer = owner.address;
+  if (field === "contract") pinned.contract = owner.address;
+  if (field === "product") pinned.productId = uuidHash(vector.enrollment.tenant_id);
+  if (field === "mainnet") pinned.chainId = 1;
+  await expect(verifyEnrollment(vector.enrollment, pinned)).rejects.toThrow("invalid_enrollment");
+});
+it.each(["future", "revision", "device", "fingerprint", "holder", "entitlements"])("rejects a certificate with a mismatched %s", async (field) => {
+  const c: DeviceCertificate = structuredClone(vector.certificate);
+  if (field === "future") c.license.not_before++;
+  if (field === "revision") c.license.revision++;
+  if (field === "device") c.license.device_key = c.license.tenant_id;
+  if (field === "fingerprint") c.license.fingerprint_hash = c.license.tenant_id;
+  if (field === "holder") c.license.holder = issuer.address;
+  if (field === "entitlements") c.entitlements = Buffer.from('{"admin":true}').toString("base64url");
+  c.signature = await issuer.signTypedData(deviceCertificateTypedData(c));
+  await expect(verifyDeviceCertificate(c, vector.enrollment, vector.device, trust, vector.certificate.license.not_before)).rejects.toThrow();
+});
+it("rejects owner consent signed by a different wallet", async () => {
+  const s = await setup(), c = await s.create();
+  await c.importEnrollment(s.e);
+  await expect(c.acceptDeviceAuthorization(await issuer.signTypedData(c.createDeviceAuthorization()))).rejects.toThrow("invalid_wallet_signature");
+  expect(c.isDeviceAuthorized).toBe(false);
+  expect(c.canRun).toBe(false);
 });
 it("does not overwrite another process's renewed certificate on shutdown", async () => {
   const s = await setup(),
@@ -300,3 +359,27 @@ it("renews automatically after one day and retries after connectivity returns", 
   expect(c.expiresAt).toBeGreaterThan(expiry);
   expect(s.renewals()).toBe(2);
 });
+it.runIf(!!process.env.TALOS_WALLET_TEST_RPC && !!process.env.TALOS_WALLET_TEST_CONTRACT)(
+  "V2 eth_call verifies an issued device certificate without granting execution after stop",
+  async () => {
+    const rpc = process.env.TALOS_WALLET_TEST_RPC!;
+    // An idle local chain does not mine new timestamps. Sign a fixture valid at
+    // the latest block so this read-only check needs no extra transaction.
+    const response = await fetch(rpc, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getBlockByNumber", params: ["latest", false] }),
+    });
+    const block = await response.json();
+    expect(response.ok).toBe(true);
+    expect(block.error).toBeUndefined();
+    const s = await setup(31337, process.env.TALOS_WALLET_TEST_CONTRACT!, rpc, Number.parseInt(block.result.timestamp, 16));
+    const c = await s.create();
+    await s.authorize(c);
+    await c.start();
+    expect(await c.verifyViaContract(rpc)).toBe(true);
+    await c.stop();
+    expect(await c.verifyViaContract(rpc)).toBe(true);
+    expect(c.canRun).toBe(false);
+  },
+);

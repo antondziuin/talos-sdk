@@ -210,7 +210,7 @@ export async function verifyCertificate(
     c.issuer.toLowerCase() !== trust.issuer.toLowerCase() ||
     c.contract.toLowerCase() !== trust.contract.toLowerCase() ||
     c.chain_id !== trust.chainId ||
-    ![8453, 84532, 31337].includes(c.chain_id) ||
+    ![8453, 84532, 11155111, 31337].includes(c.chain_id) ||
     l.product_id.toLowerCase() !== trust.productId.toLowerCase() ||
     /^0x0+$/.test(c.contract) ||
     /^0x0+$/.test(l.holder) ||

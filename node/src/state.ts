@@ -136,6 +136,12 @@ export interface StoredBinding {
    * a clock its owner controls, and it is the price of offline.
    */
   offlineSeen?: number;
+  /** Public on-chain registry manifest; never a license code or an authorization cache. */
+  registryManifest?: string;
+  /** Public identifier of a device-authenticated activation job that can be resumed without a code. */
+  registryActivationId?: string;
+  /** Public canonical head and per-license revision/revocation observations; never an authorization cache. */
+  registryChainState?: string;
 }
 
 const MAGIC = Buffer.from("TLS1");
@@ -302,6 +308,9 @@ export class StateStore {
       }
       if (typeof o["offlineToken"] === "string") b.offlineToken = o["offlineToken"];
       if (typeof o["offlineSeen"] === "number") b.offlineSeen = o["offlineSeen"];
+      if (typeof o["registryManifest"] === "string" && o["registryManifest"].length <= 65536) b.registryManifest = o["registryManifest"];
+      if (typeof o["registryActivationId"] === "string" && o["registryActivationId"].length <= 36) b.registryActivationId = o["registryActivationId"];
+      if (typeof o["registryChainState"] === "string") b.registryChainState = o["registryChainState"];
       // What makes a binding worth keeping is that it holds a licence or the
       // identity behind one. The activation secret is that for an online
       // install; an air-gapped install has none — it was never issued one — and

@@ -187,7 +187,7 @@ export async function verifyEnrollment(
   if (
     e.issuer.toLowerCase() !== trust.issuer.toLowerCase() ||
     e.chain_id !== trust.chainId ||
-    ![8453, 84532, 31337].includes(e.chain_id) ||
+    ![8453, 84532, 11155111, 31337].includes(e.chain_id) ||
     e.contract.toLowerCase() !== trust.contract.toLowerCase() ||
     uuidHash(e.product_id) !== trust.productId.toLowerCase() ||
     /^0x0+$/.test(e.holder) ||

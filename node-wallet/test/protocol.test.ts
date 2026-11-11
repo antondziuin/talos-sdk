@@ -1,5 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
+import { privateKeyToAccount } from "viem/accounts";
+import { type Hex } from "viem";
 import {
   licenseTypedData,
   deviceTypedData,
@@ -71,5 +73,14 @@ describe("shared Solidity/Rust/SDK wallet protocol", () => {
     };
     expect(licenseRef(renewed)).toBe(licenseRef(c));
     await verifyDevice(renewed, d);
+  });
+  it("accepts a freshly signed Ethereum Sepolia certificate and refuses cross-chain replay", async () => {
+    const issuer = privateKeyToAccount(("0x" + "01".repeat(32)) as Hex);
+    const sepolia: Certificate = { ...c, chain_id: 11155111 };
+    sepolia.signature = await issuer.signTypedData(licenseTypedData(sepolia));
+    expect(await verifyCertificate(sepolia, { ...trust, chainId: 11155111 }, c.license.not_before)).toEqual({ pro: true });
+    await expect(verifyCertificate(sepolia, trust, c.license.not_before)).rejects.toThrow("invalid_certificate");
+    await expect(verifyCertificate({ ...sepolia, chain_id: 84532 }, trust, c.license.not_before)).rejects.toThrow("invalid_issuer_signature");
+    await expect(verifyCertificate({ ...sepolia, chain_id: 1 }, { ...trust, chainId: 1 }, c.license.not_before)).rejects.toThrow("invalid_certificate");
   });
 });

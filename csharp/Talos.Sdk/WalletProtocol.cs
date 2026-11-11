@@ -44,7 +44,7 @@ namespace Talos.Sdk
             Root = doc.RootElement.Clone();
         }
     }
-    /// <summary>Shared EIP-712 hashing and signature verification; compatible with Base's verifier.</summary>
+    /// <summary>Shared EIP-712 hashing and signature verification for the Talos verifier.</summary>
     public static class WalletProtocol
     {
         internal const string LicenseType = "License(bytes32 tenantId,bytes32 productId,bytes32 licenseId,address holder,uint64 notBefore,uint64 expiresAt,bytes32 entitlementsHash,bytes32 coordinatorKey,uint8 maxConcurrentDevices)";
@@ -80,7 +80,7 @@ namespace Talos.Sdk
         internal static byte[] Typed(WalletCertificate c, byte[] contents)
         {
             long chain = c.Root.GetProperty("chain_id").GetInt64();
-            if (chain != 8453 && chain != 84532 && chain != 31337) throw new ArgumentException("wrong_chain");
+            if (chain != 8453 && chain != 84532 && chain != 11155111 && chain != 31337) throw new ArgumentException("wrong_chain");
             var domain = Hash(Join(Hash("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"), Hash("TalosLicenseVerifier"), Hash("1"), Word(chain), Address(Str(c.Root, "contract"))));
             return Hash(Join(new byte[] { 0x19, 0x01 }, domain, contents));
         }
