@@ -60,6 +60,7 @@ async function setup(chainId = 84532, contract = vector.enrollment.contract, rpc
     revision = 1,
     revoked = false,
     renewals = 0;
+  let lastCertificate: DeviceCertificate | undefined;
   const http = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     if (rpcUrl && String(input) === rpcUrl) return globalThis.fetch(input, init);
     if (offline) throw new Error("offline");
@@ -108,6 +109,9 @@ async function setup(chainId = 84532, contract = vector.enrollment.contract, rpc
     )
       return new Response("{}", { status: 409 });
     bound = d.device_key;
+    // Shared Anvil tests can mine ahead of the host, while an idle chain can
+    // lag it. The certificate must already be valid against both clocks.
+    const notBefore = certificateTime === undefined ? now : Math.min(now, certificateTime);
     const c: DeviceCertificate = {
       ...vector.certificate,
       chain_id: chainId,
@@ -117,11 +121,12 @@ async function setup(chainId = 84532, contract = vector.enrollment.contract, rpc
         device_key: d.device_key,
         fingerprint_hash: d.fingerprint_hash,
         revision,
-        not_before: certificateTime ?? now,
-        expires_at: (certificateTime ?? now) + 604800,
+        not_before: notBefore,
+        expires_at: notBefore + 604800,
       },
     };
     c.signature = await issuer.signTypedData(deviceCertificateTypedData(c));
+    lastCertificate = c;
     renewals++;
     return Response.json(c);
   });
@@ -160,6 +165,7 @@ async function setup(chainId = 84532, contract = vector.enrollment.contract, rpc
       return next;
     },
     renewals: () => renewals,
+    certificate: () => lastCertificate!,
   };
 }
 it("matches the Rust and Solidity device signature vectors and exact expiry", async () => {
@@ -216,6 +222,18 @@ it("activates and renews on Ethereum Sepolia, preserving pinned trust and RPC ch
   s.http.mockImplementationOnce(async () => Response.json({ jsonrpc: "2.0", id: 1, result: "0x1" }));
   await expect(c.verifyViaContract("http://127.0.0.1:8545")).rejects.toThrow("wrong_rpc_chain");
   expect(s.http.mock.calls.length - before).toBe(1);
+});
+
+it.each([-120, 120])("keeps the read-only contract fixture valid for both host and chain clocks (block offset %ss)", async offset => {
+  const blockTime = Math.floor(Date.now() / 1000) + offset;
+  const s = await setup(31337, trust.contract, undefined, blockTime), c = await s.create();
+  await s.authorize(c); await c.start(); expect(c.canRun).toBe(true);
+  const certificate = s.certificate();
+  const authorization = { device_key: c.deviceKey, fingerprint_hash: c.fingerprintHash,
+    signature: await owner.signTypedData(c.createDeviceAuthorization()) };
+  expect(await verifyDeviceCertificate(certificate, s.e, authorization, { ...trust, chainId: 31337 }, blockTime)).toEqual({ pro: true });
+  expect(certificate.license.expires_at - certificate.license.not_before).toBe(604800);
+  await c.stop(); expect(c.canRun).toBe(false);
 });
 it.each(["issuer", "contract", "product", "mainnet"])("rejects an enrollment outside the application's pinned %s", async (field) => {
   const pinned = { ...trust };
@@ -363,8 +381,8 @@ it.runIf(!!process.env.TALOS_WALLET_TEST_RPC && !!process.env.TALOS_WALLET_TEST_
   "V2 eth_call verifies an issued device certificate without granting execution after stop",
   async () => {
     const rpc = process.env.TALOS_WALLET_TEST_RPC!;
-    // An idle local chain does not mine new timestamps. Sign a fixture valid at
-    // the latest block so this read-only check needs no extra transaction.
+    // Anchor to the block as well as the host clock: prior shared-chain tests
+    // may mine in the future, and an idle chain may be behind the host.
     const response = await fetch(rpc, {
       method: "POST",
       headers: { "content-type": "application/json" },
