@@ -42,6 +42,12 @@ trust anchors. They are not accepted from a customer manifest. Release the updat
 base Node SDK together with this wallet SDK so its state loader restores the new
 public registry fields. [Runnable code-entry application](../../examples/wallet-license/registry-code.mjs).
 
+The integration API uses snake_case: map `product_id` to `productId`,
+`chain_id` to `chainId`, and `product_token` to `productToken`. Supply
+`activationUrl` (base URL without `/v1/client/...`) and `rpcUrls` separately;
+they are not returned by that endpoint. See the
+[public configuration and RPC guidance](../README.md#direct-on-chain-registry).
+
 Registry mode explicitly supports Base Mainnet (`8453`), Ethereum Sepolia
 (`11155111`), and local Anvil (`31337`). Pin a deployed contract and trusted RPCs
 for the selected chain; never reuse a Sepolia address on Base. Base publication

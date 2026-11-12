@@ -70,6 +70,24 @@ runtime checks use direct RPC, with no ongoing Talos dependency. Configure trust
 `activationUrl` / `ActivationUrl` and `productToken` / `ProductToken` separately from
 the customer manifest. [Runnable Node application](../examples/wallet-license/README.md).
 
+The publisher fetches public policy fields from the authenticated portal endpoint
+`GET /v1/portal/products/{product}/wallet-registry-policies/{policy}/integration`.
+It returns `issuer`, `product_id`, `chain_id`, `contract`, `product_token` and
+`automatic_activation`; code-entry requires the last field to be `true`.
+The application supplies its trusted activation base URL and client RPC endpoints
+separately. SDKs append the activation/status paths to that base URL themselves.
+Public client settings never include publisher credentials or the worker's private
+RPC token. See the [configuration field table](rust/README.md#publisher-integration-configuration)
+and [client RPC availability guidance](rust/README.md#client-rpc-availability).
+
+Rust SDK 0.3.1 adds [transactional code replacement](rust/README.md#switching-to-another-license-code)
+without resetting device identity, and [signed public updates](rust/README.md#signed-updates-for-registry-applications)
+without classic activation. Registry policy creation supports license-lifetime
+updates or a separate paid maintenance period. Public update delivery is an
+explicit product opt-in; the SDK checks the signed release date against the
+on-chain update rights, including for manually installed builds. Node/C# Registry
+licensing remains supported; these new updater APIs are currently Rust-specific.
+
 ## Activation metadata
 
 Every SDK hashes fingerprint components with a product-scoped key before sending

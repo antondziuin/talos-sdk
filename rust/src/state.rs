@@ -75,8 +75,12 @@ pub(crate) struct StoredBinding {
     pub registry_activation_id: Option<String>,
     /// Public manifest, retained only after independent RPC validation.
     pub registry_manifest: Option<String>,
+    /// Resumable replacement job while the current public manifest is retained.
+    pub registry_replacement_id: Option<String>,
     /// Highest canonical head/revision observations and terminal revocation.
     pub registry_chain_state: Option<String>,
+    /// Separate public-update verifier state, scoped independently of licensing.
+    pub public_update_state: Option<String>,
 }
 
 impl StoredBinding {
@@ -107,7 +111,9 @@ impl StoredBinding {
             "offlineSeen": self.offline_seen,
             "registryActivationId": self.registry_activation_id,
             "registryManifest": self.registry_manifest,
+            "registryReplacementId": self.registry_replacement_id,
             "registryChainState": self.registry_chain_state,
+            "publicUpdateState": self.public_update_state,
         })
     }
 
@@ -142,7 +148,9 @@ impl StoredBinding {
             offline_seen: n("offlineSeen"),
             registry_activation_id: opt("registryActivationId"),
             registry_manifest: opt("registryManifest"),
+            registry_replacement_id: opt("registryReplacementId"),
             registry_chain_state: opt("registryChainState"),
+            public_update_state: opt("publicUpdateState"),
         })
     }
 }
@@ -287,8 +295,11 @@ impl StateStore {
         // Worth keeping only if it holds a licence or the identity behind one.
         // An air-gapped install has no activation secret — it was never issued
         // one — and requiring it would throw away its file and its key.
-        (!b.activation_secret.is_empty() || b.offline_token.is_some() || b.machine_key.is_some())
-            .then_some(b)
+        (!b.activation_secret.is_empty()
+            || b.offline_token.is_some()
+            || b.machine_key.is_some()
+            || b.public_update_state.is_some())
+        .then_some(b)
     }
 
     /// Persist the binding. Best-effort by design: a read-only or full disk

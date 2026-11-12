@@ -255,7 +255,10 @@ impl Rpc<'_> {
             .map_err(|_| RegistryError::transient("registry_rpc_unavailable"))?;
         if !(200..300).contains(&response.status) {
             return Err(
-                if [408, 429].contains(&response.status) || response.status >= 500 {
+                // Authentication and quota failures belong to this RPC provider,
+                // not to the on-chain license. Another independently pinned
+                // provider must still perform every verification from scratch.
+                if [401, 403, 408, 429].contains(&response.status) || response.status >= 500 {
                     RegistryError::transient("registry_rpc_unavailable")
                 } else {
                     RegistryError::new("registry_rpc_rejected")
@@ -799,7 +802,7 @@ mod tests {
         .call("eth_chainId", json!([]))
         .unwrap_err()
         .is_transient());
-        let transport = MockTransport::new(vec![Ok(HttpResponse::from_bytes(403, "SECRET"))]);
+        let transport = MockTransport::new(vec![Ok(HttpResponse::from_bytes(400, "SECRET"))]);
         assert!(!Rpc {
             transport: &transport,
             url: "https://rpc.example/"
@@ -815,6 +818,94 @@ mod tests {
         .call("eth_sendRawTransaction", json!(["0x"]))
         .is_err());
         assert!(transport.sent.lock().unwrap().is_empty());
+    }
+
+    fn snapshot_replies(
+        parsed: &ParsedManifest,
+        device: &str,
+        status: u8,
+    ) -> Vec<Result<HttpResponse, String>> {
+        let block = json!({"number":"0x64","timestamp":"0x44c","hash":head(100).hash});
+        let mut record = raw_record();
+        record[12..32].copy_from_slice(&decode_hex(&parsed.manifest.holder).unwrap());
+        record[32..64].copy_from_slice(&decode_hex(device).unwrap());
+        record[128..160].copy_from_slice(&decode_hex(&parsed.entitlements_hash).unwrap());
+        record[223] = status;
+        let mut replies = vec![
+            response(json!("0x2105")),
+            response(block.clone()),
+            response(json!(include_str!("test-runtime.hex").trim())),
+            response(json!(format!("0x{:064x}", 1))),
+            response(json!(hex(&record))),
+        ];
+        if status == 1 {
+            replies.push(response(json!(format!("0x{:064x}", 1))));
+        }
+        replies.push(response(block));
+        replies
+    }
+
+    #[test]
+    fn revoked_rpc_keys_fail_over_to_a_fully_verified_independent_snapshot() {
+        let (trust, parsed, device) = fixture();
+        let input = ReadInput {
+            trust: &trust,
+            parsed: &parsed,
+            device_key: &device,
+            prior_state: None,
+            time_high_water: 0,
+        };
+        let urls = vec![
+            "https://first.example/EXPOSED_PROVIDER_KEY".into(),
+            "https://second.example/".into(),
+        ];
+        for status in [401, 403] {
+            let mut replies = vec![Ok(HttpResponse::from_bytes(
+                status,
+                "PRIVATE_PROVIDER_MESSAGE",
+            ))];
+            replies.extend(snapshot_replies(&parsed, &device, 1));
+            let transport = MockTransport::new(replies);
+            let observation = read_chain(&transport, &urls, &input, || 1100, |_| Ok(())).unwrap();
+            assert!(observation.refusal.is_none());
+            assert_eq!(observation.record.device_key, device);
+            let sent = transport.sent.lock().unwrap();
+            assert_eq!(sent.len(), 8);
+            assert_eq!(sent[0].url, urls[0]);
+            assert!(sent[1..].iter().all(|request| request.url == urls[1]));
+        }
+        let transport = MockTransport::new(vec![
+            Ok(HttpResponse::from_bytes(401, "PRIVATE_PROVIDER_MESSAGE")),
+            Ok(HttpResponse::from_bytes(403, "PRIVATE_PROVIDER_MESSAGE")),
+        ]);
+        let error = read_chain(&transport, &urls, &input, || 1100, |_| Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), "registry_rpc_unavailable");
+        assert!(error.is_transient());
+    }
+
+    #[test]
+    fn an_authoritative_license_revocation_never_tries_a_permissive_backup() {
+        let (trust, parsed, device) = fixture();
+        let input = ReadInput {
+            trust: &trust,
+            parsed: &parsed,
+            device_key: &device,
+            prior_state: None,
+            time_high_water: 0,
+        };
+        let urls = vec![
+            "https://first.example/".into(),
+            "https://second.example/".into(),
+        ];
+        let transport = MockTransport::new(snapshot_replies(&parsed, &device, 3));
+        let observation = read_chain(&transport, &urls, &input, || 1100, |_| Ok(())).unwrap();
+        assert_eq!(observation.refusal, Some("license_revoked"));
+        assert!(transport
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.url == urls[0]));
     }
 
     #[test]

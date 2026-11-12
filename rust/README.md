@@ -52,16 +52,48 @@ Create one per product and share it.
 
 Version 0.3.0 adds `RegistryLicenseClient` behind an explicit Cargo feature.
 Existing `TalosClient` applications keep the default dependency set and behavior.
+Version 0.3.1 adds transactional license replacement, RPC authentication failover
+and signed public updates with Registry maintenance rights.
 
 ```toml
 [dependencies]
 talos-sdk = { version = "0.3", features = ["registry"] }
 ```
 
-Use trusted publisher configuration from
-`GET /v1/portal/products/{product}/wallet-registry-policies/{policy}/integration`.
-Pin `issuer`, `product_id` (bytes32, not the product UUID), `chain_id`, `contract`
-and your application's RPC endpoints independently of customer input.
+### Publisher integration configuration
+
+The publisher retrieves
+`GET /v1/portal/products/{product}/wallet-registry-policies/{policy}/integration`
+through the authenticated portal API. Its response contains `issuer`, `product_id`,
+`chain_id`, `contract`, `product_token` and `automatic_activation`, plus update
+configuration (`updates_mode`, `updates_duration_days`, `public_updates`,
+`anchor_public_key`). For code-entry
+activation, choose a policy with `automatic_activation: true` and a configured,
+funded activation worker. That flag is policy metadata, not a client option.
+
+Build the application's public configuration as follows:
+
+| Rust option | Source | Meaning |
+|---|---|---|
+| `issuer` | Integration response | Publisher's registry namespace address. |
+| `product_id` | Integration response | Product bytes32 hash; do not substitute the product UUID. |
+| `chain_id` | Integration response | Explicit network pin, for example Base Mainnet `8453`. |
+| `contract` | Integration response | Registry deployed on that exact network. |
+| `product_token` | Integration response | Public product token used for code activation. |
+| `activation_url` | Trusted application configuration | Talos HTTPS origin/base URL, for example `https://talos.dziuin.dev`. |
+| `rpc_urls` | Trusted application configuration | One to five independently selected client RPC endpoints. |
+| Public updater `anchor_public_key` | Integration response or product detail | Public anchor pin for signed release-key rotation; keep it independent of downloaded metadata. |
+
+The endpoint does **not** return `activation_url` or `rpc_urls`. For activation,
+pass the service's base URL without `/v1/client/...`; the SDK appends
+`/v1/client/registry/activate` and `/v1/client/registry/activation-status` itself. A trusted
+reverse-proxy base path may precede those paths.
+
+These application settings are public and may ship with the installer. Fetch
+them as the publisher and pin them independently of customer input. Keep the
+publisher API key, issuer private key, KEK, backend RPC credentials and customer
+license codes out of this configuration. Each product supplies its own issuer
+and product values, even when products share one registry contract.
 
 ```rust
 use talos_sdk::{RegistryLicenseClient, RegistryLicenseOptions};
@@ -118,9 +150,154 @@ talos-sdk = { version = "0.3", default-features = false, features = ["registry"]
 
 Pass `transport: Some(Arc::new(your_transport))` in `RegistryLicenseOptions`.
 The same transport handles activation HTTP and Ethereum RPC and must enforce
-the request timeout. Never distribute your publisher worker's private RPC token.
+the request timeout, including body reads, and return redirects without following
+them. Never distribute your publisher worker's private RPC token.
 Use a hidden code prompt in terminal applications and a private application-data
 state path. A pending activation can be resumed without asking for its code again.
+
+### Switching to another license code
+
+Use `replace_license(&new_code)` for an explicit **Use another code** action.
+`activate()` retains its original activate-or-resume behavior and does not replace
+an existing manifest. Do not delete or rename the encrypted state to switch codes.
+
+```rust
+// Hidden input or an application's private code-entry UI; never CLI arguments.
+client.replace_license(&new_code)?;
+// After a timeout, cancellation or restart, continue the same pending switch:
+if client.has_pending_replacement() {
+    client.resume_replacement()?;
+}
+```
+
+The switch preserves the Ed25519 device key, canonical block/revision history and
+observed revocations. The old binding remains current until a new grant passes
+fresh RPC checks and is saved atomically. An invalid new code does not erase the
+old binding. This does not make an expired or revoked old license valid.
+
+`replace_with_options` and `resume_replacement_with_options` support the same
+deadlines, cancellation and progress callbacks as initial activation. A pending
+replacement is resumed explicitly; another code is not silently substituted.
+`discard_pending_replacement()` is an explicit local forget operation: it does
+not cancel the server job, refund gas, revoke a license or unbind a device. Do not
+discard automatically on timeouts, rate limits, `license_missing` or device errors.
+An on-chain renewal of the same license is visible through ordinary `validate()`;
+expiry alone is not a reason to replace local state.
+
+### Client RPC availability
+
+For a Base integration test, client endpoints can be configured as
+`["https://mainnet.base.org", "https://base-rpc.publicnode.com"]`. This is a test
+configuration, not a production availability guarantee. Base describes its public
+RPC as rate limited and unsuitable for production applications; see
+[Connect to Base](https://docs.base.org/get-started/connect-to-base). Select and
+monitor client RPC capacity for the expected production traffic separately from
+the publisher worker's RPC.
+
+An endpoint URL or provider token embedded in a desktop executable is recoverable
+by its users. Keep the server's Alchemy or other private provider credentials on
+the server. Multiple trusted endpoints provide fallback for transient failures;
+they do not provide independent blockchain proofs or an availability guarantee.
+Routing all client reads through Talos would restore a runtime dependency on Talos.
+Since 0.3.1, an RPC HTTP `401`/`403` also permits fallback: an unavailable provider
+credential is not an on-chain license refusal. The backup still verifies the
+network, contract, device, entitlements and canonical state independently.
+
+If every endpoint times out or is rate limited, show a temporary verification
+unavailability and retry later. Do not report an RPC outage as a revoked license,
+delete the saved activation, or grant cached/offline authorization. Authoritative
+expiry, revocation and device mismatch remain license failures rather than reasons
+to try a more permissive provider.
+
+### Signed updates for Registry applications
+
+Rust 0.3.1 provides `PublicUpdateClient`, independently of classic Talos activation.
+The publisher must first enable **Public signed updates** in the product's edit
+form (`PATCH /v1/portal/products/{product}` with `public_updates: true`). This is
+separate from `public_downloads`: archives stay private until this explicit opt-in.
+The public channel exposes published full update files to anyone; downloading
+bytes does not grant a license or protected application features.
+
+Publish a signed release with the app's exact version, the required full artifact
+(WT Viewer uses `windows` / `x64` / `archive`) and 100% rollout. Draft, scheduled,
+canary, revoked-key and unpublished artifacts are not served. The initial public
+updater uses full artifacts rather than binary deltas.
+
+```rust
+use talos_sdk::{PublicUpdateClient, PublicUpdateOptions};
+
+let updates = PublicUpdateClient::new(PublicUpdateOptions {
+    product_token,
+    registry_product_id: Some(product_id), // same bytes32 pin as the Registry client
+    anchor_public_key, // pin from trusted product/integration configuration
+    server_url: "https://talos.dziuin.dev".into(),
+    app_version: Some(env!("CARGO_PKG_VERSION").into()),
+    // Optional: a separate update state_path, never the Registry state file.
+    ..Default::default()
+})?;
+
+// Before using this installed build, including after a manual installation:
+updates.require_running_release_entitlement(&client)?;
+// Ordinary protected operations still require a fresh Registry license check.
+let license = client.require_valid_license()?;
+
+// Run update checking separately from ordinary application work.
+if let Some(info) = updates.check_for_registry_update(&client, Default::default())? {
+    let artifact = info.artifacts.iter()
+        .find(|a| a.platform == "windows" && a.arch == "x64" && a.kind == "archive")
+        .ok_or("no Windows x64 archive")?;
+    updates.download_registry_update(&client, &info, &destination, Some(artifact), None)?;
+    // The verified archive is ready; the host application performs installation.
+}
+```
+
+Use `check_for_registry_update` / `download_registry_update` in a licensed
+application: they verify a fresh Registry grant and its update rights, bind the
+signed product UUID to the Registry product hash, and check publication dates.
+Set `registry_product_id` from the same trusted integration response as the
+Registry client; Registry-aware helpers require this pin even when no metadata
+HTTP request is needed for a lifetime license.
+The plain `check_for_update` / `download_update` methods only verify public release
+metadata and bytes; they do not authorize licensed work. Existing `UpdateInfo` and
+`UpdateArtifact` types are shared with `TalosClient` for updater compatibility.
+
+Create Registry policies with either `updates_mode: "license"` (default, updates
+throughout the valid license lifetime) or `updates_mode: "maintenance"` with
+`updates_duration_days` from 1 to 36500. The server stamps reserved `talos_updates`
+entitlements into the on-chain hash at first activation/preparation. Retries do
+not restart the paid period; ordinary entitlement overrides cannot extend it.
+Existing manifests without this metadata retain the license-lifetime behavior.
+
+Maintenance is independent of license expiry. The publication cutoff is checked
+against `max(iat, published_at, not_before)` from the verified signed manifest.
+Releases within the paid period remain eligible after it ends; newer releases
+outside it are refused. The server can offer the newest eligible historical
+release instead of only the newest release overall. Maintenance expiry does not
+disable an older entitled build. The legacy `updates: false` entitlement disables
+update operations, separately from running an already entitled build.
+
+`require_running_release_entitlement` also checks a manually installed build, using
+the compiled app version. A paid-period license needs verified publication metadata
+for that exact version. On first use it resolves the signed release from Talos;
+after caching it, later launches need only that signed local metadata and fresh
+Registry RPC, so an unavailable Talos server does not disable an already verified
+installed build. A previously unseen version cannot bypass the paid period by
+being installed manually. Lifetime licenses need no publication lookup for this
+running-build check.
+
+The updater verifies the anchor-signed keyset, release signature, product/channel,
+size and SHA-256, and persists installed release and keyset high-water marks.
+Supply the actual compiled `app_version` (or `current_version` when checking),
+plus `current_release_seq` when your installer knows it. Signed semantic versions
+cannot downgrade the running version; non-semantic versions need a trusted
+installed sequence. An existing destination file is never overwritten on a failed
+or substituted download. The application chooses platform/architecture, installs
+the verified artifact and restarts; the SDK does not replace the running binary.
+
+An update-check outage should display a temporary update error while ordinary
+licensed work continues. Do not interpret missing update metadata or a failed
+request as proof that the app is up to date. Use `PublicUpdateRequestOptions` for
+deadlines/cancellation; keep licensing and update state paths separate.
 
 ## Errors
 

@@ -31,6 +31,12 @@ activation IDs survive restart, cancellation and timeout. `IsActivated` means a
 manifest is present, not that it authorizes work. Recheck before protected operations.
 After activation, runtime validation uses RPC independently of Talos availability.
 
+The integration API uses snake_case: map `issuer`, `product_id`, `chain_id`,
+`contract` and `product_token` to the corresponding PascalCase options. Supply
+`ActivationUrl` (base URL without `/v1/client/...`) and `RpcUrls` separately;
+they are not returned by that endpoint. See the
+[public configuration and RPC guidance](../README.md#direct-on-chain-registry).
+
 Registry mode explicitly supports Base Mainnet (`8453`), Ethereum Sepolia
 (`11155111`), and local Anvil (`31337`). Pin a deployed contract and trusted RPCs
 for the selected chain; never reuse a Sepolia address on Base. Base publication

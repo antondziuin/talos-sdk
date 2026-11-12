@@ -28,6 +28,7 @@ use crate::{
     transport::{HttpRequest, HttpResponse, Transport},
 };
 use activation::{ActivationEndpoint, ActivationResponse, ActivationStatus};
+pub(crate) use protocol::validate_endpoint;
 use protocol::ParsedManifest;
 pub use protocol::{RegistryLicenseManifest, RegistryTrust};
 
@@ -204,6 +205,63 @@ impl RegistryLicenseState {
     pub fn entitlement_i64(&self, name: &str) -> Option<i64> {
         self.entitlements.get(name).and_then(Value::as_i64)
     }
+
+    /// Authorize an update whose publication timestamp came from an independently
+    /// verified, product-pinned signed release manifest. Never pass a timestamp
+    /// supplied by a customer or copied from unsigned release-list metadata.
+    /// Maintenance limits update eligibility, not the runtime license's validity.
+    pub fn require_update_entitlement(&self, release_timestamp: u64) -> RegistryResult<()> {
+        const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+        if release_timestamp == 0 || release_timestamp > MAX_SAFE_INTEGER {
+            return Err(RegistryError::new("invalid_release_timestamp"));
+        }
+        match self.update_publication_cutoff()? {
+            Some(until) if release_timestamp > until => {
+                Err(RegistryError::new("updates_not_entitled"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Latest eligible signed publication time, or no publication cutoff for
+    /// license-mode/legacy grants. This is a discovery hint, not authorization:
+    /// verify the offered release and recheck this license before downloading.
+    pub fn update_publication_cutoff(&self) -> RegistryResult<Option<u64>> {
+        match self.entitlements.get("updates") {
+            Some(Value::Bool(false)) => {
+                return Err(RegistryError::new("updates_not_entitled"));
+            }
+            None | Some(Value::Bool(true)) => {}
+            Some(_) => return Err(RegistryError::new("invalid_update_entitlement")),
+        }
+        self.maintenance_publication_cutoff()
+    }
+
+    /// Maintenance window for a verified running build's signed publication
+    /// time. Unlike update discovery, this ignores the legacy `updates: false`
+    /// switch: disabling new downloads must not disable an already paid build.
+    /// The caller must still check the runtime license and signed build identity.
+    pub fn maintenance_publication_cutoff(&self) -> RegistryResult<Option<u64>> {
+        const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+        let Some(policy) = self.entitlements.get("talos_updates") else {
+            return Ok(None); // Existing registry grants predate update metadata.
+        };
+        let policy = policy
+            .as_object()
+            .ok_or_else(|| RegistryError::new("invalid_update_entitlement"))?;
+        match policy.get("mode").and_then(Value::as_str) {
+            Some("license") if policy.len() == 1 => Ok(None),
+            Some("maintenance") if policy.len() == 2 => {
+                let until = policy
+                    .get("until")
+                    .and_then(Value::as_u64)
+                    .filter(|n| *n > 0 && *n <= MAX_SAFE_INTEGER)
+                    .ok_or_else(|| RegistryError::new("invalid_update_entitlement"))?;
+                Ok(Some(until))
+            }
+            _ => Err(RegistryError::new("invalid_update_entitlement")),
+        }
+    }
 }
 
 struct Clock {
@@ -340,7 +398,9 @@ impl RegistryLicenseClient {
             None => StoredBinding::empty(&fp.composite),
         };
         if binding.machine_key.is_none()
-            && (binding.registry_activation_id.is_some() || binding.registry_manifest.is_some())
+            && (binding.registry_activation_id.is_some()
+                || binding.registry_manifest.is_some()
+                || binding.registry_replacement_id.is_some())
         {
             return Err(RegistryError::new("device_key_missing"));
         }
@@ -365,6 +425,14 @@ impl RegistryLicenseClient {
         }
         if binding.registry_activation_id.is_some() && binding.registry_manifest.is_some() {
             return Err(RegistryError::new("registry_activation_state_conflict"));
+        }
+        if let Some(id) = &binding.registry_replacement_id {
+            if !protocol::registry_uuid(id) {
+                return Err(RegistryError::new("invalid_registry_activation_state"));
+            }
+            if binding.registry_manifest.is_none() || binding.registry_activation_id.is_some() {
+                return Err(RegistryError::new("registry_activation_state_conflict"));
+            }
         }
         let manifest = binding
             .registry_manifest
@@ -399,6 +467,9 @@ impl RegistryLicenseClient {
     pub fn device_key(&self) -> &str {
         &self.0.device_key
     }
+    pub(crate) fn registry_product_id(&self) -> &str {
+        &self.0.trust.product_id
+    }
     /// A manifest is loaded. This alone is never permission to use the application.
     #[must_use]
     pub fn is_activated(&self) -> bool {
@@ -408,6 +479,13 @@ impl RegistryLicenseClient {
     #[must_use]
     pub fn has_pending_activation(&self) -> bool {
         self.with_binding(|binding| Ok(binding.registry_activation_id.is_some()))
+            .unwrap_or(false)
+    }
+    /// A replacement is retained separately from the current license. Check this
+    /// before prompting for a further code, and call `resume_replacement`.
+    #[must_use]
+    pub fn has_pending_replacement(&self) -> bool {
+        self.with_binding(|binding| Ok(binding.registry_replacement_id.is_some()))
             .unwrap_or(false)
     }
     /// Import public lookup information. It grants no access and is not persisted
@@ -444,13 +522,59 @@ impl RegistryLicenseClient {
         self.activate_with_options("", options)
     }
 
-    /// Activate with bounded polling. Ready API responses must pass fresh RPC
-    /// checks before their manifest is saved. The code is never retained.
-    pub fn activate_with_options(
+    /// Explicitly replace a completed code activation, preserving the device
+    /// identity and the current license until a new grant passes fresh RPC checks.
+    /// A retained replacement must be resumed or explicitly discarded first;
+    /// a different code is never silently ignored or substituted for that job.
+    pub fn replace_license(&self, code: &str) -> RegistryResult<RegistryLicenseState> {
+        self.replace_with_options(code, &RegistryActivationOptions::default())
+    }
+
+    /// Replace with the same deadlines, cancellation and progress options as
+    /// initial activation. Invalid codes and interrupted polling keep the old
+    /// manifest. Once publication is claimed, only its public job ID is retained.
+    pub fn replace_with_options(
         &self,
         code: &str,
         options: &RegistryActivationOptions,
     ) -> RegistryResult<RegistryLicenseState> {
+        self.replace_inner(Some(code), options)
+    }
+
+    /// Resume the retained replacement without asking for or storing its code.
+    /// The current license can still be checked independently while it is pending.
+    pub fn resume_replacement(&self) -> RegistryResult<RegistryLicenseState> {
+        self.resume_replacement_with_options(&RegistryActivationOptions::default())
+    }
+
+    /// Resume replacement with a bounded deadline and cooperative cancellation.
+    pub fn resume_replacement_with_options(
+        &self,
+        options: &RegistryActivationOptions,
+    ) -> RegistryResult<RegistryLicenseState> {
+        self.replace_inner(None, options)
+    }
+
+    /// Forget only the local pending replacement handle after an explicit user
+    /// decision. This does NOT cancel server publication, refund gas, revoke or
+    /// unbind a license, or reset identity/history. Cancel and join an in-flight
+    /// SDK replacement first; this call serializes with it across processes.
+    /// Never invoke this automatically for timeouts or RPC/service failures.
+    pub fn discard_pending_replacement(&self) -> RegistryResult<()> {
+        let budget = self.activation_budget(&RegistryActivationOptions::default())?;
+        let _guard =
+            FileLock::acquire(&lock_path(&self.0.path, ".activation.lock"), Some(&budget))?;
+        self.restore_manifest(Some(&budget))?;
+        let (expected, generation) = self.snapshot()?;
+        self.with_binding_budget(Some(&budget), |binding| {
+            self.assert_active(&budget, generation)?;
+            self.check_replacement_base(binding, &expected)?;
+            binding.registry_replacement_id = None;
+            self.save_binding(binding)
+        })
+    }
+
+    fn activation_budget(&self, options: &RegistryActivationOptions) -> RegistryResult<Budget> {
         let timeout =
             options
                 .timeout
@@ -462,10 +586,226 @@ impl RegistryLicenseClient {
         if timeout.is_zero() || timeout > Duration::from_secs(600) {
             return Err(RegistryError::new("invalid_registry_activation_timeout"));
         }
-        let budget = Budget {
+        Ok(Budget {
             deadline: Instant::now() + timeout,
             cancellation: options.cancellation.clone(),
+        })
+    }
+
+    fn replace_inner(
+        &self,
+        code: Option<&str>,
+        options: &RegistryActivationOptions,
+    ) -> RegistryResult<RegistryLicenseState> {
+        let budget = self.activation_budget(options)?;
+        budget.remaining()?;
+        let _guard =
+            FileLock::acquire(&lock_path(&self.0.path, ".activation.lock"), Some(&budget))?;
+        self.restore_manifest(Some(&budget))?;
+        let (expected, generation) = self.snapshot()?;
+        let endpoint = self
+            .0
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| RegistryError::new("registry_activation_not_configured"))?;
+        let pending = self.with_binding_budget(Some(&budget), |binding| {
+            self.assert_active(&budget, generation)?;
+            self.check_replacement_base(binding, &expected)?;
+            Ok(binding.registry_replacement_id.clone())
+        })?;
+        let scoped = ScopedTransport {
+            inner: self.0.transport.as_ref(),
+            budget: &budget,
         };
+        let mut response = match (code, pending) {
+            (Some(_), Some(_)) => {
+                return Err(RegistryError::new("registry_replacement_pending"));
+            }
+            (None, None) => return Err(RegistryError::new("registry_replacement_not_pending")),
+            (None, Some(id)) => {
+                self.poll_replacement(endpoint, &scoped, &id, &budget, &expected, generation)?
+            }
+            (Some(code), None) => {
+                let result = endpoint.activate(
+                    &scoped,
+                    &self.0.key,
+                    code,
+                    &request_uuid()?,
+                    budget.remaining()?,
+                );
+                budget.remaining()?;
+                result?
+            }
+        };
+        loop {
+            self.assert_active(&budget, generation)?;
+            let failed = matches!(response.status, ActivationStatus::Failed);
+            self.save_replacement(
+                &response.activation_id,
+                failed,
+                &budget,
+                &expected,
+                generation,
+            )?;
+            match response.status {
+                ActivationStatus::Failed => {
+                    return Err(RegistryError::new("registry_activation_failed"));
+                }
+                ActivationStatus::Pending => {
+                    notify(
+                        options,
+                        RegistryActivationStatus::Pending,
+                        &response.activation_id,
+                        response.retry_after_s,
+                    );
+                    budget.sleep(Duration::from_secs(response.retry_after_s.max(1)))?;
+                    response = self.poll_replacement(
+                        endpoint,
+                        &scoped,
+                        &response.activation_id,
+                        &budget,
+                        &expected,
+                        generation,
+                    )?;
+                }
+                ActivationStatus::Ready => {
+                    let raw =
+                        serde_json::to_string(response.manifest.as_ref().ok_or_else(|| {
+                            RegistryError::new("invalid_registry_activation_response")
+                        })?)
+                        .map_err(|_| RegistryError::new("invalid_registry_manifest"))?;
+                    let candidate = protocol::parse_manifest(&raw, &self.0.trust)?;
+                    notify(
+                        options,
+                        RegistryActivationStatus::Validating,
+                        &response.activation_id,
+                        0,
+                    );
+                    let check =
+                        self.validate_candidate(&candidate, generation, &scoped, Some(&budget));
+                    self.assert_active(&budget, generation)?;
+                    let license = check?;
+                    self.commit_replacement(
+                        candidate,
+                        &raw,
+                        &response.activation_id,
+                        &budget,
+                        &expected,
+                        generation,
+                    )?;
+                    // Commit is the linearization point: a later cancellation
+                    // cannot undo a successfully verified, durably saved swap.
+                    notify(
+                        options,
+                        RegistryActivationStatus::Ready,
+                        &response.activation_id,
+                        0,
+                    );
+                    return Ok(license);
+                }
+            }
+        }
+    }
+
+    fn check_replacement_base(
+        &self,
+        binding: &StoredBinding,
+        expected: &ParsedManifest,
+    ) -> RegistryResult<()> {
+        let stored = binding
+            .registry_manifest
+            .as_deref()
+            .ok_or_else(|| RegistryError::new("registry_replacement_state_conflict"))?;
+        if binding.registry_activation_id.is_some()
+            || protocol::parse_manifest(stored, &self.0.trust)?.manifest != expected.manifest
+        {
+            return Err(RegistryError::new("registry_replacement_state_conflict"));
+        }
+        Ok(())
+    }
+
+    fn save_replacement(
+        &self,
+        id: &str,
+        failed: bool,
+        budget: &Budget,
+        expected: &ParsedManifest,
+        generation: u64,
+    ) -> RegistryResult<()> {
+        self.with_binding_budget(Some(budget), |binding| {
+            self.assert_active(budget, generation)?;
+            self.check_replacement_base(binding, expected)?;
+            if binding
+                .registry_replacement_id
+                .as_deref()
+                .is_some_and(|saved| saved != id)
+            {
+                return Err(RegistryError::new("registry_replacement_state_conflict"));
+            }
+            binding.registry_replacement_id = (!failed).then(|| id.to_owned());
+            self.save_binding(binding)
+        })
+    }
+
+    fn poll_replacement(
+        &self,
+        endpoint: &ActivationEndpoint,
+        transport: &dyn Transport,
+        id: &str,
+        budget: &Budget,
+        expected: &ParsedManifest,
+        generation: u64,
+    ) -> RegistryResult<ActivationResponse> {
+        self.assert_active(budget, generation)?;
+        let result = endpoint.poll(transport, &self.0.key, id, budget.remaining()?);
+        self.assert_active(budget, generation)?;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code() == "activation_not_found")
+        {
+            self.save_replacement(id, true, budget, expected, generation)?;
+        }
+        result
+    }
+
+    fn commit_replacement(
+        &self,
+        candidate: ParsedManifest,
+        raw: &str,
+        id: &str,
+        budget: &Budget,
+        expected: &ParsedManifest,
+        generation: u64,
+    ) -> RegistryResult<()> {
+        // Same lock order as initial activation: manifest -> persisted state.
+        let mut manifest = lock(&self.0.manifest);
+        self.assert_active(budget, generation)?;
+        if manifest.as_ref().map(|m| &m.manifest) != Some(&expected.manifest) {
+            return Err(RegistryError::new("registry_replacement_state_conflict"));
+        }
+        self.with_binding_budget(Some(budget), |binding| {
+            self.assert_active(budget, generation)?;
+            self.check_replacement_base(binding, expected)?;
+            if binding.registry_replacement_id.as_deref() != Some(id) {
+                return Err(RegistryError::new("registry_replacement_state_conflict"));
+            }
+            binding.registry_manifest = Some(raw.to_owned());
+            binding.registry_replacement_id = None;
+            self.save_binding(binding)
+        })?;
+        *manifest = Some(candidate);
+        self.0.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Activate with bounded polling. Ready API responses must pass fresh RPC
+    /// checks before their manifest is saved. The code is never retained.
+    pub fn activate_with_options(
+        &self,
+        code: &str,
+        options: &RegistryActivationOptions,
+    ) -> RegistryResult<RegistryLicenseState> {
+        let budget = self.activation_budget(options)?;
         budget.remaining()?;
         // Separate from short state locks: one first activation per profile,
         // including across processes. Closing/crashing releases the OS lock.
@@ -746,10 +1086,11 @@ impl RegistryLicenseClient {
         transport: &dyn Transport,
         budget: Option<&Budget>,
     ) -> RegistryResult<RegistryLicenseState> {
-        let (initial, high) = self.with_binding_budget(budget, |binding| {
+        let (initial, high, persisted_manifest) = self.with_binding_budget(budget, |binding| {
             Ok((
                 chain::parse_chain_state(binding.registry_chain_state.as_deref())?,
                 binding.time_high_water.max(0) as u64,
+                binding.registry_manifest.clone(),
             ))
         })?;
         let observation = chain::read_chain(
@@ -773,6 +1114,9 @@ impl RegistryLicenseClient {
         )?;
         let terminal = self.with_binding_budget(budget, |binding| {
             if self.0.generation.load(Ordering::Acquire) != generation {
+                return Err(RegistryError::new("license_changed_during_validation"));
+            }
+            if binding.registry_manifest != persisted_manifest {
                 return Err(RegistryError::new("license_changed_during_validation"));
             }
             let seen = chain::parse_chain_state(binding.registry_chain_state.as_deref())?;

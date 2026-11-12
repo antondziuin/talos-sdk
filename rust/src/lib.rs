@@ -59,6 +59,8 @@ mod fingerprint;
 mod host;
 mod offline;
 #[cfg(feature = "registry")]
+pub mod public_updates;
+#[cfg(feature = "registry")]
 pub mod registry;
 mod state;
 pub mod transport;
@@ -72,6 +74,11 @@ pub use client::{verify_applied_update, Subscription, TalosClient, TalosOptions}
 pub use error::{Error, Result};
 pub use fingerprint::{collect_fingerprint, FingerprintData};
 pub use offline::{signed_message, SignedDoc, LICENSE_FILE_KIND, RECEIPT_DOMAIN, REQUEST_DOMAIN};
+#[cfg(feature = "registry")]
+pub use public_updates::{
+    PublicUpdateCancellationToken, PublicUpdateClient, PublicUpdateOptions,
+    PublicUpdateRequestOptions,
+};
 #[cfg(feature = "registry")]
 pub use registry::{
     RegistryActivationOptions, RegistryActivationProgress, RegistryActivationStatus,

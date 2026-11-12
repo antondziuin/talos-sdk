@@ -13,6 +13,7 @@ const TOKEN: &str = "tpt_registry_client_fixture";
 const JOB: &str = "11111111-1111-4111-8111-111111111111";
 const FIRST_CODE: &str = "SYNTHETIC-FIRST-CODE";
 const SECOND_CODE: &str = "SYNTHETIC-SECOND-CODE";
+const REPLACEMENT_JOB: &str = "22222222-2222-4222-8222-222222222222";
 
 fn address(byte: &str) -> String {
     format!("0x{}", byte.repeat(20))
@@ -69,6 +70,16 @@ enum Reply {
     Failed,
     Unavailable,
 }
+#[derive(Clone)]
+struct LicenseRecord {
+    device: String,
+    holder: String,
+    rights_hash: String,
+    not_before: u64,
+    expires: u64,
+    revision: u64,
+    status: u64,
+}
 struct Model {
     activation: VecDeque<Reply>,
     polling: VecDeque<Reply>,
@@ -83,6 +94,7 @@ struct Model {
     device: String,
     holder: String,
     rights_hash: String,
+    entitlements_json: Vec<u8>,
     runtime: String,
     chain: u64,
     version: u64,
@@ -96,6 +108,9 @@ struct Model {
     fail_primary: bool,
     bad_manifest: Option<&'static str>,
     block_state_write: Option<PathBuf>,
+    manifest_license_id: String,
+    job: String,
+    records: BTreeMap<String, LicenseRecord>,
 }
 struct Server(Mutex<Model>);
 impl Server {
@@ -115,6 +130,7 @@ impl Server {
             device: word("00"),
             holder: address("22"),
             rights_hash: protocol::keccak_hex(br#"{"pro":true,"seats":3}"#),
+            entitlements_json: br#"{"pro":true,"seats":3}"#.to_vec(),
             runtime: include_str!("test-runtime.hex").trim().to_owned(),
             chain: 8453,
             version: 1,
@@ -128,6 +144,9 @@ impl Server {
             fail_primary: false,
             bad_manifest: None,
             block_state_write: None,
+            manifest_license_id: word("44"),
+            job: JOB.into(),
+            records: BTreeMap::new(),
         })))
     }
     fn with(&self, action: impl FnOnce(&mut Model)) {
@@ -136,8 +155,8 @@ impl Server {
     fn manifest(model: &Model) -> Value {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let mut value = json!({"v":1,"kind":"talos-registry-license","chain_id":8453,"contract":address("11"),
-            "issuer":address("22"),"product_id":word("33"),"license_id":word("44"),"holder":address("22"),
-            "entitlements":URL_SAFE_NO_PAD.encode(br#"{"pro":true,"seats":3}"#)});
+            "issuer":address("22"),"product_id":word("33"),"license_id":model.manifest_license_id,"holder":address("22"),
+            "entitlements":URL_SAFE_NO_PAD.encode(&model.entitlements_json)});
         if let Some(field) = model.bad_manifest {
             value[field] = match field {
                 "chain_id" => json!(11155111),
@@ -151,21 +170,36 @@ impl Server {
         let (status, body) = match reply {
             Reply::Pending => (
                 200,
-                json!({"status":"pending","activation_id":JOB,"manifest":null,"error":null,"retry_after_s":0}),
+                json!({"status":"pending","activation_id":model.job,"manifest":null,"error":null,"retry_after_s":0}),
             ),
             Reply::Ready => (
                 200,
-                json!({"status":"ready","activation_id":JOB,"manifest":Self::manifest(model),"error":null,"retry_after_s":0}),
+                json!({"status":"ready","activation_id":model.job,"manifest":Self::manifest(model),"error":null,"retry_after_s":0}),
             ),
             Reply::MissingJob => (404, json!({"error":"activation_not_found"})),
             Reply::WrongCode => (404, json!({"error":"license_not_found"})),
             Reply::Failed => (
                 200,
-                json!({"status":"failed","activation_id":JOB,"manifest":null,"error":"synthetic_worker_failure","retry_after_s":0}),
+                json!({"status":"failed","activation_id":model.job,"manifest":null,"error":"synthetic_worker_failure","retry_after_s":0}),
             ),
             Reply::Unavailable => (503, json!({"error":"registry_activation_unavailable"})),
         };
         HttpResponse::from_bytes(status, body.to_string())
+    }
+    fn record(model: &Model, id: &str) -> LicenseRecord {
+        if let Some(record) = model.records.get(id) {
+            return record.clone();
+        }
+        assert_eq!(id, word("44"));
+        LicenseRecord {
+            device: model.device.clone(),
+            holder: model.holder.clone(),
+            rights_hash: model.rights_hash.clone(),
+            not_before: model.not_before,
+            expires: model.expires,
+            revision: model.revision,
+            status: model.status,
+        }
     }
 }
 fn verify_proof(body: &Value, status: bool) {
@@ -258,6 +292,8 @@ impl Transport for Server {
                 if data == selector("registryVersion()") {
                     json!(format!("0x{}", uint(model.version)))
                 } else if data.starts_with(&selector("getLicense(address,bytes32,bytes32)")) {
+                    let id = format!("0x{}", &data[138..202]);
+                    let record = Self::record(&model, &id);
                     assert_eq!(
                         data,
                         format!(
@@ -265,20 +301,22 @@ impl Transport for Server {
                             selector("getLicense(address,bytes32,bytes32)"),
                             address_word(&address("22")),
                             &word("33")[2..],
-                            &word("44")[2..]
+                            &id[2..]
                         )
                     );
                     json!(format!(
                         "0x{}{}{}{}{}{}{}",
-                        address_word(&model.holder),
-                        &model.device[2..],
-                        uint(model.not_before),
-                        uint(model.expires),
-                        &model.rights_hash[2..],
-                        uint(model.revision),
-                        uint(model.status)
+                        address_word(&record.holder),
+                        &record.device[2..],
+                        uint(record.not_before),
+                        uint(record.expires),
+                        &record.rights_hash[2..],
+                        uint(record.revision),
+                        uint(record.status)
                     ))
                 } else {
+                    let id = format!("0x{}", &data[138..202]);
+                    Self::record(&model, &id);
                     assert_eq!(
                         data,
                         format!(
@@ -288,10 +326,10 @@ impl Transport for Server {
                             ),
                             address_word(&address("22")),
                             &word("33")[2..],
-                            &word("44")[2..],
+                            &id[2..],
                             address_word(&address("22")),
                             &model.device[2..],
-                            &protocol::keccak_hex(br#"{"pro":true,"seats":3}"#)[2..]
+                            &protocol::keccak_hex(&model.entitlements_json)[2..]
                         )
                     );
                     if let Some(path) = model.block_state_write.take() {
@@ -349,6 +387,9 @@ fn imported(profile: &Profile, server: Arc<Server>) -> RegistryLicenseClient {
         .unwrap();
     client
 }
+
+#[path = "replacement_tests.rs"]
+mod replacement;
 
 #[test]
 fn activation_requires_real_rpc_then_persists_and_restart_uses_rpc_without_talos() {

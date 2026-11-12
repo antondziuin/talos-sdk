@@ -1,6 +1,6 @@
 [package]
 name = "talos-sdk"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Talos SDK for Rust: code activation, on-chain registries, offline licensing, feature entitlements, floating seats, and signed software updates."
@@ -25,7 +25,7 @@ default = ["ureq"]
 # CA bundle, request logging, or a test double.
 ureq = ["dep:ureq"]
 # Direct registry verification and code activation, with an optional host transport.
-registry = ["dep:sha3", "dep:http", "dep:fs2", "dep:zeroize"]
+registry = ["dep:sha3", "dep:http", "dep:fs2", "dep:zeroize", "dep:semver"]
 
 [dependencies]
 base64 = "0.22"
@@ -41,6 +41,7 @@ sha3 = { version = "0.10", optional = true }
 http = { version = "1", optional = true }
 fs2 = { version = "0.4", optional = true }
 zeroize = { version = "1", optional = true }
+semver = { version = "1", optional = true }
 ureq = { version = "3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
