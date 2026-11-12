@@ -75,6 +75,7 @@ struct Settings {
     channel: String,
     keyset_iat: i64,
     manifest: Option<String>,
+    resolve_signer: Option<SigningKey>,
     keyset: Option<String>,
     body: Option<Value>,
     bytes: Vec<u8>,
@@ -104,6 +105,7 @@ impl Server {
                 channel: "stable".into(),
                 keyset_iat: unix_now(),
                 manifest: None,
+                resolve_signer: None,
                 keyset: None,
                 body: None,
                 bytes: BYTES.into(),
@@ -275,7 +277,11 @@ impl Transport for Server {
                     resolved["iat"] = json!(s.keyset_iat - 200);
                     resolved["published_at"] = json!(s.keyset_iat - 200);
                 }
-                manifest = mint(&self.release, "manifest", &resolved);
+                manifest = mint(
+                    s.resolve_signer.as_ref().unwrap_or(&self.release),
+                    "manifest",
+                    &resolved,
+                );
             }
             let body=s.body.clone().unwrap_or_else(||json!({"update_available":true,"manifest":manifest,
                 // These envelope facts deliberately disagree with signed claims.
@@ -652,7 +658,8 @@ fn registry_product_binding_and_scheduled_publication_time_are_verified() {
     let wrong = make_registry(format!("0x{}", "33".repeat(32)), "other-registry.dat");
     assert!(bind_registry(&wrong, &offer).is_err());
     let mut claims = server.claims();
-    claims["not_before"] = json!(unix_now() + 30);
+    let scheduled = unix_now() + 30;
+    claims["not_before"] = json!(scheduled);
     offer = client
         .0
         .verify_offer(
@@ -661,7 +668,7 @@ fn registry_product_binding_and_scheduled_publication_time_are_verified() {
             "stable",
         )
         .unwrap();
-    assert_eq!(offer.published_at, (unix_now() + 30) as u64);
+    assert_eq!(offer.published_at, scheduled as u64);
 }
 
 #[test]
@@ -824,7 +831,10 @@ fn a_changed_private_offer_cannot_replace_the_manifest_used_for_registry_eligibi
             Some(&info.artifacts[0]),
             None,
             &Default::default(),
-            Some(&expected)
+            DownloadAuthority {
+                expected: Some(&expected),
+                registry: None
+            }
         )
         .is_err());
     assert_eq!(server.gets(), 0);
@@ -1074,7 +1084,7 @@ fn cached_running_metadata_cannot_resurrect_a_known_revoked_or_ambiguous_key() {
             .require_running_release_entitlement(&registry)
             .is_err());
         assert_eq!(
-            calls,
+            calls + 1,
             server
                 .settings
                 .lock()
@@ -1256,4 +1266,290 @@ fn an_old_unorderable_version_cannot_bypass_a_known_running_version_using_a_stal
             ..Default::default()
         })
         .is_err());
+}
+
+fn cached_paid_client(
+    fixture: &Fixture,
+    server: &Arc<Server>,
+) -> (PublicUpdateClient, RegistryLicenseClient) {
+    let registry = registry(
+        fixture,
+        server,
+        json!({"pro":true,"talos_updates":{"mode":"maintenance","until":unix_now()+3600}}),
+    );
+    let mut options = server.options(fixture);
+    options.app_version = Some("1.1.0".into());
+    let client = PublicUpdateClient::new(options).unwrap();
+    client
+        .require_running_release_entitlement(&registry)
+        .unwrap();
+    (client, registry)
+}
+
+fn api_calls(server: &Server) -> usize {
+    server
+        .settings
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|r| r.url.starts_with(ORIGIN))
+        .count()
+}
+
+#[test]
+fn a_same_second_authority_conflict_recovers_without_an_application_refresh_hack() {
+    let f = Fixture::new();
+    let server = Server::new();
+    let (client, registry) = cached_paid_client(&f, &server);
+    let iat = server.settings.lock().unwrap().keyset_iat;
+    let keys = json!([
+        {"purpose":"release","status":"active","pk":pk(&server.release)},
+        {"purpose":"license","status":"active","pk":pk(&key(45))}
+    ]);
+    let ambiguous = server.keyset(iat, keys.clone());
+    server.configure(|s| s.keyset = Some(ambiguous));
+    assert!(client.check_for_update(Default::default()).is_err());
+    let fresh = server.keyset(iat + 1, keys);
+    server.configure(|s| s.keyset = Some(fresh));
+    let calls = api_calls(&server);
+    client
+        .require_running_release_entitlement(&registry)
+        .unwrap();
+    assert_eq!(api_calls(&server), calls + 1);
+    // The repaired valid cache stays independent of Talos again.
+    server.configure(|s| s.status = Some(503));
+    let calls = api_calls(&server);
+    client
+        .require_running_release_entitlement(&registry)
+        .unwrap();
+    assert_eq!(api_calls(&server), calls);
+}
+
+#[test]
+fn authority_recovery_is_bounded_and_does_not_accept_a_historical_keyset() {
+    let f = Fixture::new();
+    let server = Server::new();
+    let (client, registry) = cached_paid_client(&f, &server);
+    let iat = server.settings.lock().unwrap().keyset_iat;
+    let old = server.keyset(
+        iat,
+        json!([{"purpose":"release","status":"active","pk":pk(&server.release)}]),
+    );
+    let revoked = server.keyset(iat + 1, json!([]));
+    server.configure(|s| s.keyset = Some(revoked));
+    assert!(client.check_for_update(Default::default()).is_err());
+    server.configure(|s| s.status = Some(503));
+    let calls = api_calls(&server);
+    assert!(client
+        .require_running_release_entitlement(&registry)
+        .is_err());
+    assert_eq!(api_calls(&server), calls + 1);
+    server.configure(|s| {
+        s.status = None;
+        s.keyset = Some(old);
+    });
+    let calls = api_calls(&server);
+    assert!(client
+        .require_running_release_entitlement(&registry)
+        .is_err());
+    assert_eq!(api_calls(&server), calls + 1);
+    let budget = Budget::new(Duration::from_secs(1), &Default::default()).unwrap();
+    client
+        .0
+        .with_state(&budget, |state| {
+            assert_eq!(state.keyset_iat, iat + 1);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_cached_build_can_resolve_an_authorized_replacement_release_signer() {
+    let f = Fixture::new();
+    let server = Server::new();
+    let (client, registry) = cached_paid_client(&f, &server);
+    let iat = server.settings.lock().unwrap().keyset_iat;
+    let replacement = key(43);
+    let fresh = server.keyset(
+        iat + 1,
+        json!([{"purpose":"release","status":"active","pk":pk(&replacement)}]),
+    );
+    server.configure(|s| s.keyset = Some(fresh));
+    // Learn the old key's removal before a replacement manifest is available.
+    assert!(client.check_for_update(Default::default()).is_err());
+    let manifest = mint(&replacement, "manifest", &server.claims());
+    server.configure(|s| {
+        s.manifest = Some(manifest);
+        s.resolve_signer = Some(replacement);
+    });
+    let calls = api_calls(&server);
+    client
+        .require_running_release_entitlement(&registry)
+        .unwrap();
+    assert_eq!(api_calls(&server), calls + 2); // fresh keys, exact-version resolution
+    server.configure(|s| s.status = Some(503));
+    let calls = api_calls(&server);
+    client
+        .require_running_release_entitlement(&registry)
+        .unwrap();
+    assert_eq!(api_calls(&server), calls);
+}
+
+struct StreamGate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+impl StreamGate {
+    fn release(&self) {
+        let (released, changed) = &*self.0;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+    }
+}
+impl Drop for StreamGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct BlockedBody {
+    body: Box<dyn Read + Send>,
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+impl Read for BlockedBody {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+            let (released, changed) = &*self.release;
+            let (released, timeout) = changed
+                .wait_timeout_while(
+                    released.lock().unwrap(),
+                    Duration::from_secs(10),
+                    |released| !*released,
+                )
+                .unwrap();
+            if timeout.timed_out() && !*released {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+        }
+        self.body.read(output)
+    }
+}
+
+struct BlockedTransport {
+    server: Arc<Server>,
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+impl Transport for BlockedTransport {
+    fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+        let download = request.method == "GET";
+        let mut response = self.server.send(request)?;
+        if download {
+            response.body = Box::new(BlockedBody {
+                body: response.body,
+                entered: self.entered.lock().unwrap().take(),
+                release: self.release.clone(),
+            });
+        }
+        Ok(response)
+    }
+}
+
+fn blocked_paid_client(
+    fixture: &Fixture,
+    server: &Arc<Server>,
+) -> (
+    PublicUpdateClient,
+    RegistryLicenseClient,
+    StreamGate,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let registry = registry(
+        fixture,
+        server,
+        json!({"pro":true,"talos_updates":{"mode":"maintenance","until":unix_now()+3600}}),
+    );
+    let (entered, receiver) = std::sync::mpsc::channel();
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let transport = Arc::new(BlockedTransport {
+        server: server.clone(),
+        entered: Mutex::new(Some(entered)),
+        release: release.clone(),
+    });
+    let mut options = server.options(fixture);
+    options.transport = Some(transport);
+    (
+        PublicUpdateClient::new(options).unwrap(),
+        registry,
+        StreamGate(release),
+        receiver,
+    )
+}
+
+#[test]
+fn a_stalled_download_does_not_block_a_cached_paid_running_build() {
+    let f = Fixture::new();
+    let server = Server::new();
+    let (client, registry, gate, entered) = blocked_paid_client(&f, &server);
+    let info = client
+        .check_for_registry_update(&registry, Default::default())
+        .unwrap()
+        .unwrap();
+    let downloading = client.clone();
+    let download_registry = registry.clone();
+    let dest = f.dest();
+    let download = std::thread::spawn(move || {
+        downloading.download_registry_update(
+            &download_registry,
+            &info,
+            dest,
+            Some(&info.artifacts[0]),
+            None,
+        )
+    });
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    let before = api_calls(&server);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let running = client.clone();
+    let guard = std::thread::spawn(move || {
+        let _ = tx.send(running.require_running_release_entitlement(&registry));
+    });
+    let result = rx.recv_timeout(Duration::from_secs(2));
+    let unchanged = api_calls(&server) == before;
+    gate.release();
+    guard.join().unwrap();
+    download.join().unwrap().unwrap();
+    assert!(matches!(result, Ok(Ok(()))));
+    assert!(unchanged, "the cached paid build must not call Talos HTTP");
+    assert_eq!(std::fs::read(f.dest()).unwrap(), BYTES);
+}
+
+#[test]
+fn a_revocation_learned_while_streaming_prevents_final_file_publication() {
+    let f = Fixture::new();
+    let server = Server::new();
+    let (client, registry, gate, entered) = blocked_paid_client(&f, &server);
+    let info = client
+        .check_for_registry_update(&registry, Default::default())
+        .unwrap()
+        .unwrap();
+    let downloading = client.clone();
+    let dest = f.dest();
+    let download = std::thread::spawn(move || {
+        downloading.download_registry_update(&registry, &info, dest, Some(&info.artifacts[0]), None)
+    });
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    let other = server.client(&f);
+    let iat = server.settings.lock().unwrap().keyset_iat;
+    let revoked = server.keyset(iat + 1, json!([]));
+    server.configure(|s| s.keyset = Some(revoked));
+    assert!(other.check_for_update(Default::default()).is_err());
+    gate.release();
+    assert!(download.join().unwrap().is_err());
+    assert!(!f.dest().exists());
+    assert!(!std::fs::read_dir(&f.path).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .ends_with(".talos-part")));
 }

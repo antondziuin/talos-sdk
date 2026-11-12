@@ -54,6 +54,8 @@ Version 0.3.0 adds `RegistryLicenseClient` behind an explicit Cargo feature.
 Existing `TalosClient` applications keep the default dependency set and behavior.
 Version 0.3.1 adds transactional license replacement, RPC authentication failover
 and signed public updates with Registry maintenance rights.
+Use 0.3.2 or later for automatic update-key recovery and independent license
+checks while an archive is downloading.
 
 ```toml
 [dependencies]
@@ -298,6 +300,12 @@ An update-check outage should display a temporary update error while ordinary
 licensed work continues. Do not interpret missing update metadata or a failed
 request as proof that the app is up to date. Use `PublicUpdateRequestOptions` for
 deadlines/cancellation; keep licensing and update state paths separate.
+Valid cached running-release proof needs no Talos HTTP. If a known keyset conflict
+or obsolete signing authority prevents that proof from verifying, 0.3.2 attempts
+one bounded refresh before refusing access; a revoked key or replay never becomes
+valid merely because refresh failed. Long archive transfers release update-state
+locks so a cached running-build check can proceed concurrently. The host should
+also give downloads their own worker rather than blocking UI or license checks.
 
 ## Errors
 

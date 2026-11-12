@@ -151,6 +151,12 @@ struct Offer {
     cutoff: Option<u64>,
 }
 
+#[derive(Default)]
+struct DownloadAuthority<'a> {
+    expected: Option<&'a Offer>,
+    registry: Option<&'a RegistryLicenseClient>,
+}
+
 struct Inner {
     options: PublicUpdateOptions,
     anchor: PublicKey,
@@ -412,7 +418,14 @@ impl PublicUpdateClient {
         on_progress: Option<&mut dyn FnMut(DownloadProgress)>,
         request: &PublicUpdateRequestOptions,
     ) -> Result<UpdateArtifact> {
-        self.download_checked(info, dest.as_ref(), artifact, on_progress, request, None)
+        self.download_checked(
+            info,
+            dest.as_ref(),
+            artifact,
+            on_progress,
+            request,
+            DownloadAuthority::default(),
+        )
     }
 
     fn download_checked(
@@ -422,12 +435,12 @@ impl PublicUpdateClient {
         artifact: Option<&UpdateArtifact>,
         mut on_progress: Option<&mut dyn FnMut(DownloadProgress)>,
         request: &PublicUpdateRequestOptions,
-        expected: Option<&Offer>,
+        authority: DownloadAuthority<'_>,
     ) -> Result<UpdateArtifact> {
         let budget = Budget::new(self.0.options.download_timeout, request)?;
-        self.0.with_state(&budget, |state| {
+        let (offer, chosen, path) = self.0.with_state(&budget, |state| {
             let offer = self.0.offer_for(info)?;
-            if expected.is_some_and(|prior| {
+            if authority.expected.is_some_and(|prior| {
                 prior.manifest != offer.manifest
                     || prior.channel != offer.channel
                     || prior.cutoff != offer.cutoff
@@ -435,29 +448,9 @@ impl PublicUpdateClient {
                 return Err(Error::signature("public_update_offer_changed"));
             }
             let keys = self.0.refresh_keys(state, &budget)?;
-            let signed = self
-                .0
+            self.0
                 .verify_offer(&keys, &offer.manifest, &offer.channel)?;
-            if signed.info.version != offer.info.version
-                || signed.info.release_seq != offer.info.release_seq
-            {
-                return Err(invalid());
-            }
-            observe(state, &offer)?;
-            if info.release_seq <= state.installed_seq {
-                return Err(Error::signature("public_update_rollback"));
-            }
-            if let Some(running) = state
-                .installed_version
-                .as_deref()
-                .and_then(comparable_version)
-            {
-                if comparable_version(&info.version).is_none_or(|candidate| {
-                    candidate.cmp_precedence(&running) != std::cmp::Ordering::Greater
-                }) {
-                    return Err(Error::signature("public_update_version_rollback"));
-                }
-            }
+            self.0.validate_download_floor(state, &offer)?;
             let chosen = match artifact {
                 Some(a) => a.clone(),
                 None => info
@@ -483,52 +476,72 @@ impl PublicUpdateClient {
             }
             let path = chosen
                 .download_path
-                .as_deref()
+                .clone()
                 .ok_or_else(|| Error::usage("artifact_has_no_download_path"))?;
-            self.0.validate_download_path(path, &offer.channel)?;
-            if dest.try_exists()? {
-                return Err(Error::usage("public_update_destination_exists"));
+            self.0.validate_download_path(&path, &offer.channel)?;
+            self.0.save(state)?;
+            Ok((offer, chosen, path))
+        })?;
+
+        // Streaming owns only its unique staging file. A stalled update must
+        // never hold the state/operation locks needed by a paid running build.
+        if dest.try_exists()? {
+            return Err(Error::usage("public_update_destination_exists"));
+        }
+        let mut part = Part::create(dest)?;
+        let response = self.0.send("GET", &path, None, &budget, true)?;
+        if response.content_length.is_some_and(|n| n != chosen.size) {
+            return Err(Error::signature("artifact_size_mismatch"));
+        }
+        let mut body = response.body.take(chosen.size.saturating_add(1));
+        let mut digest = Sha256::new();
+        let mut received = 0u64;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            budget.remaining()?;
+            let n = body.read(&mut buf).map_err(|_| unavailable())?;
+            budget.remaining()?;
+            if n == 0 {
+                break;
             }
-            let mut part = Part::create(dest)?;
-            let response = self.0.send("GET", path, None, &budget, true)?;
-            if response.content_length.is_some_and(|n| n != chosen.size) {
+            received = received.checked_add(n as u64).ok_or_else(invalid)?;
+            if received > chosen.size {
                 return Err(Error::signature("artifact_size_mismatch"));
             }
-            let mut body = response.body.take(chosen.size.saturating_add(1));
-            let mut digest = Sha256::new();
-            let mut received = 0u64;
-            let mut buf = [0u8; 64 * 1024];
-            loop {
-                budget.remaining()?;
-                let n = body.read(&mut buf).map_err(|_| unavailable())?;
-                budget.remaining()?;
-                if n == 0 {
-                    break;
-                }
-                received = received.checked_add(n as u64).ok_or_else(invalid)?;
-                if received > chosen.size {
-                    return Err(Error::signature("artifact_size_mismatch"));
-                }
-                part.file.write_all(&buf[..n])?;
-                digest.update(&buf[..n]);
-                if let Some(progress) = &mut on_progress {
-                    progress(DownloadProgress {
-                        bytes_received: received,
-                        total_bytes: chosen.size,
-                    });
-                }
+            part.file.write_all(&buf[..n])?;
+            digest.update(&buf[..n]);
+            if let Some(progress) = &mut on_progress {
+                progress(DownloadProgress {
+                    bytes_received: received,
+                    total_bytes: chosen.size,
+                });
             }
-            if received != chosen.size || hex(&digest.finalize()) != chosen.sha256 {
-                return Err(Error::signature("artifact_hash_mismatch"));
-            }
-            budget.remaining()?;
-            part.file.sync_all()?;
-            // Linking is atomic and never replaces an existing destination, even if
-            // another process created it after the check above. The part is adjacent.
-            std::fs::hard_link(&part.path, dest)?;
+        }
+        if received != chosen.size || hex(&digest.finalize()) != chosen.sha256 {
+            return Err(Error::signature("artifact_hash_mismatch"));
+        }
+        budget.remaining()?;
+        part.file.sync_all()?;
+        if let Some(registry) = authority.registry {
+            self.bind_registry_configuration(registry)?;
+            bind_registry(registry, &offer)?;
+            registry
+                .require_valid_license()
+                .map_err(registry_error)?
+                .require_update_entitlement(offer.published_at)
+                .map_err(registry_error)?;
+        }
+        self.0.with_state(&budget, |state| {
+            // Preserve the exact preflight manifest; a concurrent offer must
+            // not substitute different product/publication facts after rights
+            // were checked. Fresh observations always win before publication.
+            self.0.verify_latest_authority(state, &offer)?;
+            self.0.validate_download_floor(state, &offer)?;
             if !state.downloaded.contains_key(&info.version) && state.downloaded.len() >= 64 {
                 return Err(Error::usage("public_update_history_limit"));
             }
+            budget.remaining()?;
+            std::fs::hard_link(&part.path, dest)?;
             state
                 .downloaded
                 .entry(info.version.clone())
@@ -577,32 +590,23 @@ impl PublicUpdateClient {
         {
             return Err(Error::usage("public_update_cancelled"));
         }
-        self.authorize_running_release(registry, request)?;
+        let before = self.authorize_running_release(registry, request)?;
         let offer = self.0.offer_for(info)?;
         bind_registry(registry, &offer)?;
-        registry
-            .require_valid_license()
-            .map_err(registry_error)?
+        before
             .require_update_entitlement(offer.published_at)
             .map_err(registry_error)?;
-        let chosen = self.download_checked(
+        self.download_checked(
             info,
             dest.as_ref(),
             artifact,
             on_progress,
             request,
-            Some(&offer),
-        )?;
-        registry
-            .require_valid_license()
-            .map_err(registry_error)?
-            .require_update_entitlement(offer.published_at)
-            .map_err(registry_error)?;
-        let budget = Budget::new(self.0.options.http_timeout, request)?;
-        self.0.with_state(&budget, |state| {
-            self.0.verify_latest_authority(state, &offer)
-        })?;
-        Ok(chosen)
+            DownloadAuthority {
+                expected: Some(&offer),
+                registry: Some(registry),
+            },
+        )
     }
 }
 
@@ -664,16 +668,35 @@ impl PublicUpdateClient {
         let channel = &self.0.channel;
         let offer = self.0.with_state(&budget, |state| {
             let cache_key = running_key(channel, version);
-            if let Some(cached) = state.running_releases.get(&cache_key) {
-                if state.keyset_conflict { return Err(Error::signature("public_update_keyset_conflict")); }
-                let latest = state.keyset.as_deref().ok_or_else(invalid_state)?;
-                let claims = verify_keyset(&self.0.anchor, &self.0.options.product_token, latest)?;
-                let keys = release_keys(&claims)?;
-                let offer = self.0.verify_offer(&keys, &cached.manifest, channel)?;
-                if offer.info.version != version { return Err(invalid_state()); }
-                return Ok(offer);
+            let mut refreshed_keys = None;
+            if let Some(manifest) = state.running_releases.get(&cache_key).map(|cached| cached.manifest.clone()) {
+                match self.0.verify_cached_running(state, &manifest, channel) {
+                    Ok(offer) => {
+                        if offer.info.version != version { return Err(invalid_state()); }
+                        return Ok(offer);
+                    }
+                    Err(error) if recoverable_authority(&error) => {
+                        // A conflict or an observed signing-key change is not
+                        // recoverable from historical snapshots. Ask once for a
+                        // fresh anchor-signed keyset, preserving all known floors.
+                        let keys = self.0.refresh_keys(state, &budget)?;
+                        match self.0.verify_offer(&keys, &manifest, channel) {
+                            Ok(offer) => {
+                                if offer.info.version != version { return Err(invalid_state()); }
+                                return Ok(offer);
+                            }
+                            Err(error) if changed_release_signer(&error) => {
+                                // The exact same build may have been re-signed
+                                // by an authorized replacement release key.
+                                refreshed_keys = Some(keys);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            let keys = self.0.refresh_keys(state, &budget)?;
+            let keys = match refreshed_keys { Some(keys) => keys, None => self.0.refresh_keys(state, &budget)? };
             let body = self.0.post("/v1/client/public-updates/resolve", json!({
                 "product_token": self.0.options.product_token, "version": version, "channel": channel,
             }), &budget)?;
@@ -864,13 +887,36 @@ impl Inner {
     }
 
     fn verify_latest_authority(&self, state: &Saved, offer: &Offer) -> Result<()> {
+        self.verify_cached_running(state, &offer.manifest, &offer.channel)?;
+        Ok(())
+    }
+
+    fn validate_download_floor(&self, state: &mut Saved, offer: &Offer) -> Result<()> {
+        observe(state, offer)?;
+        if offer.info.release_seq <= state.installed_seq {
+            return Err(Error::signature("public_update_rollback"));
+        }
+        if let Some(running) = state
+            .installed_version
+            .as_deref()
+            .and_then(comparable_version)
+        {
+            if comparable_version(&offer.info.version).is_none_or(|candidate| {
+                candidate.cmp_precedence(&running) != std::cmp::Ordering::Greater
+            }) {
+                return Err(Error::signature("public_update_version_rollback"));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_cached_running(&self, state: &Saved, manifest: &str, channel: &str) -> Result<Offer> {
         if state.keyset_conflict {
             return Err(Error::signature("public_update_keyset_conflict"));
         }
         let token = state.keyset.as_deref().ok_or_else(invalid_state)?;
         let claims = verify_keyset(&self.anchor, &self.options.product_token, token)?;
-        self.verify_offer(&release_keys(&claims)?, &offer.manifest, &offer.channel)?;
-        Ok(())
+        self.verify_offer(&release_keys(&claims)?, manifest, channel)
     }
 
     fn send(
@@ -1202,6 +1248,16 @@ fn not_entitled() -> Error {
         status: 403,
         code: Some("updates_not_entitled".into()),
     }
+}
+
+fn changed_release_signer(error: &Error) -> bool {
+    matches!(error, Error::Signature(reason) if reason == "signature verification failed")
+}
+
+fn recoverable_authority(error: &Error) -> bool {
+    changed_release_signer(error)
+        || matches!(error, Error::Signature(reason)
+        if reason == "public_update_keyset_conflict" || reason == "no_release_verification_key")
 }
 
 fn comparable_version(value: &str) -> Option<semver::Version> {
