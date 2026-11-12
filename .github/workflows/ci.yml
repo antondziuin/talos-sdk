@@ -78,8 +78,13 @@ jobs:
       # Without the built-in transport, which is how an application bringing
       # its own HTTP client builds it.
       - run: cargo clippy --no-default-features --all-targets -- -D warnings
-      - run: cargo test
-      - run: cargo doc --no-deps
+      - run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features registry --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --locked --no-default-features
+      - run: cargo test --locked --all-features
+      - run: cargo test --locked --no-default-features --features registry
+      - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -95,13 +100,15 @@ jobs:
       # otherwise discovered by a customer on an older toolchain.
       - uses: dtolnay/rust-toolchain@1.85
       - run: cargo build --locked
+      - run: cargo build --locked --all-features
+      - run: cargo build --locked --no-default-features --features registry
       # What `cargo publish` would upload: the library and nothing else. The
       # tests read `../contract-vectors.json`, which exists here and not in a
       # package, so they are deliberately left out of it.
       - name: the package carries the library, its README and licence
         run: |
           cargo package --list --allow-dirty > listing
-          for want in src/lib.rs README.md LICENSE Cargo.toml; do
+          for want in src/lib.rs src/registry/mod.rs README.md LICENSE Cargo.toml; do
             grep -qx "$want" listing || { echo "the package is missing $want" >&2; exit 1; }
           done
           if grep -q "^tests/" listing; then

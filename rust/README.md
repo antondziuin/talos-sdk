@@ -48,6 +48,80 @@ let seats = state.entitlement_i64("seats").unwrap_or(1);
 `TalosClient` is `Clone + Send + Sync`; clones are handles to the same client.
 Create one per product and share it.
 
+## Direct on-chain registry (optional)
+
+Version 0.3.0 adds `RegistryLicenseClient` behind an explicit Cargo feature.
+Existing `TalosClient` applications keep the default dependency set and behavior.
+
+```toml
+[dependencies]
+talos-sdk = { version = "0.3", features = ["registry"] }
+```
+
+Use trusted publisher configuration from
+`GET /v1/portal/products/{product}/wallet-registry-policies/{policy}/integration`.
+Pin `issuer`, `product_id` (bytes32, not the product UUID), `chain_id`, `contract`
+and your application's RPC endpoints independently of customer input.
+
+```rust
+use talos_sdk::{RegistryLicenseClient, RegistryLicenseOptions};
+
+// issuer/product_id/contract/product_token come from trusted integration config.
+let client = RegistryLicenseClient::new(RegistryLicenseOptions {
+    issuer,
+    product_id,
+    chain_id: 11155111, // Sepolia; Base 8453 needs its own explicit pins
+    contract,
+    rpc_urls: vec!["https://ethereum-sepolia-rpc.publicnode.com".into()],
+    activation_url: Some("https://licenses.example.com".into()),
+    product_token: Some(product_token),
+    ..Default::default()
+})?;
+
+if !client.is_activated() {
+    if client.has_pending_activation() {
+        client.resume_activation()?;
+    } else {
+        // Read from a hidden prompt or your application's code-entry UI.
+        // Do not accept a code as a command-line argument or log it.
+        client.activate(&code_entered_by_customer)?;
+    }
+}
+
+// Repeat this fresh read before each protected operation and its result.
+let license = client.require_valid_license()?;
+if license.entitlement_bool("pro") {
+    // Perform the protected operation.
+}
+```
+
+The automatically published policy's worker pays issue/bind gas. The buyer
+needs no wallet or ETH. Activation uses an Ed25519 device proof, then the SDK
+independently verifies the on-chain grant before granting access. Pending IDs
+resume after restart without the original code; Base can wait up to ten minutes
+for the safe head. Activation errors, cancellation, timeout and unavailable RPC
+grant no access. Once ready, runtime checks use RPC directly without Talos.
+
+The encrypted local state retains the device key, pending activation ID, public
+manifest and observed chain/revision floors. It does not retain the activation
+code, its hash or request proof. Protect that state and keep it across restarts.
+`is_activated()` reports saved state, not current authorization. Registry mode
+has no offline authorization grace; ordinary `TalosClient` offline behavior is
+separate. On-chain IDs and device public keys are public; never publish codes,
+personal data or secrets. Client patching and copied device keys remain possible.
+
+Bring your own [`Transport`](#supplying-your-own-transport) with:
+
+```toml
+talos-sdk = { version = "0.3", default-features = false, features = ["registry"] }
+```
+
+Pass `transport: Some(Arc::new(your_transport))` in `RegistryLicenseOptions`.
+The same transport handles activation HTTP and Ethereum RPC and must enforce
+the request timeout. Never distribute your publisher worker's private RPC token.
+Use a hidden code prompt in terminal applications and a private application-data
+state path. A pending activation can be resumed without asking for its code again.
+
 ## Errors
 
 `talos_sdk::Error` separates the server's answers from the absence of one:

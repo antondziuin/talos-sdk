@@ -35,10 +35,14 @@
 //! # Ok::<(), talos_sdk::Error>(())
 //! ```
 //!
-//! Every server response is a Talos-compact token signed by the product key and
+//! Classic [`TalosClient`] licensing responses are Talos-compact tokens signed by the product key and
 //! verified against the pinned key, so a fake or intercepting server cannot
 //! forge an acceptable answer. Calls block; from async code run them on a
 //! blocking thread.
+//!
+//! With the `registry` feature, `RegistryLicenseClient` activates a code once
+//! through Talos and checks a pinned on-chain registry directly on later starts.
+//! API publication claims and cached manifests never grant access by themselves.
 //!
 //! Anti-tamper honesty: a binary is patchable. Gate premium value on
 //! server-returned *data* (entitlements, configuration), not on client
@@ -54,6 +58,8 @@ mod error;
 mod fingerprint;
 mod host;
 mod offline;
+#[cfg(feature = "registry")]
+pub mod registry;
 mod state;
 pub mod transport;
 mod types;
@@ -66,6 +72,13 @@ pub use client::{verify_applied_update, Subscription, TalosClient, TalosOptions}
 pub use error::{Error, Result};
 pub use fingerprint::{collect_fingerprint, FingerprintData};
 pub use offline::{signed_message, SignedDoc, LICENSE_FILE_KIND, RECEIPT_DOMAIN, REQUEST_DOMAIN};
+#[cfg(feature = "registry")]
+pub use registry::{
+    RegistryActivationOptions, RegistryActivationProgress, RegistryActivationStatus,
+    RegistryCancellationToken, RegistryLicenseClient, RegistryLicenseError,
+    RegistryLicenseManifest, RegistryLicenseOptions, RegistryLicenseState, RegistryResult,
+    RegistryTrust,
+};
 pub use state::{default_state_path, hash_license_key};
 pub use transport::{HttpRequest, HttpResponse, Transport};
 pub use types::{

@@ -70,6 +70,8 @@ impl HttpResponse {
 /// very differently from silence.
 pub trait Transport: Send + Sync {
     /// Send `request` and return the response, whatever its status.
+    /// Registry callers require redirects to be returned as responses rather
+    /// than followed, and the supplied deadline to cover reading the body too.
     fn send(&self, request: HttpRequest) -> Result<HttpResponse, String>;
 }
 
@@ -104,6 +106,19 @@ mod ureq_transport {
                 .http_status_as_error(false)
                 .build();
             UreqTransport {
+                agent: config.into(),
+            }
+        }
+
+        /// A client that returns redirects without following them. Used by
+        /// registry activation so a redirect cannot forward a customer's code.
+        #[must_use]
+        pub fn without_redirects() -> Self {
+            let config = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .max_redirects(0)
+                .build();
+            Self {
                 agent: config.into(),
             }
         }

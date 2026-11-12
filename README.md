@@ -45,12 +45,13 @@ They persist a block/revision floor, retry provider lag without granting stale
 access, recheck canonical history on reorgs, and retain observed revocation.
 Base activation defaults to ten minutes while waiting for L1 safe publication.
 
-Node/Electron's `@antondziuin/talos-sdk-wallet` and C#'s `Talos.Sdk` also expose
+Node/Electron's `@antondziuin/talos-sdk-wallet`, C#'s `Talos.Sdk` and Rust's
+`talos-sdk` 0.3.0 with `features = ["registry"]` expose
 `RegistryLicenseClient` for `TalosLicenseRegistryV1`. This mode reads licensing
 state directly through trusted Ethereum RPC, with no Talos runtime API,
 coordinator, or renewal service. It is separate from ordinary Talos activation
-and seven-day `DeviceLicenseClient` certificates. A registry client for the Rust
-SDK is not implemented.
+and seven-day `DeviceLicenseClient` certificates. Rust's feature is optional;
+existing classic clients keep their default dependencies and HTTP seam.
 
 Import a public manifest, have the holder's wallet confirm the generated device
 binding transaction, then call `requireValidLicense()` / `RequireValidLicenseAsync()`
@@ -59,10 +60,10 @@ access and there is no offline authorization cache. Pin issuer, product, chain a
 registry address independently of the file. Issuance, binding, renewal and
 revocation require wallet transactions; client patching and full device-key
 cloning are not prevented. Examples: [Node registry](node-wallet/README.md),
-[C# registry](csharp/README.md).
+[C# registry](csharp/README.md), [Rust registry](rust/README.md#direct-on-chain-registry-optional).
 
 Automatically published policies also support a customer code-entry flow through
-`activate(code)` / `ActivateAsync(code)`. The activation service arranges and pays
+`activate(code)` / `ActivateAsync(code)` / Rust `activate(&code)`. The activation service arranges and pays
 for publication; the SDK uses an Ed25519 device proof, not a customer Ethereum
 wallet. Pending jobs resume after restart without resending a code. Once ready,
 runtime checks use direct RPC, with no ongoing Talos dependency. Configure trusted

@@ -71,6 +71,12 @@ pub(crate) struct StoredBinding {
     /// one server time in its life, and mixing the two would make a corrected
     /// fast clock read as tampering.
     pub offline_seen: i64,
+    /// Resumable registry job, never the original code.
+    pub registry_activation_id: Option<String>,
+    /// Public manifest, retained only after independent RPC validation.
+    pub registry_manifest: Option<String>,
+    /// Highest canonical head/revision observations and terminal revocation.
+    pub registry_chain_state: Option<String>,
 }
 
 impl StoredBinding {
@@ -99,6 +105,9 @@ impl StoredBinding {
             "machinePublicKey": self.machine_public_key,
             "offlineToken": self.offline_token,
             "offlineSeen": self.offline_seen,
+            "registryActivationId": self.registry_activation_id,
+            "registryManifest": self.registry_manifest,
+            "registryChainState": self.registry_chain_state,
         })
     }
 
@@ -131,6 +140,9 @@ impl StoredBinding {
             machine_public_key: opt("machinePublicKey"),
             offline_token: opt("offlineToken"),
             offline_seen: n("offlineSeen"),
+            registry_activation_id: opt("registryActivationId"),
+            registry_manifest: opt("registryManifest"),
+            registry_chain_state: opt("registryChainState"),
         })
     }
 }
@@ -341,7 +353,7 @@ impl StateStore {
 /// itself to 0700 because a licence file lives under it would break every
 /// other service that passes through it.
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -350,7 +362,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 

@@ -268,7 +268,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - run: cargo test --locked
+      - run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features registry --all-targets -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo test --locked --no-default-features --features registry
       # `plan` read the version out of the manifest with awk; this is cargo's own
       # reading of the same file. A workspace inheriting the version, or a
       # second `[package]`-looking table, would move one and not the other.
@@ -282,6 +288,7 @@ jobs:
       # Packs and builds the crate from the packaged sources alone — what a
       # customer's `cargo add` gets — before anything is uploaded.
       - run: cargo package --locked
+      - run: cargo package --locked --all-features
       # Trusted publishing needs the crate to exist before crates.io lets it be
       # configured, which is the same chicken-and-egg npm had: the first
       # release went out with an API token in `CARGO_REGISTRY_TOKEN`.
