@@ -112,6 +112,54 @@ impl ActivationEndpoint {
         Ok(response)
     }
 
+    /// Report a launch. The response carries nothing; only delivery matters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn checkin(
+        &self,
+        transport: &dyn Transport,
+        key: &SigningKey,
+        license_id: &str,
+        install_id: &str,
+        timestamp: u64,
+        app_version: Option<&str>,
+        timeout: Duration,
+    ) -> RegistryResult<()> {
+        let unavailable = || RegistryError::new("registry_checkin_unavailable");
+        let device = hex(key.verifying_key().as_bytes());
+        let message = super::protocol::checkin_proof_text(
+            &self.product_token,
+            license_id,
+            &device,
+            install_id,
+            timestamp,
+        )?;
+        let body = serde_json::to_vec(&json!({
+            "product_token": self.product_token,
+            "license_id": license_id,
+            "device_key": device,
+            "install_id": install_id,
+            "timestamp": timestamp,
+            "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            "app_version": app_version,
+            "proof": hex(&key.sign(message.as_bytes()).to_bytes()),
+        }))
+        .map_err(|_| unavailable())?;
+        let response = transport
+            .send(HttpRequest {
+                method: "POST",
+                url: format!("{}/v1/client/registry/checkin", self.endpoint),
+                headers: vec![("content-type", "application/json".into())],
+                body: Some(body),
+                timeout: Some(timeout.min(HTTP_TIMEOUT)),
+            })
+            .map_err(|_| unavailable())?;
+        if response.status == 204 {
+            Ok(())
+        } else {
+            Err(unavailable())
+        }
+    }
+
     fn post(
         &self,
         transport: &dyn Transport,

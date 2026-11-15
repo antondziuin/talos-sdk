@@ -186,6 +186,38 @@ discard automatically on timeouts, rate limits, `license_missing` or device erro
 An on-chain renewal of the same license is visible through ordinary `validate()`;
 expiry alone is not a reason to replace local state.
 
+### One license on any computer (portable file)
+
+The registry binds a license to one key, not to one computer. An activated
+client can export that key together with the public manifest, and any other
+installation can import the file. No Talos request is made on import or
+afterwards; each computer still reads the registry over RPC, so revocation or
+expiry on chain stops every copy at once.
+
+```rust
+// On the computer where the code was activated:
+let file = client.export_portable_license()?;        // keep it secret
+// On any other computer, with the same publisher pins:
+let client = RegistryLicenseClient::import_portable_license(options, &file)?;
+let license = client.require_valid_license()?;        // RPC only
+```
+
+The file is a bearer credential: whoever holds it can run the application, and
+there is no device limit. Export it only for licenses that are meant to be
+unrestricted, and never log or upload it. An installation that already holds a
+different license refuses the import instead of overwriting it.
+
+### Reporting launches (optional)
+
+`client.report_launch(Some(env!("CARGO_PKG_VERSION")))` tells the publisher's
+Talos server that this installation started. It feeds per-license computer and
+launch counts in the portal. It is advisory: call it after
+`require_valid_license`, ignore its error, and never make access depend on it —
+offline it fails with `registry_checkin_unavailable` and the license keeps
+working. It sends the public license identifier, a product-scoped digest of the
+machine fingerprint, OS/architecture and the version; no host or user name.
+It needs `activation_url` and `product_token`.
+
 ### Client RPC availability
 
 For a Base integration test, client endpoints can be configured as

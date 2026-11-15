@@ -111,6 +111,7 @@ struct Model {
     manifest_license_id: String,
     job: String,
     records: BTreeMap<String, LicenseRecord>,
+    checkins: Vec<Value>,
 }
 struct Server(Mutex<Model>);
 impl Server {
@@ -147,6 +148,7 @@ impl Server {
             manifest_license_id: word("44"),
             job: JOB.into(),
             records: BTreeMap::new(),
+            checkins: Vec::new(),
         })))
     }
     fn with(&self, action: impl FnOnce(&mut Model)) {
@@ -251,6 +253,30 @@ impl Transport for Server {
                 model.device = device;
                 let reply = model.activation.pop_front().unwrap_or(Reply::Ready);
                 return Ok(Self::reply(&model, reply));
+            }
+            if request.url.ends_with("/checkin") {
+                let device = body["device_key"].as_str().unwrap();
+                let message = protocol::checkin_proof_text(
+                    TOKEN,
+                    body["license_id"].as_str().unwrap(),
+                    device,
+                    body["install_id"].as_str().unwrap(),
+                    body["timestamp"].as_u64().unwrap(),
+                )
+                .unwrap();
+                let key = VerifyingKey::from_bytes(
+                    protocol::decode_hex(device)
+                        .unwrap()
+                        .as_slice()
+                        .try_into()
+                        .unwrap(),
+                )
+                .unwrap();
+                let proof = protocol::decode_hex(body["proof"].as_str().unwrap()).unwrap();
+                key.verify_strict(message.as_bytes(), &Signature::from_slice(&proof).unwrap())
+                    .unwrap();
+                model.checkins.push(body);
+                return Ok(HttpResponse::from_bytes(204, Vec::new()));
             }
             assert!(request.url.ends_with("/activation-status"));
             verify_proof(&body, true);
@@ -443,6 +469,123 @@ fn activation_requires_real_rpc_then_persists_and_restart_uses_rpc_without_talos
     assert_eq!(model.api_calls, api_before);
     assert!(model.rpc_calls > rpc_before);
     assert_eq!(model.activation_posts, 1);
+}
+
+#[test]
+fn portable_file_validates_on_another_machine_through_rpc_alone_and_never_calls_talos() {
+    let first = Profile::new();
+    let server = Server::new();
+    let origin = RegistryLicenseClient::new(options(&first, server.clone())).unwrap();
+    assert_eq!(
+        origin.export_portable_license().unwrap_err().code(),
+        "registry_manifest_required",
+        "nothing to export before activation"
+    );
+    origin.activate(FIRST_CODE).unwrap();
+    let file = origin.export_portable_license().unwrap();
+    assert!(!file.contains(FIRST_CODE), "the code is never in the file");
+
+    // A different computer: its own profile, its own hardware, and no Talos.
+    let other_machine = |profile: &Profile| {
+        let mut opts = options(profile, server.clone());
+        for value in opts.fingerprint_components.values_mut() {
+            value.push_str(":another-computer");
+        }
+        opts
+    };
+    let (api_before, posts_before) = {
+        let model = lock(&server.0);
+        (model.api_calls, model.activation_posts)
+    };
+    server.with(|model| model.api_offline = true);
+    let second = Profile::new();
+    let copy =
+        RegistryLicenseClient::import_portable_license(other_machine(&second), &file).unwrap();
+    assert_eq!(copy.device_key(), origin.device_key());
+    assert!(copy.is_activated());
+    assert!(copy
+        .require_valid_license()
+        .unwrap()
+        .entitlement_bool("pro"));
+    // The same file again is a no-op, and the state survives a restart.
+    drop(copy);
+    let again =
+        RegistryLicenseClient::import_portable_license(other_machine(&second), &file).unwrap();
+    assert!(again.require_valid_license().is_ok());
+    {
+        let model = lock(&server.0);
+        assert_eq!(model.api_calls, api_before, "no Talos request on the copy");
+        assert_eq!(model.activation_posts, posts_before);
+    }
+
+    // The registry stays the authority: revoking the record stops every copy.
+    server.with(|model| model.status = 3);
+    assert!(again.require_valid_license().is_err());
+    assert!(origin.require_valid_license().is_err());
+    assert!(
+        origin.export_portable_license().is_err(),
+        "an invalid license is not exported"
+    );
+
+    // A file is never trusted for its pins, and a damaged one is refused.
+    let third = Profile::new();
+    let mut foreign = other_machine(&third);
+    foreign.issuer = address("77");
+    assert!(RegistryLicenseClient::import_portable_license(foreign, &file).is_err());
+    assert_eq!(
+        RegistryLicenseClient::import_portable_license(
+            other_machine(&third),
+            &file.replace("talos-registry-portable-license", "talos-registry-license"),
+        )
+        .unwrap_err()
+        .code(),
+        "invalid_portable_license"
+    );
+    assert!(!third.state().exists(), "a refused file writes nothing");
+}
+
+#[test]
+fn launch_report_is_signed_names_the_install_and_never_decides_access() {
+    let first = Profile::new();
+    let server = Server::new();
+    let origin = RegistryLicenseClient::new(options(&first, server.clone())).unwrap();
+    assert!(origin.report_launch(None).is_err(), "nothing to report yet");
+    origin.activate(FIRST_CODE).unwrap();
+    origin.report_launch(Some("1.2.3")).unwrap();
+    origin.report_launch(Some("1.2.3")).unwrap();
+
+    // The same portable key on another computer reports as a different install.
+    let second = Profile::new();
+    let mut opts = options(&second, server.clone());
+    for value in opts.fingerprint_components.values_mut() {
+        value.push_str(":another-computer");
+    }
+    let copy = RegistryLicenseClient::import_portable_license(
+        opts,
+        &origin.export_portable_license().unwrap(),
+    )
+    .unwrap();
+    copy.report_launch(None).unwrap();
+    {
+        let model = lock(&server.0);
+        let reports = &model.checkins;
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[0]["license_id"], word("44"));
+        assert_eq!(reports[0]["app_version"], "1.2.3");
+        assert!(reports[2]["app_version"].is_null());
+        assert_eq!(reports[0]["install_id"], reports[1]["install_id"]);
+        assert_ne!(reports[0]["install_id"], reports[2]["install_id"]);
+        assert_eq!(reports[0]["device_key"], reports[2]["device_key"]);
+        assert_eq!(reports[0]["install_id"].as_str().unwrap().len(), 64);
+    }
+
+    // Talos unreachable: the report fails and the license still validates.
+    server.with(|model| model.api_offline = true);
+    assert_eq!(
+        copy.report_launch(None).unwrap_err().code(),
+        "registry_checkin_unavailable"
+    );
+    assert!(copy.require_valid_license().is_ok());
 }
 
 #[test]

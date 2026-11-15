@@ -374,28 +374,12 @@ impl RegistryLicenseClient {
             inner: transport,
             timeout: options.http_timeout.min(Duration::from_secs(10)),
         });
-        let scope = format!(
-            "wallet-registry:{}:{}:{}:{}",
-            trust.chain_id, trust.contract, trust.issuer, trust.product_id
-        );
-        let fp = crate::collect_fingerprint(&scope, &options.fingerprint_components);
-        let path = options
-            .state_path
-            .clone()
-            .unwrap_or_else(|| crate::default_state_path(&scope));
-        let path = if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .map_err(|_| RegistryError::new("invalid_registry_state_path"))?
-                .join(path)
-        };
-        let store = StateStore::new(path.clone(), &scope, &state_key_material(&fp));
+        let (store, path, composite) = state_location(&options, &trust)?;
         let _guard = FileLock::acquire(&lock_path(&path, ".lock"), None)?;
         let mut binding = match store.load() {
             Some(binding) => binding,
             None if path.exists() => return Err(RegistryError::new("invalid_device_state")),
-            None => StoredBinding::empty(&fp.composite),
+            None => StoredBinding::empty(&composite),
         };
         if binding.machine_key.is_none()
             && (binding.registry_activation_id.is_some()
@@ -497,6 +481,170 @@ impl RegistryLicenseClient {
         self.0.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
+    /// Export this activated license as a portable file: the public manifest
+    /// together with the secret half of the key the registry record is bound to.
+    ///
+    /// The registry binds a license to one key, not to one computer. A file
+    /// carrying that key therefore validates on any machine, with no Talos
+    /// server involved — each one still reads the registry over RPC, so a
+    /// revocation or expiry on chain stops every copy at once.
+    ///
+    /// **The file is a bearer credential.** Whoever holds it can run the
+    /// application; there is no device limit. Call this only for licenses that
+    /// are meant to be unrestricted, and never log or upload the result. A
+    /// fresh valid observation is required first: an invalid license is not
+    /// exported.
+    pub fn export_portable_license(&self) -> RegistryResult<String> {
+        self.validate()?;
+        let (manifest, secret) = self.with_binding(|binding| {
+            if binding.registry_activation_id.is_some() || binding.registry_replacement_id.is_some()
+            {
+                return Err(RegistryError::new("registry_activation_state_conflict"));
+            }
+            let manifest = binding
+                .registry_manifest
+                .clone()
+                .ok_or_else(|| RegistryError::new("registry_license_not_activated"))?;
+            let secret = Zeroizing::new(
+                binding
+                    .machine_key
+                    .clone()
+                    .ok_or_else(|| RegistryError::new("device_key_missing"))?,
+            );
+            Ok((manifest, secret))
+        })?;
+        let mut file = Map::new();
+        file.insert("v".into(), Value::from(1));
+        file.insert("kind".into(), Value::from(PORTABLE_KIND));
+        file.insert("manifest".into(), Value::from(manifest));
+        file.insert("device_secret".into(), Value::from(secret.as_str()));
+        Ok(Value::Object(file).to_string())
+    }
+
+    /// Install a portable license file on this machine and open a client for it.
+    ///
+    /// No Talos request is made, now or later. The file's key and manifest are
+    /// written into this installation's own encrypted state, after which the
+    /// client behaves exactly as if it had been activated here. Importing
+    /// grants nothing by itself: `require_valid_license` must still succeed
+    /// against the registry.
+    ///
+    /// An installation that already holds a different license, or has an
+    /// activation in progress, is refused rather than overwritten. Importing
+    /// the same file again is a no-op.
+    pub fn import_portable_license(
+        options: RegistryLicenseOptions,
+        raw: &str,
+    ) -> RegistryResult<Self> {
+        let invalid = || RegistryError::new("invalid_portable_license");
+        let trust = RegistryTrust {
+            chain_id: options.chain_id,
+            contract: options.contract.to_ascii_lowercase(),
+            issuer: options.issuer.to_ascii_lowercase(),
+            product_id: options.product_id.to_ascii_lowercase(),
+        };
+        protocol::validate_trust(&trust)?;
+        if raw.len() > 131_072 {
+            return Err(invalid());
+        }
+        let file: Value = serde_json::from_str(raw).map_err(|_| invalid())?;
+        if file.get("v").and_then(Value::as_u64) != Some(1)
+            || file.get("kind").and_then(Value::as_str) != Some(PORTABLE_KIND)
+        {
+            return Err(invalid());
+        }
+        let manifest = file
+            .get("manifest")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        let secret = Zeroizing::new(
+            file.get("device_secret")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid)?
+                .to_owned(),
+        );
+        // The pins come from the application, never from the file: a manifest
+        // for another issuer, product, chain or contract is refused here.
+        let parsed = protocol::parse_manifest(manifest, &trust)?;
+        let seed = Zeroizing::new(STANDARD.decode(secret.as_str()).map_err(|_| invalid())?);
+        let seed: &[u8; 32] = seed.as_slice().try_into().map_err(|_| invalid())?;
+        if STANDARD.encode(seed) != *secret {
+            return Err(invalid());
+        }
+        let public = STANDARD.encode(SigningKey::from_bytes(seed).verifying_key().as_bytes());
+
+        let (store, path, composite) = state_location(&options, &trust)?;
+        {
+            let _guard = FileLock::acquire(&lock_path(&path, ".lock"), None)?;
+            let mut binding = match store.load() {
+                Some(binding) => binding,
+                None if path.exists() => return Err(RegistryError::new("invalid_device_state")),
+                None => StoredBinding::empty(&composite),
+            };
+            if binding.registry_activation_id.is_some() || binding.registry_replacement_id.is_some()
+            {
+                return Err(RegistryError::new("registry_activation_state_conflict"));
+            }
+            if let Some(current) = &binding.registry_manifest {
+                let current = protocol::parse_manifest(current, &trust)?;
+                if current.manifest != parsed.manifest
+                    || binding.machine_public_key.as_deref() != Some(public.as_str())
+                {
+                    return Err(RegistryError::new("registry_already_activated"));
+                }
+            } else {
+                // A key generated here and never bound to anything is replaced;
+                // nothing on chain refers to it.
+                binding.machine_key = Some(secret.as_str().to_owned());
+                binding.machine_public_key = Some(public);
+                binding.registry_manifest = Some(manifest.to_owned());
+                binding.registry_chain_state = None;
+                if !store.save(&binding) {
+                    return Err(RegistryError::new("device_state_not_saved"));
+                }
+            }
+        }
+        Self::new(options)
+    }
+
+    /// Tell the publisher's Talos server that this installation started.
+    ///
+    /// Advisory in both directions: it feeds the publisher's per-license
+    /// install and launch counts, and it is **never** a condition of access —
+    /// call it after `require_valid_license`, ignore its error, and do not
+    /// retry in a loop. Offline, or with Talos down, it fails with
+    /// `registry_checkin_unavailable` and the license keeps working.
+    ///
+    /// Sent: the public license identifier, a product-scoped digest of this
+    /// machine's fingerprint, the OS and architecture, and `app_version`. No
+    /// host name, user name or raw hardware identifier.
+    pub fn report_launch(&self, app_version: Option<&str>) -> RegistryResult<()> {
+        let endpoint = self
+            .0
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| RegistryError::new("registry_activation_not_configured"))?;
+        let (candidate, _) = self.snapshot()?;
+        let scope = format!(
+            "wallet-registry:{}:{}:{}:{}",
+            self.0.trust.chain_id,
+            self.0.trust.contract,
+            self.0.trust.issuer,
+            self.0.trust.product_id
+        );
+        let fp = crate::collect_fingerprint(&scope, &self.0.options.fingerprint_components);
+        let install_id = protocol::keccak_hex(fp.composite.as_bytes())[2..].to_owned();
+        endpoint.checkin(
+            self.0.transport.as_ref(),
+            &self.0.key,
+            &candidate.manifest.license_id,
+            &install_id,
+            wall_time(),
+            app_version,
+            Duration::from_secs(5),
+        )
+    }
+
     /// Read fresh canonical state; an authoritative refusal never tries another
     /// provider, and a cache is never used as offline permission.
     pub fn validate(&self) -> RegistryResult<RegistryLicenseState> {
@@ -1215,6 +1363,34 @@ fn notify(
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(progress)));
     }
+}
+const PORTABLE_KIND: &str = "talos-registry-portable-license";
+
+/// Where this installation keeps its registry state, and the key it is sealed
+/// under. One definition, because the portable import must write exactly the
+/// file `RegistryLicenseClient::new` will read.
+fn state_location(
+    options: &RegistryLicenseOptions,
+    trust: &RegistryTrust,
+) -> RegistryResult<(StateStore, PathBuf, String)> {
+    let scope = format!(
+        "wallet-registry:{}:{}:{}:{}",
+        trust.chain_id, trust.contract, trust.issuer, trust.product_id
+    );
+    let fp = crate::collect_fingerprint(&scope, &options.fingerprint_components);
+    let path = options
+        .state_path
+        .clone()
+        .unwrap_or_else(|| crate::default_state_path(&scope));
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|_| RegistryError::new("invalid_registry_state_path"))?
+            .join(path)
+    };
+    let store = StateStore::new(path.clone(), &scope, &state_key_material(&fp));
+    Ok((store, path, fp.composite))
 }
 fn stored_key(binding: &StoredBinding) -> RegistryResult<SigningKey> {
     let encoded = binding

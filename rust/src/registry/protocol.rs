@@ -226,6 +226,23 @@ pub(crate) fn status_proof_text(
     ))
 }
 
+pub(crate) fn checkin_proof_text(
+    product_token: &str,
+    license_id: &str,
+    device_key: &str,
+    install_id: &str,
+    timestamp: u64,
+) -> Result<String, RegistryError> {
+    Ok(format!(
+        "talos-registry-checkin.1.{}.{}.{}.{}.{}",
+        keccak_hex(product_token.as_bytes()),
+        fixed_hex(license_id, 32)?,
+        fixed_hex(device_key, 32)?,
+        install_id,
+        timestamp
+    ))
+}
+
 pub(crate) fn parse_manifest(
     raw: &str,
     trust: &RegistryTrust,
