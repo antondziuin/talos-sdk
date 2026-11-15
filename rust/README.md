@@ -56,6 +56,8 @@ Version 0.3.1 adds transactional license replacement, RPC authentication failove
 and signed public updates with Registry maintenance rights.
 Use 0.3.2 or later for automatic update-key recovery and independent license
 checks while an archive is downloading.
+Version 0.3.3 adds portable license files (`export_portable_license` /
+`import_portable_license`) and optional launch reports (`report_launch`).
 
 ```toml
 [dependencies]
