@@ -112,6 +112,17 @@ struct Model {
     job: String,
     records: BTreeMap<String, LicenseRecord>,
     checkins: Vec<Value>,
+    /// Holder the activation API names; the activator for a recoverable policy.
+    manifest_holder: String,
+    /// Runtime code at the activator address; empty means nothing is deployed there.
+    activator_runtime: String,
+    /// What the activator returns from `getEntitlements`, by hash.
+    published: BTreeMap<String, Vec<u8>>,
+    /// Identifiers with no record read as never issued instead of failing the fixture.
+    unknown_is_missing: bool,
+    /// The activation API behaves like the worker: the record and its bytes exist on
+    /// chain by the time the manifest is handed out.
+    publish_on_activate: bool,
 }
 struct Server(Mutex<Model>);
 impl Server {
@@ -149,6 +160,11 @@ impl Server {
             job: JOB.into(),
             records: BTreeMap::new(),
             checkins: Vec::new(),
+            manifest_holder: address("22"),
+            activator_runtime: include_str!("test-activator-runtime.hex").trim().to_owned(),
+            published: BTreeMap::new(),
+            unknown_is_missing: false,
+            publish_on_activate: false,
         })))
     }
     fn with(&self, action: impl FnOnce(&mut Model)) {
@@ -157,7 +173,7 @@ impl Server {
     fn manifest(model: &Model) -> Value {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let mut value = json!({"v":1,"kind":"talos-registry-license","chain_id":8453,"contract":address("11"),
-            "issuer":address("22"),"product_id":word("33"),"license_id":model.manifest_license_id,"holder":address("22"),
+            "issuer":address("22"),"product_id":word("33"),"license_id":model.manifest_license_id,"holder":model.manifest_holder,
             "entitlements":URL_SAFE_NO_PAD.encode(&model.entitlements_json)});
         if let Some(field) = model.bad_manifest {
             value[field] = match field {
@@ -191,6 +207,17 @@ impl Server {
     fn record(model: &Model, id: &str) -> LicenseRecord {
         if let Some(record) = model.records.get(id) {
             return record.clone();
+        }
+        if model.unknown_is_missing {
+            return LicenseRecord {
+                device: word("00"),
+                holder: address("00"),
+                rights_hash: word("00"),
+                not_before: 0,
+                expires: 0,
+                revision: 0,
+                status: 0,
+            };
         }
         assert_eq!(id, word("44"));
         LicenseRecord {
@@ -250,8 +277,23 @@ impl Transport for Server {
                 ));
                 let device = body["device_key"].as_str().unwrap().to_owned();
                 model.devices.push(device.clone());
-                model.device = device;
+                model.device = device.clone();
                 let reply = model.activation.pop_front().unwrap_or(Reply::Ready);
+                if model.publish_on_activate && matches!(reply, Reply::Ready) {
+                    let record = LicenseRecord {
+                        device,
+                        holder: model.manifest_holder.clone(),
+                        rights_hash: protocol::keccak_hex(&model.entitlements_json),
+                        not_before: model.not_before,
+                        expires: model.expires,
+                        revision: 2,
+                        status: 1,
+                    };
+                    let bytes = model.entitlements_json.clone();
+                    model.published.insert(record.rights_hash.clone(), bytes);
+                    let id = model.manifest_license_id.clone();
+                    model.records.insert(id, record);
+                }
                 return Ok(Self::reply(&model, reply));
             }
             if request.url.ends_with("/checkin") {
@@ -307,9 +349,36 @@ impl Transport for Server {
                 json!({"number":format!("0x{number:x}"),"hash":format!("0x{number:064x}"),"timestamp":format!("0x{:x}",model.timestamp)})
             }
             "eth_getCode" => {
-                assert_eq!(body["params"][0], address("11"));
                 assert_eq!(body["params"][1], format!("0x{:x}", model.head));
-                json!(model.runtime)
+                if body["params"][0] == address("77") {
+                    json!(model.activator_runtime)
+                } else {
+                    assert_eq!(body["params"][0], address("11"));
+                    json!(model.runtime)
+                }
+            }
+            "eth_call" if body["params"][0]["to"] == address("77") => {
+                assert_eq!(body["params"][1], format!("0x{:x}", model.head));
+                let data = body["params"][0]["data"].as_str().unwrap();
+                if data == selector("activatorVersion()") {
+                    json!(format!("0x{}", uint(1)))
+                } else {
+                    assert!(data.starts_with(&selector("getEntitlements(bytes32)")));
+                    assert_eq!(data.len(), 10 + 64);
+                    let bytes = model
+                        .published
+                        .get(&format!("0x{}", &data[10..]))
+                        .cloned()
+                        .unwrap_or_default();
+                    let padding = (32 - bytes.len() % 32) % 32;
+                    json!(format!(
+                        "0x{}{}{}{}",
+                        uint(32),
+                        uint(bytes.len() as u64),
+                        &protocol::hex(&bytes)[2..],
+                        "00".repeat(padding)
+                    ))
+                }
             }
             "eth_call" => {
                 assert_eq!(body["params"][0]["to"], address("11"));
@@ -342,7 +411,18 @@ impl Transport for Server {
                     ))
                 } else {
                     let id = format!("0x{}", &data[138..202]);
-                    Self::record(&model, &id);
+                    let record = Self::record(&model, &id);
+                    // A record the fixture stores explicitly is checked against itself; the
+                    // implicit default record is the one the activation API last described.
+                    let (holder, device, rights) = if model.records.contains_key(&id) {
+                        (record.holder, record.device, record.rights_hash)
+                    } else {
+                        (
+                            address("22"),
+                            model.device.clone(),
+                            protocol::keccak_hex(&model.entitlements_json),
+                        )
+                    };
                     assert_eq!(
                         data,
                         format!(
@@ -353,9 +433,9 @@ impl Transport for Server {
                             address_word(&address("22")),
                             &word("33")[2..],
                             &id[2..],
-                            address_word(&address("22")),
-                            &model.device[2..],
-                            &protocol::keccak_hex(&model.entitlements_json)[2..]
+                            address_word(&holder),
+                            &device[2..],
+                            &rights[2..]
                         )
                     );
                     if let Some(path) = model.block_state_write.take() {
@@ -414,6 +494,8 @@ fn imported(profile: &Profile, server: Arc<Server>) -> RegistryLicenseClient {
     client
 }
 
+#[path = "recovery_tests.rs"]
+mod recovery;
 #[path = "replacement_tests.rs"]
 mod replacement;
 

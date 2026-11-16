@@ -99,6 +99,11 @@ pub struct RegistryLicenseOptions {
     pub product_token: Option<String>,
     /// Per-request timeout, capped at ten seconds; zero is refused.
     pub http_timeout: Duration,
+    /// The deployed TalosLicenseActivatorV1 address, from the publisher's integration
+    /// settings, when the policy issues licenses that can be recovered from their code.
+    /// With it, a client opened through [`RegistryLicenseClient::with_code`] restores an
+    /// already activated license from the registry alone, with no Talos request.
+    pub activator: Option<String>,
 }
 
 impl Default for RegistryLicenseOptions {
@@ -115,6 +120,7 @@ impl Default for RegistryLicenseOptions {
             activation_url: None,
             product_token: None,
             http_timeout: Duration::from_secs(10),
+            activator: None,
         }
     }
 }
@@ -156,7 +162,8 @@ pub enum RegistryActivationStatus {
 pub struct RegistryActivationProgress {
     /// Current stage.
     pub status: RegistryActivationStatus,
-    /// Public activation job UUID.
+    /// Public activation job UUID; empty when a license is restored from the registry
+    /// by its code, which involves no activation job.
     pub activation_id: String,
     /// Suggested delay before another status poll.
     pub retry_after_seconds: u64,
@@ -319,6 +326,7 @@ struct Inner {
     trust: RegistryTrust,
     transport: Arc<dyn Transport>,
     endpoint: Option<ActivationEndpoint>,
+    activator: Option<String>,
     store: StateStore,
     path: PathBuf,
     key: SigningKey,
@@ -345,13 +353,13 @@ impl RegistryLicenseClient {
     /// Validate configuration and restore/create this installation's encrypted
     /// device identity. An unwritable state file is a refusal, not best-effort.
     pub fn new(mut options: RegistryLicenseOptions) -> RegistryResult<Self> {
-        let trust = RegistryTrust {
-            chain_id: options.chain_id,
-            contract: options.contract.to_ascii_lowercase(),
-            issuer: options.issuer.to_ascii_lowercase(),
-            product_id: options.product_id.to_ascii_lowercase(),
-        };
-        protocol::validate_trust(&trust)?;
+        let trust = trust_of(&options)?;
+        let activator = options
+            .activator
+            .as_deref()
+            .map(|address| protocol::nonzero_hex(address, 20))
+            .transpose()
+            .map_err(|_| RegistryError::new("invalid_registry_configuration"))?;
         if options.rpc_urls.is_empty()
             || options.rpc_urls.len() > 5
             || options.http_timeout.is_zero()
@@ -433,6 +441,7 @@ impl RegistryLicenseClient {
             trust,
             transport,
             endpoint,
+            activator,
             store,
             path,
             key,
@@ -537,13 +546,7 @@ impl RegistryLicenseClient {
         raw: &str,
     ) -> RegistryResult<Self> {
         let invalid = || RegistryError::new("invalid_portable_license");
-        let trust = RegistryTrust {
-            chain_id: options.chain_id,
-            contract: options.contract.to_ascii_lowercase(),
-            issuer: options.issuer.to_ascii_lowercase(),
-            product_id: options.product_id.to_ascii_lowercase(),
-        };
-        protocol::validate_trust(&trust)?;
+        let trust = trust_of(&options)?;
         if raw.len() > 131_072 {
             return Err(invalid());
         }
@@ -605,6 +608,148 @@ impl RegistryLicenseClient {
             }
         }
         Self::new(options)
+    }
+
+    /// Open a client whose device identity is derived from the customer's license code.
+    ///
+    /// This is how an application uses a policy with code recovery. The key a license is
+    /// bound to is computed from the code instead of being generated at random, so the
+    /// same code produces the same key on a reinstalled system or another computer. Call
+    /// `activate(code)` on the result: a first activation goes through Talos once, and
+    /// every later one, anywhere, is rebuilt from the registry over RPC with no Talos
+    /// request, provided `activator` is set in the options.
+    ///
+    /// **The code is then a bearer credential.** Whoever knows it can run the application
+    /// on any number of computers for as long as the license stands, and only an on-chain
+    /// revocation stops them. Use this only with policies meant to work that way.
+    ///
+    /// Neither the code nor anything that reveals it is stored; the derived key is kept in
+    /// this installation's encrypted state like any device key. An installation that
+    /// already holds a license under a different key is refused with
+    /// `registry_already_activated` rather than overwritten: use
+    /// [`replace_with_code`](Self::replace_with_code) to change codes.
+    pub fn with_code(options: RegistryLicenseOptions, code: &str) -> RegistryResult<Self> {
+        let trust = trust_of(&options)?;
+        let identity = protocol::code_identity(&trust, code)?;
+        let public = STANDARD.encode(
+            SigningKey::from_bytes(&identity.seed)
+                .verifying_key()
+                .as_bytes(),
+        );
+        let (store, path, composite) = state_location(&options, &trust)?;
+        {
+            let _guard = FileLock::acquire(&lock_path(&path, ".lock"), None)?;
+            let mut binding = match store.load() {
+                Some(binding) => binding,
+                None if path.exists() => return Err(RegistryError::new("invalid_device_state")),
+                None => StoredBinding::empty(&composite),
+            };
+            let same = binding.machine_public_key.as_deref() == Some(public.as_str());
+            if binding.registry_manifest.is_some()
+                || binding.registry_activation_id.is_some()
+                || binding.registry_replacement_id.is_some()
+            {
+                if !same {
+                    return Err(RegistryError::new("registry_already_activated"));
+                }
+            } else if !same {
+                // A key generated here and never bound to anything is replaced; nothing on
+                // chain refers to it.
+                binding.machine_key = Some(STANDARD.encode(identity.seed.as_slice()));
+                binding.machine_public_key = Some(public);
+                binding.registry_chain_state = None;
+                if !store.save(&binding) {
+                    return Err(RegistryError::new("device_state_not_saved"));
+                }
+            }
+        }
+        Self::new(options)
+    }
+
+    /// Switch this installation to another code on a policy with code recovery, keeping
+    /// the current license in force until the new one has passed a fresh registry check.
+    ///
+    /// A recoverable license is bound to a key derived from its code, so a new code means
+    /// a new key; [`replace_license`](Self::replace_license), which keeps the key, cannot
+    /// do this and refuses when `activator` is configured. The new code is activated in a
+    /// side file next to the state file and swapped in only on success. An interrupted
+    /// call can simply be repeated with the same code and resumes the same activation.
+    ///
+    /// Returns a new client. Handles opened before the swap hold the old key and fail
+    /// with `device_key_missing`; drop them and use the returned one.
+    pub fn replace_with_code(
+        options: RegistryLicenseOptions,
+        code: &str,
+        activation: &RegistryActivationOptions,
+    ) -> RegistryResult<(Self, RegistryLicenseState)> {
+        let trust = trust_of(&options)?;
+        let identity = protocol::code_identity(&trust, code)?;
+        let public = STANDARD.encode(
+            SigningKey::from_bytes(&identity.seed)
+                .verifying_key()
+                .as_bytes(),
+        );
+        let (store, path, _) = state_location(&options, &trust)?;
+        let current = {
+            let _guard = FileLock::acquire(&lock_path(&path, ".lock"), None)?;
+            match store.load() {
+                Some(binding) => Some(binding),
+                None if path.exists() => return Err(RegistryError::new("invalid_device_state")),
+                None => None,
+            }
+        };
+        let occupied = current.as_ref().is_some_and(|binding| {
+            binding.registry_manifest.is_some()
+                || binding.registry_activation_id.is_some()
+                || binding.registry_replacement_id.is_some()
+        });
+        let same = current
+            .as_ref()
+            .is_some_and(|binding| binding.machine_public_key.as_deref() == Some(public.as_str()));
+        if !occupied || same {
+            // Nothing to preserve, or the same code again: an ordinary activation.
+            let client = Self::with_code(options, code)?;
+            let license = client.activate_with_options(code, activation)?;
+            return Ok((client, license));
+        }
+        let next_path = lock_path(&path, ".next");
+        let mut side = options.clone();
+        side.state_path = Some(next_path.clone());
+        let (side_store, _, _) = state_location(&side, &trust)?;
+        {
+            // A side file left by a different code belongs to an abandoned attempt.
+            let _guard = FileLock::acquire(&lock_path(&next_path, ".lock"), None)?;
+            let stale = match side_store.load() {
+                Some(binding) => binding.machine_public_key.as_deref() != Some(public.as_str()),
+                None => next_path.exists(),
+            };
+            if stale && std::fs::remove_file(&next_path).is_err() {
+                return Err(RegistryError::new("device_state_not_saved"));
+            }
+        }
+        let license = Self::with_code(side, code)?.activate_with_options(code, activation)?;
+        {
+            let _activation = FileLock::acquire(&lock_path(&path, ".activation.lock"), None)?;
+            let _state = FileLock::acquire(&lock_path(&path, ".lock"), None)?;
+            let _next = FileLock::acquire(&lock_path(&next_path, ".lock"), None)?;
+            let mut next = side_store
+                .load()
+                .filter(|binding| {
+                    binding.registry_manifest.is_some()
+                        && binding.machine_public_key.as_deref() == Some(public.as_str())
+                })
+                .ok_or_else(|| RegistryError::new("device_state_not_saved"))?;
+            // The clock high-water marks belong to this computer, not to a license.
+            if let Some(old) = store.load() {
+                next.time_high_water = next.time_high_water.max(old.time_high_water);
+                next.offline_seen = next.offline_seen.max(old.offline_seen);
+            }
+            if !store.save(&next) {
+                return Err(RegistryError::new("device_state_not_saved"));
+            }
+            let _ = std::fs::remove_file(&next_path);
+        }
+        Ok((Self::new(options)?, license))
     }
 
     /// Tell the publisher's Talos server that this installation started.
@@ -745,6 +890,11 @@ impl RegistryLicenseClient {
         code: Option<&str>,
         options: &RegistryActivationOptions,
     ) -> RegistryResult<RegistryLicenseState> {
+        if code.is_some() && self.0.activator.is_some() {
+            // A recoverable license is bound to a key derived from its code. Replacing the
+            // manifest under the current key would produce one its own code cannot recover.
+            return Err(RegistryError::new("registry_code_replacement_required"));
+        }
         let budget = self.activation_budget(options)?;
         budget.remaining()?;
         let _guard =
@@ -970,13 +1120,22 @@ impl RegistryLicenseClient {
             budget.remaining()?;
             return result;
         }
+        let pending =
+            self.with_binding_budget(Some(&budget), |b| Ok(b.registry_activation_id.clone()))?;
+        if pending.is_none() {
+            // A license already published under this code is rebuilt from the registry;
+            // Talos is asked only when there is nothing on chain to recover.
+            if let Some(license) =
+                self.recover_from_chain(code, options, &scoped, &budget, generation)?
+            {
+                return Ok(license);
+            }
+        }
         let endpoint = self
             .0
             .endpoint
             .as_ref()
             .ok_or_else(|| RegistryError::new("registry_activation_not_configured"))?;
-        let pending =
-            self.with_binding_budget(Some(&budget), |b| Ok(b.registry_activation_id.clone()))?;
         let mut response = match pending {
             Some(id) => self.poll(endpoint, &scoped, &id, &budget, generation)?,
             None => {
@@ -1074,6 +1233,78 @@ impl RegistryLicenseClient {
                 }
             }
         }
+    }
+
+    /// With an activator configured, look for a license already published under `code` and
+    /// install it from chain data alone. `None` sends the caller on to the activation
+    /// service: no activator, no code, or nothing recoverable on chain.
+    fn recover_from_chain(
+        &self,
+        code: &str,
+        options: &RegistryActivationOptions,
+        transport: &dyn Transport,
+        budget: &Budget,
+        generation: u64,
+    ) -> RegistryResult<Option<RegistryLicenseState>> {
+        let Some(activator) = self.0.activator.as_deref() else {
+            return Ok(None);
+        };
+        if code.trim().is_empty() {
+            return Ok(None);
+        }
+        let identity = protocol::code_identity(&self.0.trust, code)?;
+        if SigningKey::from_bytes(&identity.seed).verifying_key() != self.0.key.verifying_key() {
+            // This client holds a random key. Activating with it would bind the license to a
+            // key its own code cannot reproduce, which is the one thing this mode promises.
+            return Err(RegistryError::new("registry_code_identity_required"));
+        }
+        self.assert_active(budget, generation)?;
+        let found = chain::recover_manifest(
+            transport,
+            &self.0.options.rpc_urls,
+            &chain::RecoveryInput {
+                trust: &self.0.trust,
+                activator,
+                license_id: &identity.license_id,
+                device_key: &self.0.device_key,
+            },
+            || self.now(),
+        );
+        self.assert_active(budget, generation)?;
+        let Some(manifest) = found? else {
+            return Ok(None);
+        };
+        let raw = serde_json::to_string(&manifest)
+            .map_err(|_| RegistryError::new("invalid_registry_manifest"))?;
+        let candidate = protocol::parse_manifest(&raw, &self.0.trust)?;
+        // No activation job exists for a license read straight from the registry.
+        notify(options, RegistryActivationStatus::Validating, "", 0);
+        let check = self.validate_candidate(&candidate, generation, transport, Some(budget));
+        self.assert_active(budget, generation)?;
+        check?;
+        let generation = {
+            // Same lock order as `commit_ready`: manifest, then persisted state.
+            let mut manifest = lock(&self.0.manifest);
+            self.assert_active(budget, generation)?;
+            if manifest.is_some() {
+                return Err(RegistryError::new("registry_activation_interrupted"));
+            }
+            self.with_binding_budget(Some(budget), |binding| {
+                self.assert_active(budget, generation)?;
+                if binding.registry_activation_id.is_some() || binding.registry_manifest.is_some() {
+                    return Err(RegistryError::new("registry_activation_state_conflict"));
+                }
+                binding.registry_manifest = Some(raw.clone());
+                self.save_binding(binding)
+            })?;
+            *manifest = Some(candidate);
+            self.0.generation.fetch_add(1, Ordering::AcqRel) + 1
+        };
+        let result = self.validate_with(transport, Some(budget));
+        self.assert_active(budget, generation)?;
+        let result = result?;
+        notify(options, RegistryActivationStatus::Ready, "", 0);
+        Ok(Some(result))
     }
 
     fn now(&self) -> u64 {
@@ -1365,6 +1596,18 @@ fn notify(
     }
 }
 const PORTABLE_KIND: &str = "talos-registry-portable-license";
+
+/// The application's pins in canonical form, validated.
+fn trust_of(options: &RegistryLicenseOptions) -> RegistryResult<RegistryTrust> {
+    let trust = RegistryTrust {
+        chain_id: options.chain_id,
+        contract: options.contract.to_ascii_lowercase(),
+        issuer: options.issuer.to_ascii_lowercase(),
+        product_id: options.product_id.to_ascii_lowercase(),
+    };
+    protocol::validate_trust(&trust)?;
+    Ok(trust)
+}
 
 /// Where this installation keeps its registry state, and the key it is sealed
 /// under. One definition, because the portable import must write exactly the

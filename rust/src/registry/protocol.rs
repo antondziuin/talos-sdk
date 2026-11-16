@@ -5,6 +5,7 @@ use http::Uri;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha3::{Digest, Keccak256};
+use zeroize::Zeroizing;
 
 use super::RegistryError;
 
@@ -243,6 +244,65 @@ pub(crate) fn checkin_proof_text(
     ))
 }
 
+/// The form of a license code the Talos server hashes: ASCII letters and digits only,
+/// upper case, with the look-alike Crockford characters folded (I, L → 1; O → 0). A code
+/// typed with or without its dashes, in either case, therefore names the same license.
+pub(crate) fn normalize_code(code: &str) -> String {
+    code.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| match c.to_ascii_uppercase() {
+            'I' | 'L' => '1',
+            'O' => '0',
+            other => other,
+        })
+        .collect()
+}
+
+/// What a recoverable license's code determines on its own: where the record lives in the
+/// registry, and the device key that record is bound to.
+pub(crate) struct CodeIdentity {
+    /// Public registry identifier, 0x-prefixed 32-byte hex.
+    pub license_id: String,
+    /// Ed25519 seed. Secret: whoever has it can run the application.
+    pub seed: Zeroizing<[u8; 32]>,
+}
+
+/// Derive the identity of a recoverable license from its code and the application's pins.
+///
+/// Both values hang off one root so that neither reveals the other, and the root binds the
+/// chain, registry, issuer and product: the same code under another product is unrelated.
+/// The server computes the identifier the same way, and the public key too, so that it can
+/// refuse to bind a recoverable license to any other key. A code carries 120 random bits,
+/// so the public identifier and key do not help anyone guess it.
+pub(crate) fn code_identity(
+    trust: &RegistryTrust,
+    code: &str,
+) -> Result<CodeIdentity, RegistryError> {
+    validate_trust(trust)?;
+    let normalized = Zeroizing::new(normalize_code(code));
+    if normalized.is_empty() || normalized.len() > 256 {
+        return Err(RegistryError::new("activation_code_required"));
+    }
+    let mut input = Zeroizing::new(b"talos-registry-code-v1\0".to_vec());
+    input.extend_from_slice(&[0; 24]);
+    input.extend_from_slice(&trust.chain_id.to_be_bytes());
+    for pin in [&trust.contract, &trust.issuer, &trust.product_id] {
+        input.extend_from_slice(&decode_hex(pin)?);
+    }
+    input.extend_from_slice(normalized.as_bytes());
+    let root = Zeroizing::new(<[u8; 32]>::from(Keccak256::digest(&*input)));
+    let derive = |label: &[u8]| {
+        let mut hasher = Keccak256::new();
+        hasher.update(label);
+        hasher.update(root.as_slice());
+        <[u8; 32]>::from(hasher.finalize())
+    };
+    Ok(CodeIdentity {
+        license_id: hex(&derive(b"talos-registry-code-license-v1")),
+        seed: Zeroizing::new(derive(b"talos-registry-code-device-v1")),
+    })
+}
+
 pub(crate) fn parse_manifest(
     raw: &str,
     trust: &RegistryTrust,
@@ -398,6 +458,61 @@ mod tests {
         );
         assert!(!registry_uuid("abcdef01-2345-6789-abcd-ef012345678"));
         assert!(activation_proof_text("tpt_fixture", "TEST-CODE", &key, "bad-id").is_err());
+    }
+
+    #[test]
+    fn code_identity_matches_independent_node_vector_and_ignores_how_the_code_is_typed() {
+        let (trust, _) = fixture();
+        let identity = code_identity(&trust, "0123456789ABCDEFGHJKMNPQR").unwrap();
+        // Computed with viem's keccak256 and Node's Ed25519; the server derives the same
+        // identifier in `talos_wallet::registry::code_license_id`.
+        assert_eq!(
+            identity.license_id,
+            "0xdce9ae5ad263079c0f4134e75a51932bcf0970c14aaf6351cd8da992aae67944"
+        );
+        assert_eq!(
+            hex(&*identity.seed),
+            "0x827207622bc29125e0ae0c512683a6665a025fe90561d6652904bad141b73cbc"
+        );
+        assert_eq!(
+            hex(ed25519_dalek::SigningKey::from_bytes(&identity.seed)
+                .verifying_key()
+                .as_bytes()),
+            "0x5402ca53f9f96eb225b57d8da35993dcd294b6df98ae525690a1f1585a31971b"
+        );
+        for typed in [
+            "01234-56789-ABCDE-FGHJK-MNPQR",
+            " o1234-56789-abcde-fghjk-mnpqr\n",
+            "0I234 56789 ABCDE FGHJK MNPQR",
+            "0L23456789abcdefghjkmnpqr",
+        ] {
+            let same = code_identity(&trust, typed).unwrap();
+            assert_eq!(same.license_id, identity.license_id, "{typed}");
+            assert_eq!(*same.seed, *identity.seed, "{typed}");
+        }
+        assert_eq!(normalize_code("ab-IL-o0"), "AB1100");
+        let other_code = code_identity(&trust, "0123456789ABCDEFGHJKMNPQS").unwrap();
+        assert_ne!(other_code.license_id, identity.license_id);
+        assert_ne!(*other_code.seed, *identity.seed);
+        for change in 0..4 {
+            let mut other = trust.clone();
+            match change {
+                0 => other.chain_id = 11155111,
+                1 => other.contract = format!("0x{}", "12".repeat(20)),
+                2 => other.issuer = format!("0x{}", "23".repeat(20)),
+                _ => other.product_id = format!("0x{}", "34".repeat(32)),
+            }
+            let moved = code_identity(&other, "0123456789ABCDEFGHJKMNPQR").unwrap();
+            assert_ne!(moved.license_id, identity.license_id);
+            assert_ne!(*moved.seed, *identity.seed);
+        }
+        for empty in ["", " - - ", "\u{2014}"] {
+            assert_eq!(
+                code_identity(&trust, empty).err().unwrap().code(),
+                "activation_code_required"
+            );
+        }
+        assert!(code_identity(&trust, &"A".repeat(257)).is_err());
     }
 
     #[test]

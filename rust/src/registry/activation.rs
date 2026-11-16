@@ -218,6 +218,9 @@ fn api_error(status: u16, body: &Value) -> RegistryError {
         "tenant_closed",
         "registry_activation_unavailable",
         "registry_base_activation_disabled",
+        // The policy issues code-recoverable licenses and this client's key was not
+        // derived from the code: open it with `RegistryLicenseClient::with_code`.
+        "registry_code_identity_required",
         "rate_limited",
     ];
     match known.into_iter().find(|known| Some(*known) == code) {
@@ -459,6 +462,7 @@ mod tests {
             "license_not_found",
             "activation_already_bound",
             "registry_base_activation_disabled",
+            "registry_code_identity_required",
         ] {
             let fake = Fake::json(404, json!({"error":code,"details":PRIVATE_TEXT}));
             let error = endpoint()

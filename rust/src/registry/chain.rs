@@ -9,14 +9,19 @@ use serde_json::{json, Value};
 
 use crate::transport::{HttpRequest, Transport};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
 use super::protocol::{
     decode_hex, fixed_hex, hex, keccak_hex, validate_endpoint, validate_trust, ParsedManifest,
-    RegistryTrust,
+    RegistryLicenseManifest, RegistryTrust,
 };
 use super::RegistryError;
 
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
 const RUNTIME_HASH: &str = "0xa87a5b6815e052c3833968b93d7bac89fce3fe4406ddc5b6a3dab930820f64bb";
+/// TalosLicenseActivatorV1: same compiler settings, non-upgradeable, ownerless, no immutables.
+const ACTIVATOR_RUNTIME_HASH: &str =
+    "0x8b0141e57fe37f1360a476111d893cc258cdba407d097e6c21107ce5e236f916";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -359,6 +364,174 @@ fn boolean(bytes: &[u8]) -> Result<bool, RegistryError> {
     Ok(bytes[31] == 1)
 }
 
+/// The exact runtime code and version of a pinned contract at `tag`.
+fn verify_runtime(
+    rpc: &Rpc<'_>,
+    contract: &str,
+    tag: &str,
+    runtime_hash: &str,
+    version: &str,
+    codes: [&'static str; 3],
+) -> Result<(), RegistryError> {
+    let [missing, wrong_runtime, wrong_version] = codes;
+    let code = rpc.call("eth_getCode", json!([contract, tag]))?;
+    let code = decode_hex(code.as_str().ok_or_else(|| RegistryError::new(missing))?)
+        .map_err(|_| RegistryError::new(missing))?;
+    if code.is_empty() {
+        return Err(RegistryError::new(missing));
+    }
+    if keccak_hex(&code) != runtime_hash {
+        return Err(RegistryError::new(wrong_runtime));
+    }
+    let reported = rpc.call_contract(contract, tag, selector(version))?;
+    if reported.len() != 32 || reported[..31].iter().any(|b| *b != 0) || reported[31] != 1 {
+        return Err(RegistryError::new(wrong_version));
+    }
+    Ok(())
+}
+
+fn verify_registry(rpc: &Rpc<'_>, contract: &str, tag: &str) -> Result<(), RegistryError> {
+    verify_runtime(
+        rpc,
+        contract,
+        tag,
+        RUNTIME_HASH,
+        "registryVersion()",
+        [
+            "registry_contract_missing",
+            "wrong_registry_runtime",
+            "wrong_registry_version",
+        ],
+    )
+}
+
+/// ABI-decodes a returned `bytes` value: an offset word, a length word, then padded data.
+fn abi_bytes(bytes: &[u8]) -> Result<Vec<u8>, RegistryError> {
+    if bytes.len() < 64 || bytes.len() % 32 != 0 || uint_word(&bytes[..32], 8).ok() != Some(32) {
+        return Err(invalid());
+    }
+    let length = uint_word(&bytes[32..64], 8).map_err(|_| invalid())? as usize;
+    let room = bytes.len() - 64;
+    if length > room || room - length >= 32 || length > 32_768 {
+        return Err(invalid());
+    }
+    Ok(bytes[64..64 + length].to_vec())
+}
+
+/// What an application knows about a recoverable license before it has a manifest.
+pub(crate) struct RecoveryInput<'a> {
+    pub trust: &'a RegistryTrust,
+    /// Pinned `TalosLicenseActivatorV1` address.
+    pub activator: &'a str,
+    /// Identifier derived from the code.
+    pub license_id: &'a str,
+    /// Public device key derived from the same code.
+    pub device_key: &'a str,
+}
+
+fn recover_url(
+    rpc: &Rpc<'_>,
+    input: &RecoveryInput<'_>,
+    now: &mut impl FnMut() -> u64,
+) -> Result<Option<RegistryLicenseManifest>, RegistryError> {
+    if quantity(&rpc.call("eth_chainId", json!([]))?)? != input.trust.chain_id {
+        return Err(RegistryError::new("wrong_rpc_chain"));
+    }
+    let latest = block(&rpc.call("eth_getBlockByNumber", json!(["latest", false]))?)?;
+    let time = now();
+    if latest.timestamp < time.saturating_sub(300) || latest.timestamp > time.saturating_add(30) {
+        return Err(RegistryError::transient("stale_rpc_block"));
+    }
+    verify_registry(rpc, &input.trust.contract, &latest.tag)?;
+    verify_runtime(
+        rpc,
+        input.activator,
+        &latest.tag,
+        ACTIVATOR_RUNTIME_HASH,
+        "activatorVersion()",
+        [
+            "registry_activator_missing",
+            "wrong_registry_activator",
+            "wrong_registry_activator",
+        ],
+    )?;
+    let calldata = format!(
+        "{}{}{}{}",
+        selector("getLicense(address,bytes32,bytes32)"),
+        address_word(&input.trust.issuer)?,
+        &input.trust.product_id[2..],
+        &input.license_id[2..]
+    );
+    let record = record(&rpc.call_contract(&input.trust.contract, &latest.tag, calldata)?)?;
+    // Nothing published under this code yet, or a record this code's key cannot claim: an
+    // installation activated before recovery existed, or a binding still in flight. Neither
+    // is an error; the caller falls back to the activation service.
+    if record.status == 0
+        || !record.holder.eq_ignore_ascii_case(input.activator)
+        || !record.device_key.eq_ignore_ascii_case(input.device_key)
+    {
+        return Ok(None);
+    }
+    let published = abi_bytes(&rpc.call_contract(
+        input.activator,
+        &latest.tag,
+        format!(
+            "{}{}",
+            selector("getEntitlements(bytes32)"),
+            &record.entitlements_hash[2..]
+        ),
+    )?)?;
+    // The activator is a plain store; the registry record is what makes these bytes true.
+    if published.is_empty() || keccak_hex(&published) != record.entitlements_hash {
+        return Ok(None);
+    }
+    let canonical = rpc.call("eth_getBlockByNumber", json!([latest.tag, false]))?;
+    if canonical.is_null() || !same_head(&latest.head(), &block(&canonical)?.head()) {
+        return Err(RegistryError::transient("rpc_snapshot_reorg"));
+    }
+    Ok(Some(RegistryLicenseManifest {
+        v: 1,
+        kind: "talos-registry-license".into(),
+        chain_id: input.trust.chain_id,
+        contract: input.trust.contract.clone(),
+        issuer: input.trust.issuer.clone(),
+        product_id: input.trust.product_id.clone(),
+        license_id: input.license_id.to_ascii_lowercase(),
+        holder: input.activator.to_ascii_lowercase(),
+        entitlements: URL_SAFE_NO_PAD.encode(&published),
+    }))
+}
+
+/// Rebuild the public manifest of a recoverable license from chain data alone: the record
+/// the code names, and the entitlement text its activator published. `None` means there is
+/// nothing here for this code and key to recover. Like any manifest, the result grants
+/// nothing by itself; the caller validates it against the registry before keeping it.
+pub(crate) fn recover_manifest(
+    transport: &dyn Transport,
+    rpc_urls: &[String],
+    input: &RecoveryInput<'_>,
+    mut now: impl FnMut() -> u64,
+) -> Result<Option<RegistryLicenseManifest>, RegistryError> {
+    validate_trust(input.trust)?;
+    fixed_hex(input.activator, 20)
+        .map_err(|_| RegistryError::new("invalid_registry_configuration"))?;
+    fixed_hex(input.license_id, 32).map_err(|_| RegistryError::new("invalid_registry_manifest"))?;
+    fixed_hex(input.device_key, 32).map_err(|_| RegistryError::new("invalid_device_key"))?;
+    if rpc_urls.is_empty() || rpc_urls.len() > 5 {
+        return Err(RegistryError::new("invalid_registry_configuration"));
+    }
+    let mut transient = RegistryError::transient("registry_rpc_unavailable");
+    for url in rpc_urls {
+        validate_endpoint(url, false)?;
+        match recover_url(&Rpc { transport, url }, input, &mut now) {
+            Ok(found) => return Ok(found),
+            Err(error) if error.is_transient() => transient = error,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(transient)
+}
+
 fn read_url(
     rpc: &Rpc<'_>,
     input: &ReadInput<'_>,
@@ -422,26 +595,7 @@ fn read_url(
     if latest.timestamp < time.saturating_sub(300) || latest.timestamp > time.saturating_add(30) {
         return Err(RegistryError::transient("stale_rpc_block"));
     }
-    let code = rpc.call("eth_getCode", json!([input.trust.contract, latest.tag]))?;
-    let code = decode_hex(
-        code.as_str()
-            .ok_or_else(|| RegistryError::new("registry_contract_missing"))?,
-    )
-    .map_err(|_| RegistryError::new("registry_contract_missing"))?;
-    if code.is_empty() {
-        return Err(RegistryError::new("registry_contract_missing"));
-    }
-    if keccak_hex(&code) != RUNTIME_HASH {
-        return Err(RegistryError::new("wrong_registry_runtime"));
-    }
-    let version = rpc.call_contract(
-        &input.trust.contract,
-        &latest.tag,
-        selector("registryVersion()"),
-    )?;
-    if version.len() != 32 || version[..31].iter().any(|b| *b != 0) || version[31] != 1 {
-        return Err(RegistryError::new("wrong_registry_version"));
-    }
+    verify_registry(rpc, &input.trust.contract, &latest.tag)?;
     let m = &input.parsed.manifest;
     let calldata = format!(
         "{}{}{}{}",

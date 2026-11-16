@@ -58,10 +58,13 @@ Use 0.3.2 or later for automatic update-key recovery and independent license
 checks while an archive is downloading.
 Version 0.3.3 adds portable license files (`export_portable_license` /
 `import_portable_license`) and optional launch reports (`report_launch`).
+Version 0.4.0 adds code recovery (`with_code` / `replace_with_code` and the
+`activator` option): the code a customer bought restores the license on any
+computer from the registry alone.
 
 ```toml
 [dependencies]
-talos-sdk = { version = "0.3", features = ["registry"] }
+talos-sdk = { version = "0.4", features = ["registry"] }
 ```
 
 ### Publisher integration configuration
@@ -149,7 +152,7 @@ personal data or secrets. Client patching and copied device keys remain possible
 Bring your own [`Transport`](#supplying-your-own-transport) with:
 
 ```toml
-talos-sdk = { version = "0.3", default-features = false, features = ["registry"] }
+talos-sdk = { version = "0.4", default-features = false, features = ["registry"] }
 ```
 
 Pass `transport: Some(Arc::new(your_transport))` in `RegistryLicenseOptions`.
@@ -208,6 +211,68 @@ The file is a bearer credential: whoever holds it can run the application, and
 there is no device limit. Export it only for licenses that are meant to be
 unrestricted, and never log or upload it. An installation that already holds a
 different license refuses the import instead of overwriting it.
+
+### The same code on any computer (code recovery)
+
+A portable file has to be exported before a computer is lost. Code recovery needs
+nothing but the code the customer bought: reinstall the system, type the code, and
+the license comes back from the registry over RPC, with no Talos request.
+
+It is a policy mode. The publisher creates the Registry policy with an activator
+contract, and the integration settings then carry an `activator` address to embed
+next to `issuer` and `contract`. In the application, open the client with the code:
+
+```rust
+let options = RegistryLicenseOptions {
+    activator: Some(config.activator),
+    // issuer, product_id, chain_id, contract, rpc_urls, activation_url and
+    // product_token are set exactly as for ordinary code activation.
+    ..Default::default()
+};
+let client = RegistryLicenseClient::new(options.clone())?;
+let client = if client.is_activated() {
+    client // later starts: saved state, no code needed
+} else {
+    drop(client);
+    let client = RegistryLicenseClient::with_code(options, &code)?;
+    client.activate(&code)?;
+    client
+};
+let license = client.require_valid_license()?;
+```
+
+`with_code` derives the device key from the code instead of generating one, so
+the same code yields the same key everywhere. `activate` then looks for the
+license on chain first. If it is there, it is installed from the registry record
+and the entitlement text the activator contract published, and Talos is never
+contacted. If it is not, this is the first activation and it goes through Talos
+as before. The code may be typed with or without dashes, in either case.
+
+Before relying on it, know what it changes:
+
+- **The code is a bearer credential.** Anyone who knows it can run the application
+  on any number of computers while the license stands. There is no device limit,
+  and the only remedy for a leaked code is revoking the license on chain.
+- The code itself is never stored; the derived key is kept in the encrypted
+  state like any device key.
+- Licenses activated before the policy had an activator keep their random key.
+  They are not recoverable by code; use a portable file or issue a new code.
+- A client opened with `new` holds a random key and `activate` refuses with
+  `registry_code_identity_required` rather than create a license its own code
+  could not restore. The server refuses such a key the same way, so an
+  application built without the `activator` option fails at its first
+  activation instead of quietly losing recovery.
+
+To switch a computer to another code, use
+`RegistryLicenseClient::replace_with_code(options, &new_code, &Default::default())`.
+A new code means a new key, so `replace_license` refuses with
+`registry_code_replacement_required` when `activator` is set. The current
+license stays in force until the new one passes a fresh registry check; the call
+returns a new client, and handles opened earlier then fail with
+`device_key_missing`.
+
+`RegistryLicenseOptions` gained the public `activator` field. Build options with
+`..Default::default()` so that added fields do not break your code.
 
 ### Reporting launches (optional)
 
