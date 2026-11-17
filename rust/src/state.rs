@@ -79,6 +79,9 @@ pub(crate) struct StoredBinding {
     pub registry_replacement_id: Option<String>,
     /// Highest canonical head/revision observations and terminal revocation.
     pub registry_chain_state: Option<String>,
+    /// The last fresh, valid registry observation — what an offline allowance
+    /// stamped into the licence is measured from. Never an allowance by itself.
+    pub registry_offline: Option<String>,
     /// Separate public-update verifier state, scoped independently of licensing.
     pub public_update_state: Option<String>,
 }
@@ -113,6 +116,7 @@ impl StoredBinding {
             "registryManifest": self.registry_manifest,
             "registryReplacementId": self.registry_replacement_id,
             "registryChainState": self.registry_chain_state,
+            "registryOffline": self.registry_offline,
             "publicUpdateState": self.public_update_state,
         })
     }
@@ -150,6 +154,7 @@ impl StoredBinding {
             registry_manifest: opt("registryManifest"),
             registry_replacement_id: opt("registryReplacementId"),
             registry_chain_state: opt("registryChainState"),
+            registry_offline: opt("registryOffline"),
             public_update_state: opt("publicUpdateState"),
         })
     }

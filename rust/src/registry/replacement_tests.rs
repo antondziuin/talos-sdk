@@ -429,6 +429,7 @@ fn update_state(entitlements: Value) -> RegistryLicenseState {
         block_number: 100,
         block_hash: word("aa"),
         checked_at: wall_time(),
+        offline_until: None,
     }
 }
 

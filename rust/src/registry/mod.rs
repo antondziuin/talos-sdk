@@ -1,5 +1,10 @@
 //! Walletless code activation and fresh license checks against a pinned EVM registry.
 //! Calls block: run them on a worker thread. A cached manifest never grants access.
+//!
+//! One thing may stand in for a fresh check, and only when the publisher asked for
+//! it: an offline allowance stamped into the license itself (`talos_offline`), which
+//! lets the last valid observation stand for a stated number of days while no RPC
+//! provider can be reached. See [`RegistryLicenseState::offline_until`].
 
 mod activation;
 mod chain;
@@ -182,7 +187,8 @@ pub struct RegistryActivationOptions {
     pub on_progress: Option<Arc<dyn Fn(RegistryActivationProgress) + Send + Sync>>,
 }
 
-/// A fresh observation, not an offline permit. Recheck before protected work.
+/// A fresh observation — or, where the license grants an offline allowance and no
+/// RPC provider could be reached, the last one. Recheck before protected work.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegistryLicenseState {
     /// Entitlements whose exact bytes hash matches the current chain record.
@@ -197,8 +203,22 @@ pub struct RegistryLicenseState {
     pub block_number: u64,
     /// Canonical hash of that block.
     pub block_hash: String,
-    /// Monotonic local observation time, Unix seconds.
+    /// Monotonic local observation time, Unix seconds. When [`Self::offline_until`]
+    /// is set, the time of the last fresh observation this state repeats.
     pub checked_at: u64,
+    /// `None` for a state read from the chain just now.
+    ///
+    /// `Some(deadline)` when no RPC provider could be reached and the license's
+    /// own offline allowance let the last valid observation stand: every other
+    /// field then describes that observation, and `deadline` is the Unix second
+    /// at which the allowance runs out — the earlier of the allowance and the
+    /// license's expiry. After it, validation fails with
+    /// `offline_period_expired` until a fresh check succeeds.
+    ///
+    /// The allowance is a term the publisher stamped into the license, so it is
+    /// covered by the entitlement hash the registry holds; a refusal read from
+    /// the chain — revoked, expired, another device — ends it at once.
+    pub offline_until: Option<u64>,
 }
 
 impl RegistryLicenseState {
@@ -244,6 +264,21 @@ impl RegistryLicenseState {
         self.maintenance_publication_cutoff()
     }
 
+    /// Days this license may run on its last valid observation when no RPC
+    /// provider can be reached, as stamped by the publisher's policy; `None`
+    /// when every check needs the network. A malformed term grants nothing.
+    #[must_use]
+    pub fn offline_allowance_days(&self) -> Option<u32> {
+        offline_allowance_days(&self.entitlements)
+    }
+
+    /// Whether this state repeats the last fresh observation under the
+    /// license's offline allowance instead of reading the chain just now.
+    #[must_use]
+    pub fn is_offline(&self) -> bool {
+        self.offline_until.is_some()
+    }
+
     /// Maintenance window for a verified running build's signed publication
     /// time. Unlike update discovery, this ignores the legacy `updates: false`
     /// switch: disabling new downloads must not disable an already paid build.
@@ -268,6 +303,65 @@ impl RegistryLicenseState {
             }
             _ => Err(RegistryError::new("invalid_update_entitlement")),
         }
+    }
+}
+
+/// The offline term of a license: `{"talos_offline": {"days": N}}`, `N` a whole
+/// number from 1 to 36500. Anything else — a string, a fraction, an extra key —
+/// is read as no allowance, never as a generous one.
+fn offline_allowance_days(entitlements: &Map<String, Value>) -> Option<u32> {
+    let term = entitlements.get("talos_offline")?.as_object()?;
+    if term.len() != 1 {
+        return None;
+    }
+    let days = term.get("days")?.as_u64()?;
+    (1..=36_500).contains(&days).then_some(days as u32)
+}
+
+/// The last fresh, valid observation of one license, kept in the encrypted
+/// device state. It names the license and the exact entitlement bytes it was
+/// made for, so it cannot be carried over to another license or another
+/// revision of the terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineBasis {
+    license_id: String,
+    entitlements_hash: String,
+    checked_at: u64,
+    expires_at: u64,
+    not_before: u64,
+    revision: u64,
+    block_number: u64,
+    block_hash: String,
+}
+impl OfflineBasis {
+    fn to_json(&self) -> String {
+        serde_json::json!({
+            "v": 1, "licenseId": self.license_id, "entitlementsHash": self.entitlements_hash,
+            "checkedAt": self.checked_at, "expiresAt": self.expires_at,
+            "notBefore": self.not_before, "revision": self.revision,
+            "blockNumber": self.block_number, "blockHash": self.block_hash,
+        })
+        .to_string()
+    }
+    /// Field by field: the file is on a disk the user owns.
+    fn parse(raw: Option<&str>) -> Option<Self> {
+        let value: Value = serde_json::from_str(raw?).ok()?;
+        let fields = value.as_object()?;
+        if fields.get("v").and_then(Value::as_u64) != Some(1) {
+            return None;
+        }
+        let text = |key: &str| fields.get(key).and_then(Value::as_str).map(str::to_owned);
+        let number = |key: &str| fields.get(key).and_then(Value::as_u64);
+        Some(Self {
+            license_id: text("licenseId")?,
+            entitlements_hash: text("entitlementsHash")?,
+            checked_at: number("checkedAt")?,
+            expires_at: number("expiresAt")?,
+            not_before: number("notBefore")?,
+            revision: number("revision")?,
+            block_number: number("blockNumber")?,
+            block_hash: text("blockHash")?,
+        })
     }
 }
 
@@ -602,6 +696,7 @@ impl RegistryLicenseClient {
                 binding.machine_public_key = Some(public);
                 binding.registry_manifest = Some(manifest.to_owned());
                 binding.registry_chain_state = None;
+                binding.registry_offline = None;
                 if !store.save(&binding) {
                     return Err(RegistryError::new("device_state_not_saved"));
                 }
@@ -658,6 +753,7 @@ impl RegistryLicenseClient {
                 binding.machine_key = Some(STANDARD.encode(identity.seed.as_slice()));
                 binding.machine_public_key = Some(public);
                 binding.registry_chain_state = None;
+                binding.registry_offline = None;
                 if !store.save(&binding) {
                     return Err(RegistryError::new("device_state_not_saved"));
                 }
@@ -791,13 +887,122 @@ impl RegistryLicenseClient {
     }
 
     /// Read fresh canonical state; an authoritative refusal never tries another
-    /// provider, and a cache is never used as offline permission.
+    /// provider.
+    ///
+    /// A cache is never offline permission by itself. The one exception is a term
+    /// of the license: if the publisher's policy stamped an offline allowance
+    /// into it and no RPC provider can be reached, the last valid observation
+    /// stands until that allowance runs out, and the returned state says so in
+    /// [`RegistryLicenseState::offline_until`]. A license without the term keeps
+    /// failing with the transient RPC error, as before.
     pub fn validate(&self) -> RegistryResult<RegistryLicenseState> {
-        self.validate_with(self.0.transport.as_ref(), None)
+        match self.validate_with(self.0.transport.as_ref(), None) {
+            Ok(state) => Ok(state),
+            Err(error) if error.is_transient() => self.offline_state(error),
+            Err(error) => {
+                // The chain, or this device's own state, said no. Whatever was
+                // observed before is no longer something to fall back on.
+                self.forget_offline_basis();
+                Err(error)
+            }
+        }
     }
-    /// Require a fresh valid observation before a protected operation.
+    /// Require a valid license before a protected operation: a fresh observation,
+    /// or the last one while the license's own offline allowance lasts.
     pub fn require_valid_license(&self) -> RegistryResult<RegistryLicenseState> {
         self.validate()
+    }
+    /// Require a state read from the chain just now, ignoring any offline
+    /// allowance. For the operations a publisher never wants to run on a
+    /// remembered answer.
+    pub fn require_fresh_license(&self) -> RegistryResult<RegistryLicenseState> {
+        self.validate_with(self.0.transport.as_ref(), None)
+    }
+
+    /// Let the last valid observation stand, if the license allows it and it has
+    /// not run out. `cause` is the transient failure that brought us here, and is
+    /// what the caller gets back when there is nothing to stand on.
+    fn offline_state(&self, cause: RegistryError) -> RegistryResult<RegistryLicenseState> {
+        let (candidate, _) = self.snapshot()?;
+        let Some(days) = offline_allowance_days(&candidate.entitlements) else {
+            return Err(cause);
+        };
+        self.with_binding_budget(None, |binding| {
+            let Some(basis) = OfflineBasis::parse(binding.registry_offline.as_deref()) else {
+                return Err(cause.clone());
+            };
+            // The same license, under the same terms, that was observed.
+            if basis.license_id != candidate.manifest.license_id
+                || basis.entitlements_hash != candidate.entitlements_hash
+            {
+                return Err(cause.clone());
+            }
+            // The highest time this device has ever seen, not the wall clock: a
+            // clock set back must not buy the period again.
+            let now = self
+                .now()
+                .max(binding.time_high_water.max(0) as u64)
+                .max(binding.offline_seen.max(0) as u64)
+                .max(basis.checked_at);
+            // This moment is written down whatever the answer is, so a restart
+            // with an earlier wall clock still starts from here — including
+            // after a refusal, or running out could be undone by winding back.
+            let advanced = now as i64 > binding.offline_seen;
+            binding.offline_seen = binding.offline_seen.max(now as i64);
+            let verdict = (|| {
+                if basis.not_before > now {
+                    return Err(cause.clone());
+                }
+                if basis.expires_at != 0 && basis.expires_at <= now {
+                    return Err(RegistryError::new("license_expired"));
+                }
+                let allowance = basis
+                    .checked_at
+                    .saturating_add(u64::from(days).saturating_mul(86_400));
+                if allowance <= now {
+                    return Err(RegistryError::new("offline_period_expired"));
+                }
+                Ok(RegistryLicenseState {
+                    entitlements: candidate.entitlements.clone(),
+                    expires_at: (basis.expires_at != 0).then_some(basis.expires_at),
+                    not_before: basis.not_before,
+                    revision: basis.revision,
+                    block_number: basis.block_number,
+                    block_hash: basis.block_hash.clone(),
+                    checked_at: basis.checked_at,
+                    offline_until: Some(match basis.expires_at {
+                        0 => allowance,
+                        expires_at => allowance.min(expires_at),
+                    }),
+                })
+            })();
+            if advanced {
+                let saved = self.save_binding(binding);
+                // Access is granted only on a record that was actually written.
+                if verdict.is_ok() {
+                    saved?;
+                }
+            }
+            verdict
+        })
+    }
+
+    /// Drop the remembered observation. Best effort: a state that cannot be
+    /// written keeps what it had, and the refusal that brought us here is
+    /// returned to the caller either way.
+    fn forget_offline_basis(&self) {
+        let _ = self.with_binding_budget(None, |binding| {
+            if binding.registry_offline.take().is_some() {
+                self.save_binding(binding)?;
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn skip_time(&self, seconds: u64) {
+        let mut clock = lock(&self.0.clock);
+        clock.high = clock.high.saturating_add(Duration::from_secs(seconds));
     }
     /// Claim a code, or resume retained work, using the network-specific default deadline.
     pub fn activate(&self, code: &str) -> RegistryResult<RegistryLicenseState> {
@@ -1532,7 +1737,7 @@ impl RegistryLicenseClient {
         if observation.head.timestamp.saturating_add(300) < checked_at {
             return Err(RegistryError::transient("stale_rpc_block"));
         }
-        Ok(RegistryLicenseState {
+        let state = RegistryLicenseState {
             entitlements: candidate.entitlements.clone(),
             expires_at: (observation.record.expires_at != 0)
                 .then_some(observation.record.expires_at),
@@ -1545,7 +1750,42 @@ impl RegistryLicenseClient {
                 .map_err(|_| RegistryError::new("invalid_registry_chain_state"))?,
             block_hash: observation.head.hash,
             checked_at,
-        })
+            offline_until: None,
+        };
+        // What an offline allowance is measured from. Kept only for the license
+        // this device actually holds — a candidate still being activated or
+        // replaced has not earned it — and only when the license has the term,
+        // so a license without one leaves nothing behind to be reinterpreted.
+        let basis = offline_allowance_days(&candidate.entitlements).map(|_| OfflineBasis {
+            license_id: candidate.manifest.license_id.clone(),
+            entitlements_hash: candidate.entitlements_hash.clone(),
+            checked_at: state.checked_at,
+            expires_at: observation.record.expires_at,
+            not_before: state.not_before,
+            revision: state.revision,
+            block_number: state.block_number,
+            block_hash: state.block_hash.clone(),
+        });
+        // Only when the license just observed is the one this client holds.
+        // Validating a candidate — an activation or a replacement in progress —
+        // must neither grant it a basis nor take the held license's away. Read
+        // before the state lock: the order is manifest, then state.
+        let held = lock(&self.0.manifest).as_ref().is_some_and(|held| {
+            held.manifest.license_id == candidate.manifest.license_id
+                && held.entitlements_hash == candidate.entitlements_hash
+        });
+        self.with_binding_budget(budget, |binding| {
+            if self.0.generation.load(Ordering::Acquire) != generation {
+                return Err(RegistryError::new("license_changed_during_validation"));
+            }
+            let next = basis.as_ref().map(OfflineBasis::to_json);
+            if held && binding.registry_offline != next {
+                binding.registry_offline = next;
+                self.save_binding(binding)?;
+            }
+            Ok(())
+        })?;
+        Ok(state)
     }
 }
 

@@ -106,6 +106,11 @@ struct Model {
     status: u64,
     check: bool,
     fail_primary: bool,
+    /// No RPC provider answers at all: the machine is offline.
+    rpc_offline: bool,
+    /// Timestamps of blocks that are no longer the head, so a chain that has
+    /// moved on by days still answers truthfully about where it was.
+    block_times: BTreeMap<u64, u64>,
     bad_manifest: Option<&'static str>,
     block_state_write: Option<PathBuf>,
     manifest_license_id: String,
@@ -154,6 +159,8 @@ impl Server {
             status: 1,
             check: true,
             fail_primary: false,
+            rpc_offline: false,
+            block_times: BTreeMap::new(),
             bad_manifest: None,
             block_state_write: None,
             manifest_license_id: word("44"),
@@ -334,7 +341,7 @@ impl Transport for Server {
         if request.url == RPC_B {
             model.rpc_b_calls += 1;
         }
-        if request.url == RPC_A && model.fail_primary {
+        if model.rpc_offline || (request.url == RPC_A && model.fail_primary) {
             return Err("synthetic_rpc_unavailable".into());
         }
         let result = match body["method"].as_str().unwrap() {
@@ -346,7 +353,12 @@ impl Transport for Server {
                 } else {
                     u64::from_str_radix(&tag[2..], 16).unwrap()
                 };
-                json!({"number":format!("0x{number:x}"),"hash":format!("0x{number:064x}"),"timestamp":format!("0x{:x}",model.timestamp)})
+                let timestamp = model
+                    .block_times
+                    .get(&number)
+                    .copied()
+                    .unwrap_or(model.timestamp);
+                json!({"number":format!("0x{number:x}"),"hash":format!("0x{number:064x}"),"timestamp":format!("0x{timestamp:x}")})
             }
             "eth_getCode" => {
                 assert_eq!(body["params"][1], format!("0x{:x}", model.head));
@@ -494,6 +506,8 @@ fn imported(profile: &Profile, server: Arc<Server>) -> RegistryLicenseClient {
     client
 }
 
+#[path = "offline_tests.rs"]
+mod offline;
 #[path = "recovery_tests.rs"]
 mod recovery;
 #[path = "replacement_tests.rs"]

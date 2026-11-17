@@ -1,5 +1,36 @@
 # SDK releases
 
+## Rust 0.5.0
+
+- Offline allowance for Registry licenses. A publisher's Registry policy can now
+  state how many days an application may keep running when no RPC provider can
+  be reached. The term is stamped into the license's entitlements at issuance
+  as `talos_offline: { "days": N }`, so it is covered by the entitlement hash
+  the registry holds and the SDK reads it from the verified license, not from
+  Talos at run time.
+- `RegistryLicenseClient::validate` and `require_valid_license` honour it: when
+  every RPC provider fails with a transient error, the last valid observation
+  stands until the allowance runs out, or until the license's own expiry if
+  that is sooner. After that they return `offline_period_expired`. A license
+  without the term behaves exactly as before and returns the transient RPC
+  error.
+- `RegistryLicenseState::offline_until`: `None` for a state read from the chain
+  just now, `Some(deadline)` when it repeats the last observation under the
+  allowance. A new public field, which is why this is 0.5.0: code that builds or
+  destructures `RegistryLicenseState` field by field must add it.
+  `is_offline()` and `offline_allowance_days()` read the same facts.
+- `RegistryLicenseClient::require_fresh_license`: a check that ignores the
+  allowance, for the operations that must never run on a remembered answer.
+
+The allowance is measured from the last successful check on this device, with
+the highest time the device has ever seen rather than the wall clock, so
+setting the clock back or restarting does not buy it again. A refusal read from
+the chain — revoked, expired, another device — ends it at once. It needs a
+Talos server with migration 0065 to issue such licenses; licenses issued before
+that have no term and stay online-only. Node.js and .NET do not implement the
+allowance: they treat `talos_offline` as an ordinary entitlement and keep
+requiring the network for every check.
+
 ## Rust 0.4.0
 
 - Code recovery for Registry policies that name an activator contract. A client

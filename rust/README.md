@@ -58,13 +58,14 @@ Use 0.3.2 or later for automatic update-key recovery and independent license
 checks while an archive is downloading.
 Version 0.3.3 adds portable license files (`export_portable_license` /
 `import_portable_license`) and optional launch reports (`report_launch`).
-Version 0.4.0 adds code recovery (`with_code` / `replace_with_code` and the
+Version 0.5.0 adds the offline allowance for Registry licenses
+(`RegistryLicenseState::offline_until`, see below). Version 0.4.0 adds code recovery (`with_code` / `replace_with_code` and the
 `activator` option): the code a customer bought restores the license on any
 computer from the registry alone.
 
 ```toml
 [dependencies]
-talos-sdk = { version = "0.4", features = ["registry"] }
+talos-sdk = { version = "0.5", features = ["registry"] }
 ```
 
 ### Publisher integration configuration
@@ -145,14 +146,15 @@ The encrypted local state retains the device key, pending activation ID, public
 manifest and observed chain/revision floors. It does not retain the activation
 code, its hash or request proof. Protect that state and keep it across restarts.
 `is_activated()` reports saved state, not current authorization. Registry mode
-has no offline authorization grace; ordinary `TalosClient` offline behavior is
+has no offline authorization grace unless the license itself carries one (see
+"Offline allowance" below); ordinary `TalosClient` offline behavior is
 separate. On-chain IDs and device public keys are public; never publish codes,
 personal data or secrets. Client patching and copied device keys remain possible.
 
 Bring your own [`Transport`](#supplying-your-own-transport) with:
 
 ```toml
-talos-sdk = { version = "0.4", default-features = false, features = ["registry"] }
+talos-sdk = { version = "0.5", default-features = false, features = ["registry"] }
 ```
 
 Pass `transport: Some(Arc::new(your_transport))` in `RegistryLicenseOptions`.
@@ -306,9 +308,47 @@ network, contract, device, entitlements and canonical state independently.
 
 If every endpoint times out or is rate limited, show a temporary verification
 unavailability and retry later. Do not report an RPC outage as a revoked license,
-delete the saved activation, or grant cached/offline authorization. Authoritative
-expiry, revocation and device mismatch remain license failures rather than reasons
-to try a more permissive provider.
+delete the saved activation, or grant cached/offline authorization of your own.
+Authoritative expiry, revocation and device mismatch remain license failures
+rather than reasons to try a more permissive provider.
+
+### Offline allowance
+
+A publisher can let a Registry license run without the network for a stated
+number of days. It is a term of the policy in the portal ("Offline use without a
+network check"), stamped into each license's entitlements at issuance as
+`talos_offline: { "days": N }` and therefore covered by the entitlement hash the
+registry holds. The SDK reads it from the verified license. Nothing in a local
+file and nothing Talos says at run time can raise it.
+
+```rust
+match client.require_valid_license() {
+    Ok(state) if state.is_offline() => {
+        // No RPC provider answered; the last valid check is standing in.
+        // `offline_until` is the Unix second at which that stops.
+        show_banner(state.offline_until);
+    }
+    Ok(_) => {}
+    Err(e) if e.code() == "offline_period_expired" => require_connection(),
+    Err(e) if e.is_transient() => retry_later(),
+    Err(e) => refuse(e.code()),
+}
+```
+
+- The period counts from the last successful check on this device, and is cut
+  short by the license's own expiry.
+- Time is the highest this device has ever seen, not the wall clock: setting the
+  clock back or restarting does not start the period again.
+- A refusal read from the chain ends it at once. A revoked license does not keep
+  working because the cable was pulled afterwards.
+- A license with no term, or a malformed one, grants nothing: every check needs
+  the network, as before 0.5.0.
+- `require_fresh_license()` ignores the allowance. Use it for the operations that
+  must not run on a remembered answer.
+
+Anyone can make a machine look offline, so the allowance is also how long a
+revocation can take to reach a customer who wants to avoid it. Choose the number
+with that in mind.
 
 ### Signed updates for Registry applications
 
