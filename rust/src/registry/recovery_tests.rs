@@ -338,6 +338,17 @@ fn a_recoverable_license_that_is_no_longer_valid_reports_why_and_is_not_installe
     }
 }
 
+/// A deadline that is not what the test is about. `short()` is a quarter of a
+/// second, which is right for a test that expects a timeout and wrong for one
+/// that expects the work to finish: on a loaded CI runner the swap below ran
+/// out of it and a release failed on a correct build.
+fn unhurried() -> RegistryActivationOptions {
+    RegistryActivationOptions {
+        timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    }
+}
+
 #[test]
 fn changing_codes_keeps_the_old_license_until_the_new_one_verifies_then_swaps_the_key() {
     let server = Server::new();
@@ -353,7 +364,7 @@ fn changing_codes_keeps_the_old_license_until_the_new_one_verifies_then_swaps_th
     // The new code is not on chain and Talos is unreachable: nothing changes.
     server.with(|m| m.api_offline = true);
     assert_eq!(
-        RegistryLicenseClient::replace_with_code(opts.clone(), SECOND_CODE, &short())
+        RegistryLicenseClient::replace_with_code(opts.clone(), SECOND_CODE, &unhurried())
             .unwrap_err()
             .code(),
         "registry_activation_unavailable"
@@ -365,9 +376,13 @@ fn changing_codes_keeps_the_old_license_until_the_new_one_verifies_then_swaps_th
     // A side file left by an abandoned attempt with some other code is not reused.
     assert!(side.exists());
     assert_eq!(
-        RegistryLicenseClient::replace_with_code(opts.clone(), "SYNTHETIC-THIRD-CODE", &short())
-            .unwrap_err()
-            .code(),
+        RegistryLicenseClient::replace_with_code(
+            opts.clone(),
+            "SYNTHETIC-THIRD-CODE",
+            &unhurried()
+        )
+        .unwrap_err()
+        .code(),
         "registry_activation_unavailable"
     );
 
@@ -375,7 +390,7 @@ fn changing_codes_keeps_the_old_license_until_the_new_one_verifies_then_swaps_th
     on_chain(&server, SECOND_CODE);
     let high_water = saved(&old).time_high_water;
     let (current, license) =
-        RegistryLicenseClient::replace_with_code(opts.clone(), SECOND_CODE, &short()).unwrap();
+        RegistryLicenseClient::replace_with_code(opts.clone(), SECOND_CODE, &unhurried()).unwrap();
     assert!(license.entitlement_bool("pro"));
     assert_eq!(current.device_key(), second_device);
     assert_eq!(license_id_of(&current), second_id);
@@ -395,7 +410,8 @@ fn changing_codes_keeps_the_old_license_until_the_new_one_verifies_then_swaps_th
 
     // The same code again is an ordinary validation, and the old code still exists on
     // chain for whoever holds it.
-    let (again, _) = RegistryLicenseClient::replace_with_code(opts, SECOND_CODE, &short()).unwrap();
+    let (again, _) =
+        RegistryLicenseClient::replace_with_code(opts, SECOND_CODE, &unhurried()).unwrap();
     assert_eq!(again.device_key(), second_device);
     let other = Profile::new();
     let first_again =

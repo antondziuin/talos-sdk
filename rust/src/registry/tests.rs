@@ -491,9 +491,13 @@ fn options(profile: &Profile, server: Arc<Server>) -> RegistryLicenseOptions {
         ..Default::default()
     }
 }
+/// A deadline for the tests that expect to run out of it while a job is
+/// pending. Long enough for the claim itself to be sent and its id saved on a
+/// loaded machine, and still shorter than the one second the client waits
+/// before its first status poll — so the timeout always lands in that wait.
 fn short() -> RegistryActivationOptions {
     RegistryActivationOptions {
-        timeout: Some(Duration::from_millis(250)),
+        timeout: Some(Duration::from_millis(700)),
         ..Default::default()
     }
 }
