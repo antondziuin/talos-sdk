@@ -322,7 +322,7 @@ export class WalletLicenseClient {
     );
     if (!response.ok) {
       const e = await response.json().catch(() => ({}));
-      throw new Error(e.error ?? "coordinator_unavailable");
+      throw new Error((e && typeof e === "object" && "error" in e ? e.error : undefined) ?? "coordinator_unavailable");
     }
     return (await response.json()) as SignedMessage;
   }

@@ -1192,6 +1192,7 @@ impl RegistryLicenseClient {
                         candidate,
                         &raw,
                         &response.activation_id,
+                        &license,
                         &budget,
                         &expected,
                         generation,
@@ -1276,6 +1277,7 @@ impl RegistryLicenseClient {
         candidate: ParsedManifest,
         raw: &str,
         id: &str,
+        license: &RegistryLicenseState,
         budget: &Budget,
         expected: &ParsedManifest,
         generation: u64,
@@ -1286,6 +1288,16 @@ impl RegistryLicenseClient {
         if manifest.as_ref().map(|m| &m.manifest) != Some(&expected.manifest) {
             return Err(RegistryError::new("registry_replacement_state_conflict"));
         }
+        let offline_basis = offline_allowance_days(&candidate.entitlements).map(|_| OfflineBasis {
+            license_id: candidate.manifest.license_id.clone(),
+            entitlements_hash: candidate.entitlements_hash.clone(),
+            checked_at: license.checked_at,
+            expires_at: license.expires_at.unwrap_or(0),
+            not_before: license.not_before,
+            revision: license.revision,
+            block_number: license.block_number,
+            block_hash: license.block_hash.clone(),
+        });
         self.with_binding_budget(Some(budget), |binding| {
             self.assert_active(budget, generation)?;
             self.check_replacement_base(binding, expected)?;
@@ -1294,6 +1306,7 @@ impl RegistryLicenseClient {
             }
             binding.registry_manifest = Some(raw.to_owned());
             binding.registry_replacement_id = None;
+            binding.registry_offline = offline_basis.as_ref().map(OfflineBasis::to_json);
             self.save_binding(binding)
         })?;
         *manifest = Some(candidate);

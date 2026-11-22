@@ -213,14 +213,14 @@ namespace Talos.Sdk
                 int status = (int)response.StatusCode;
                 if (!response.IsSuccessStatusCode)
                 {
-                    if (status == 408 || status == 429 || status >= 500) throw new TransientRpcException("registry_rpc_unavailable");
+                    if (status == 401 || status == 403 || status == 408 || status == 429 || status >= 500) throw new TransientRpcException("registry_rpc_unavailable");
                     throw new RegistryLicenseException("registry_rpc_rejected");
                 }
                 string raw = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                 if (raw.Length > 1048576) throw new RegistryLicenseException("invalid_registry_rpc_response");
                 using var doc = JsonDocument.Parse(raw); var r = doc.RootElement;
                 if (Str(r, "jsonrpc") != "2.0" || r.GetProperty("id").GetInt32() != 1) throw new RegistryLicenseException("invalid_registry_rpc_response");
-                if (r.TryGetProperty("error", out var error))
+                if (r.TryGetProperty("error", out var error) && error.ValueKind != JsonValueKind.Null)
                 {
                     int code = error.GetProperty("code").GetInt32();
                     if (code == -32005 || code == -32002 || code == -32603) throw new TransientRpcException("registry_rpc_unavailable");
@@ -302,11 +302,16 @@ namespace Talos.Sdk
             string tag = block.Tag, blockHash = block.Hash; long number = block.Number, timestamp = block.Timestamp;
             long now = Now(); if (timestamp < now - 300 || timestamp > now + 30) throw new TransientRpcException("stale_rpc_block");
             var code = await Rpc(endpoint, "eth_getCode", w => { w.WriteStartArray(); w.WriteStringValue(_options.Contract); w.WriteStringValue(tag); w.WriteEndArray(); }, ct).ConfigureAwait(false);
+            static byte[] CheckedBytes(string hex, int len)
+            {
+                try { return Bytes(hex, len); }
+                catch (Exception e) when (e is ArgumentException || e is FormatException) { throw new RegistryLicenseException("invalid_registry_rpc_response"); }
+            }
             string codeHex = code.GetString() ?? "";
-            if (codeHex.Length <= 2) throw new RegistryLicenseException("registry_contract_missing");
-            Bytes(codeHex, (codeHex.Length - 2) / 2);
-            if (!Bytes(await EthCall(endpoint, Call("registryVersion()"), tag, ct).ConfigureAwait(false), 32).SequenceEqual(Word(1))) throw new RegistryLicenseException("wrong_registry_version");
-            var words = Bytes(await EthCall(endpoint, Call("getLicense(address,bytes32,bytes32)", Address(_options.Issuer), Bytes(_options.ProductId, 32), Bytes(m.LicenseId, 32)), tag, ct).ConfigureAwait(false), 7 * 32);
+            if (codeHex.Length <= 2 || codeHex.Length % 2 != 0) throw new RegistryLicenseException("registry_contract_missing");
+            CheckedBytes(codeHex, (codeHex.Length - 2) / 2);
+            if (!CheckedBytes(await EthCall(endpoint, Call("registryVersion()"), tag, ct).ConfigureAwait(false), 32).SequenceEqual(Word(1))) throw new RegistryLicenseException("wrong_registry_version");
+            var words = CheckedBytes(await EthCall(endpoint, Call("getLicense(address,bytes32,bytes32)", Address(_options.Issuer), Bytes(_options.ProductId, 32), Bytes(m.LicenseId, 32)), tag, ct).ConfigureAwait(false), 7 * 32);
             long before = Number(words, 2), expires = Number(words, 3), revision = Number(words, 5), status = Number(words, 6);
             if (status > 3 || (status != 0 && revision == 0)) throw new RegistryLicenseException("invalid_registry_record");
             if (words.Take(12).Any(x => x != 0)) throw new RegistryLicenseException("invalid_registry_record");
@@ -318,7 +323,7 @@ namespace Talos.Sdk
                 : before > timestamp || before > now ? "license_not_started" : expires != 0 && (expires <= timestamp || expires <= now || expires <= before) ? "license_expired" : null;
             if (refusal == null)
             {
-                var check = Bytes(await EthCall(endpoint, Call("checkLicense(address,bytes32,bytes32,address,bytes32,bytes32)", Address(_options.Issuer), Bytes(_options.ProductId, 32), Bytes(m.LicenseId, 32), Address(m.Holder), Bytes(DeviceKey, 32), Bytes(entitlementsHash, 32)), tag, ct).ConfigureAwait(false), 32);
+                var check = CheckedBytes(await EthCall(endpoint, Call("checkLicense(address,bytes32,bytes32,address,bytes32,bytes32)", Address(_options.Issuer), Bytes(_options.ProductId, 32), Bytes(m.LicenseId, 32), Address(m.Holder), Bytes(DeviceKey, 32), Bytes(entitlementsHash, 32)), tag, ct).ConfigureAwait(false), 32);
                 if (!check.SequenceEqual(Word(1))) refusal = "registry_license_rejected";
             }
             var final = await BlockAt(endpoint, tag, ct).ConfigureAwait(false);

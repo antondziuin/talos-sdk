@@ -142,7 +142,7 @@ namespace Talos.Sdk
                 if (retry < 0 || retry > 60 || (state == "ready" ? manifest.ValueKind != JsonValueKind.Object || r.GetProperty("error").ValueKind != JsonValueKind.Null : manifest.ValueKind != JsonValueKind.Null)) throw new ArgumentException();
                 return new ActivationResponse { Status = state, Id = id.ToString("D"), Retry = retry, Manifest = state == "ready" ? new RegistryLicenseManifest(manifest.GetRawText()) : null };
             }
-            catch (Exception e) when (e is JsonException || e is ArgumentException || e is System.Collections.Generic.KeyNotFoundException || e is InvalidOperationException) { throw new RegistryLicenseException("invalid_registry_activation_response"); }
+            catch (Exception e) when (e is JsonException || e is ArgumentException || e is FormatException || e is OverflowException || e is System.Collections.Generic.KeyNotFoundException || e is InvalidOperationException) { throw new RegistryLicenseException("invalid_registry_activation_response"); }
         }
 
         private void SaveActivation(string id, RegistryLicenseManifest? manifest, bool failed, int generation, CancellationToken ct)

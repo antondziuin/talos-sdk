@@ -482,8 +482,14 @@ namespace Talos.Sdk
                 // activated".
                 string tmp = _path + ".tmp";
                 File.WriteAllBytes(tmp, outBytes);
-                if (File.Exists(_path)) File.Delete(_path);
-                File.Move(tmp, _path);
+#if NET8_0_OR_GREATER
+                File.Move(tmp, _path, overwrite: true);
+#else
+                if (File.Exists(_path))
+                    File.Replace(tmp, _path, null);
+                else
+                    File.Move(tmp, _path);
+#endif
                 return true;
             }
             catch

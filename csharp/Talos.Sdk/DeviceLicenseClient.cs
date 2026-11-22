@@ -195,7 +195,8 @@ namespace Talos.Sdk
         public async Task<bool> VerifyViaContractAsync(string rpcUrl, CancellationToken ct = default)
         {
             var cert = _certificate ?? throw new InvalidOperationException("certificate_required");
-            DeviceProtocol.VerifyCertificate(cert, _enrollment ?? throw new InvalidOperationException("enrollment_required"), DeviceKey, FingerprintHash, _options);
+            long at; lock (_gate) at = Now();
+            DeviceProtocol.VerifyCertificate(cert, _enrollment ?? throw new InvalidOperationException("enrollment_required"), DeviceKey, FingerprintHash, _options, at);
             async Task<JsonElement> Rpc(string method, Action<Utf8JsonWriter> parameters)
             {
                 string body = WalletProtocol.Write(w => { w.WriteStartObject(); w.WriteString("jsonrpc", "2.0"); w.WriteNumber("id", 1); w.WriteString("method", method); w.WritePropertyName("params"); parameters(w); w.WriteEndObject(); });
@@ -203,7 +204,7 @@ namespace Talos.Sdk
                 using var request = new HttpRequestMessage(HttpMethod.Post, rpcUrl) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
                 using var response = await _http.SendAsync(request, timeout.Token).ConfigureAwait(false); response.EnsureSuccessStatusCode();
                 using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
-                if (doc.RootElement.TryGetProperty("error", out _)) throw new HttpRequestException("rpc_unavailable");
+                if (doc.RootElement.TryGetProperty("error", out var rpcErr) && rpcErr.ValueKind != JsonValueKind.Null) throw new HttpRequestException("rpc_unavailable");
                 return doc.RootElement.GetProperty("result").Clone();
             }
             var chain = await Rpc("eth_chainId", w => { w.WriteStartArray(); w.WriteEndArray(); }).ConfigureAwait(false);

@@ -194,11 +194,12 @@ namespace Talos.Sdk
                 var result = await Request(path, body, action == "release" ? HttpMethod.Delete : HttpMethod.Post, ct).ConfigureAwait(false);
                 var lease = WalletProtocol.VerifyMessage(c.CoordinatorKey, action == "release" ? "released" : "lease", result);
                 long issued = lease.GetProperty("issued_at").GetInt64(), expires = lease.GetProperty("expires_at").GetInt64();
+                long ttl = issued >= 0 && expires >= issued && (ulong)(expires - issued) <= 60 ? expires - issued : -1;
                 if (WalletProtocol.Str(lease, "nonce") != WalletProtocol.Str(ch, "nonce") || WalletProtocol.Str(lease, "license_ref") != reference || WalletProtocol.Str(lease, "device_ref") != device || WalletProtocol.Str(lease, "instance_id") != InstanceId
-                    || expires - issued > 60 || issued < ch.GetProperty("issued_at").GetInt64() || (c.ExpiresAt != 0 && expires > c.ExpiresAt)) throw new InvalidOperationException("lease_mismatch");
+                    || ttl < 0 || issued < ch.GetProperty("issued_at").GetInt64() || (c.ExpiresAt != 0 && expires > c.ExpiresAt)) throw new InvalidOperationException("lease_mismatch");
                 if (action != "release") lock (_gate)
                 {
-                    long deadline = start + (expires - issued - 5) * Stopwatch.Frequency;
+                    long deadline = start + (ttl - 5) * Stopwatch.Frequency;
                     if (Stopwatch.GetTimestamp() >= deadline) throw new InvalidOperationException("lease_expired_in_transit");
                     if (generation == _generation && _started) { if (leaseEpoch != _leaseEpoch || Math.Abs((DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - startWall) - (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency) > 1500) throw new InvalidOperationException("session_interrupted_by_clock_or_resume"); _deadline = deadline; _lastMono = Stopwatch.GetTimestamp(); _lastWall = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(); }
                 }
@@ -217,7 +218,7 @@ namespace Talos.Sdk
                 using var request = new HttpRequestMessage(HttpMethod.Post, rpcUrl) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
                 using var response = await _http.SendAsync(request, timeout.Token).ConfigureAwait(false); response.EnsureSuccessStatusCode();
                 using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
-                if (doc.RootElement.TryGetProperty("error", out _)) throw new HttpRequestException("rpc_unavailable");
+                if (doc.RootElement.TryGetProperty("error", out var rpcErr) && rpcErr.ValueKind != JsonValueKind.Null) throw new HttpRequestException("rpc_unavailable");
                 return doc.RootElement.GetProperty("result").Clone();
             }
             var chain = await Rpc("eth_chainId", w => { w.WriteStartArray(); w.WriteEndArray(); }).ConfigureAwait(false);

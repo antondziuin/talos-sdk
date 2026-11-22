@@ -47,13 +47,13 @@ namespace Talos.Sdk
             // Cached tokens are a different path (see VerifyCached), where
             // `exp` deliberately does not apply.
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            if (!claims.TryGetProperty("nbf", out var nbf) || nbf.ValueKind != JsonValueKind.Number)
+            if (!claims.TryGetProperty("nbf", out var nbf) || nbf.ValueKind != JsonValueKind.Number || !nbf.TryGetInt64(out long nbfVal))
                 throw new TalosSignatureException("token has no nbf");
-            if (now + ClockSkewSeconds < nbf.GetInt64())
+            if (now + ClockSkewSeconds < nbfVal)
                 throw new TalosSignatureException("token not yet valid");
-            if (!claims.TryGetProperty("exp", out var exp) || exp.ValueKind != JsonValueKind.Number)
+            if (!claims.TryGetProperty("exp", out var exp) || exp.ValueKind != JsonValueKind.Number || !exp.TryGetInt64(out long expVal))
                 throw new TalosSignatureException("token has no exp");
-            if (now - ClockSkewSeconds > exp.GetInt64())
+            if (now - ClockSkewSeconds > expVal)
                 throw new TalosSignatureException("token expired");
 
             return claims;
@@ -84,9 +84,13 @@ namespace Talos.Sdk
             if (GetString(claims, "aud") != expectedAud)
                 throw new TalosSignatureException("audience mismatch");
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            if (claims.TryGetProperty("nbf", out var nbf) && nbf.ValueKind == JsonValueKind.Number
-                && now + ClockSkewSeconds < nbf.GetInt64())
-                throw new TalosSignatureException("cached token not yet valid");
+            if (claims.TryGetProperty("nbf", out var nbf) && nbf.ValueKind == JsonValueKind.Number)
+            {
+                if (!nbf.TryGetInt64(out long nbfVal))
+                    throw new TalosSignatureException("malformed nbf");
+                if (now + ClockSkewSeconds < nbfVal)
+                    throw new TalosSignatureException("cached token not yet valid");
+            }
             return claims;
         }
 
@@ -107,8 +111,10 @@ namespace Talos.Sdk
                 throw new TalosSignatureException("audience mismatch");
             if (claims.TryGetProperty("not_before", out var nb) && nb.ValueKind == JsonValueKind.Number)
             {
+                if (!nb.TryGetInt64(out long nbVal))
+                    throw new TalosSignatureException("malformed not_before");
                 long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                if (now + ClockSkewSeconds < nb.GetInt64())
+                if (now + ClockSkewSeconds < nbVal)
                     throw new TalosSignatureException("manifest not yet released");
             }
             return claims;
@@ -150,7 +156,9 @@ namespace Talos.Sdk
 
             int lastDot = token.LastIndexOf('.');
             byte[] prefix = Encoding.ASCII.GetBytes(token.Substring(0, lastDot));
-            byte[] sig = Base64Url.Decode(parts[4]);
+            byte[] sig;
+            try { sig = Base64Url.Decode(parts[4]); }
+            catch (FormatException) { throw new TalosSignatureException("malformed signature encoding"); }
 
             bool ok = false;
             foreach (byte[] key in keys)
@@ -163,9 +171,20 @@ namespace Talos.Sdk
             if (!ok)
                 throw new TalosSignatureException("signature verification failed");
 
-            byte[] payload = Base64Url.Decode(parts[3]);
-            using var doc = JsonDocument.Parse(payload);
-            return doc.RootElement.Clone();
+            byte[] payload;
+            try { payload = Base64Url.Decode(parts[3]); }
+            catch (FormatException) { throw new TalosSignatureException("malformed payload encoding"); }
+            try
+            {
+                using var doc = JsonDocument.Parse(payload);
+                if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                    throw new TalosSignatureException("malformed token payload");
+                return doc.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                throw new TalosSignatureException("malformed token payload");
+            }
         }
 
         private static string? GetString(JsonElement e, string name)

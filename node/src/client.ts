@@ -804,19 +804,30 @@ export class TalosClient {
       // Adopt the keyset delivered with activation, then verify the activation
       // token against the current license keys (so a rotated key still works).
       this.adoptKeyset(body["keyset"]);
+      if (typeof body["activation_token"] !== "string") {
+        throw new TalosSignatureError("missing activation_token");
+      }
       const claims = verifyToken(
         this.licenseVerifyKeys(),
         "activation",
         this.options.productToken,
         nonce,
-        body["activation_token"] as string,
+        body["activation_token"],
       );
+      this.checkMachine(
+        (claims["lic"] && typeof claims["lic"] === "object"
+          ? (claims["lic"] as Record<string, unknown>)["fph"]
+          : undefined) ?? claims["fph"],
+      );
+      if (typeof body["activation_secret"] !== "string" || !body["activation_secret"]) {
+        throw new TalosSignatureError("missing activation_secret");
+      }
       // The key is not kept. From here the activation secret identifies both the
       // machine and its licence, so nothing needs the key again until somebody
       // types a different one.
       this.licenseKeyHash = hashLicenseKey(licenseKey);
-      this.activationSecret = body["activation_secret"] as string;
-      this.machineId = (body["machine_id"] as string) ?? null;
+      this.activationSecret = body["activation_secret"];
+      this.machineId = typeof body["machine_id"] === "string" ? body["machine_id"] : null;
       this.binding = {
         licenseKeyHash: this.licenseKeyHash,
         activationSecret: this.activationSecret,
@@ -826,6 +837,8 @@ export class TalosClient {
         // binding; keep only the keyset, which is per product, not per machine.
         keyset: this.keysetToken ?? this.binding?.keyset,
         timeHighWater: this.binding?.timeHighWater,
+        releaseSeqHighWater: this.binding?.releaseSeqHighWater,
+        pendingRelease: this.binding?.pendingRelease,
         // The machine's own identity survives an online activation, because it is
         // an identity and not a verdict: an install that reaches the network once
         // must not have to repeat the whole air-gapped ceremony with its vendor
@@ -1025,6 +1038,7 @@ export class TalosClient {
     if (!key || !pub) throw new TalosError("no offline licence to hand back");
 
     // Drop it first. The order is the point: see above.
+    this.licensingGeneration++;
     this.binding = { ...this.bindingBase(), offlineToken: undefined };
     this.current = null;
     this.store?.save(this.binding);
@@ -1280,9 +1294,15 @@ export class TalosClient {
 
   /** Merge fields into the persisted binding and write it back. */
   private persist(patch: Partial<StoredBinding>): void {
-    if (!this.store || !this.binding) return;
+    if (!this.binding) return;
     this.binding = { ...this.binding, ...patch };
-    this.store.save(this.binding);
+    this.store?.save(this.binding);
+  }
+
+  private checkMachine(fph: unknown): void {
+    if (typeof fph === "string" && fph !== this.fingerprint) {
+      throw new TalosSignatureError("token was issued for another machine");
+    }
   }
 
   /**
@@ -1330,7 +1350,10 @@ export class TalosClient {
       });
       const switched = this.offlineSince(generation);
       if (switched) return switched;
-      const token = body["validation_token"] as string;
+      if (typeof body["validation_token"] !== "string") {
+        throw new TalosSignatureError("missing validation_token");
+      }
+      const token = body["validation_token"];
       const claims = verifyToken(
         this.licenseVerifyKeys(),
         "validation",
@@ -1338,6 +1361,7 @@ export class TalosClient {
         nonce,
         token,
       );
+      this.checkMachine(claims["fph"]);
       const decision =
         typeof claims["decision"] === "string" ? (claims["decision"] as string) : "invalid";
       this.advanceClock(claims);
@@ -1353,7 +1377,7 @@ export class TalosClient {
       // or a response that fails verification (a garbled or forged reply tells
       // us nothing, so per the trust model it is treated as unreachable, never
       // as valid).
-      if (e instanceof TalosApiError) throw e;
+      if (e instanceof TalosApiError && !(e.status >= 500 && !e.code)) throw e;
       const offline = this.offlineDecision();
       if (!offline) throw e;
       return this.adopt(offline);
@@ -1489,13 +1513,17 @@ export class TalosClient {
       });
       const switched = this.offlineSince(generation);
       if (switched) return switched;
+      if (typeof body["heartbeat_token"] !== "string") {
+        throw new TalosSignatureError("missing heartbeat_token");
+      }
       const claims = verifyToken(
         this.licenseVerifyKeys(),
         "heartbeat",
         this.options.productToken,
         nonce,
-        body["heartbeat_token"] as string,
+        body["heartbeat_token"],
       );
+      this.checkMachine(claims["fph"]);
       const decision =
         typeof claims["decision"] === "string" ? (claims["decision"] as string) : "invalid";
       // The cadence comes from the SIGNED claims, never the response envelope:
@@ -1845,6 +1873,7 @@ export class TalosClient {
     destPath: string,
     opts: DeltaOptions & { delta?: UpdateDelta; onProgress?: DownloadProgressCallback } = {},
   ): Promise<UpdateDelta> {
+    this.requireActivated();
     const chosen = opts.delta ?? this.selectDelta(info, opts);
     if (!chosen) throw new TalosError("no patch applies to this install");
     await this.fetchVerified(
@@ -1971,7 +2000,7 @@ export class TalosClient {
         await take(new Uint8Array(await res.arrayBuffer()));
       }
 
-      if (hash.digest("hex") !== sha256) {
+      if (hash.digest("hex") !== sha256.toLowerCase()) {
         throw new TalosSignatureError("artifact hash mismatch (tampered or wrong bytes)");
       }
       // Closed before the rename: Windows will not move a file that is open.
@@ -2027,6 +2056,7 @@ export class TalosClient {
     body: unknown,
   ): Promise<Record<string, unknown>> {
     let res: FetchResponseLike;
+    let text: string;
     try {
       res = await this.doFetch(this.options.serverUrl.replace(/\/+$/, "") + path, {
         method,
@@ -2034,6 +2064,7 @@ export class TalosClient {
         body: JSON.stringify(body),
         signal: this.timeoutSignal(),
       });
+      text = await res.text();
     } catch (e) {
       // An abort is a network failure, not a licensing verdict, and it has to
       // read as one: `validate` turns a network failure into the grace-period
@@ -2046,17 +2077,29 @@ export class TalosClient {
       }
       throw e;
     }
-    const text = await res.text();
     if (res.status < 200 || res.status >= 300) {
       let errorCode: string | undefined;
       try {
-        errorCode = (JSON.parse(text) as { error?: string }).error;
+        const errBody: unknown = JSON.parse(text);
+        if (errBody && typeof errBody === "object" && typeof (errBody as { error?: unknown }).error === "string") {
+          errorCode = (errBody as { error: string }).error;
+        }
       } catch {
         errorCode = undefined;
       }
       throw new TalosApiError(res.status, errorCode);
     }
-    return text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    if (!text.trim()) return {};
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new TalosSignatureError("malformed JSON response");
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new TalosSignatureError("unexpected JSON response shape");
+    }
+    return parsed as Record<string, unknown>;
   }
 }
 
@@ -2136,7 +2179,9 @@ function deltaKey(platform: unknown, arch: unknown, from: unknown, targetKind: u
 /** The platform and arch names this machine matches artifacts by. */
 function hostTarget(): { platform: string; arch: string } {
   const map: Record<string, string> = { win32: "windows", darwin: "macos", linux: "linux" };
-  return { platform: map[os.platform()] ?? os.platform(), arch: os.arch() };
+  const archMap: Record<string, string> = { ia32: "x86" };
+  const rawArch = os.arch();
+  return { platform: map[os.platform()] ?? os.platform(), arch: archMap[rawArch] ?? rawArch };
 }
 
 /** Best artifact for the current platform (installer preferred), or undefined. */
@@ -2168,7 +2213,7 @@ export async function verifyAppliedUpdate(filePath: string, delta: UpdateDelta):
     stream.on("end", () => resolve());
   });
   const actual = hash.digest("hex");
-  if (actual !== delta.target.sha256) {
+  if (actual !== delta.target.sha256.toLowerCase()) {
     throw new TalosSignatureError(
       `applied update does not match the signed manifest: expected ${delta.target.sha256}, got ${actual}`,
     );

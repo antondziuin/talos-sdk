@@ -508,7 +508,7 @@ impl PublicUpdateClient {
             if received > chosen.size {
                 return Err(Error::signature("artifact_size_mismatch"));
             }
-            part.file.write_all(&buf[..n])?;
+            part.file_mut().write_all(&buf[..n])?;
             digest.update(&buf[..n]);
             if let Some(progress) = &mut on_progress {
                 progress(DownloadProgress {
@@ -521,7 +521,7 @@ impl PublicUpdateClient {
             return Err(Error::signature("artifact_hash_mismatch"));
         }
         budget.remaining()?;
-        part.file.sync_all()?;
+        part.file_mut().sync_all()?;
         if let Some(registry) = authority.registry {
             self.bind_registry_configuration(registry)?;
             bind_registry(registry, &offer)?;
@@ -1449,7 +1449,12 @@ impl FileLock {
             budget.remaining()?;
             match FileExt::try_lock_exclusive(&file) {
                 Ok(()) => return Ok(Self(file)),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => budget.wait()?,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    budget.wait()?;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -1463,7 +1468,7 @@ impl Drop for FileLock {
 
 struct Part {
     path: PathBuf,
-    file: File,
+    file: Option<File>,
 }
 impl Part {
     fn create(dest: &Path) -> Result<Self> {
@@ -1481,11 +1486,21 @@ impl Part {
             options.mode(0o600);
         }
         let file = options.open(&path)?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file: Some(file),
+        })
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("staging file open until drop")
     }
 }
 impl Drop for Part {
     fn drop(&mut self) {
+        // Close the file handle before unlinking: on Windows an open handle
+        // causes remove_file to fail with ERROR_SHARING_VIOLATION.
+        drop(self.file.take());
         let _ = std::fs::remove_file(&self.path);
     }
 }

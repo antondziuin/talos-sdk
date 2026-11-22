@@ -46,7 +46,16 @@ function parseAndVerify(keys: Keys, token: string, expectedTyp: string): Record<
   const ok = list.some((k) => cryptoVerify(null, prefix, k, sig));
   if (!ok) throw new TalosSignatureError("signature verification failed");
 
-  return JSON.parse(b64urlDecode(parts[3]!).toString("utf8")) as Record<string, unknown>;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(b64urlDecode(parts[3]!).toString("utf8"));
+  } catch {
+    throw new TalosSignatureError("malformed token payload");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new TalosSignatureError("malformed token payload");
+  }
+  return parsed as Record<string, unknown>;
 }
 
 /**

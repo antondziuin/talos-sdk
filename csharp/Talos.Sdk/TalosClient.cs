@@ -758,15 +758,23 @@ namespace Talos.Sdk
                     // current license keys (so a rotated key still works).
                     if (root.TryGetProperty("keyset", out var ks) && ks.ValueKind == JsonValueKind.String)
                         AdoptKeyset(ks.GetString());
-                    string token = root.GetProperty("activation_token").GetString()!;
+                    if (!root.TryGetProperty("activation_token", out var atEl) || atEl.ValueKind != JsonValueKind.String)
+                        throw new TalosSignatureException("missing activation_token");
+                    string token = atEl.GetString()!;
                     JsonElement claims = TalosCompact.Verify(
                         LicenseVerifyKeys(), "activation", _options.ProductToken, nonce, token);
+                    CheckMachine(
+                        (claims.TryGetProperty("lic", out var licEl) && licEl.ValueKind == JsonValueKind.Object ? GetStr(licEl, "fph") : null)
+                        ?? GetStr(claims, "fph"));
 
                     // The key is not kept. From here the activation secret identifies
                     // both the machine and its licence.
+                    if (!root.TryGetProperty("activation_secret", out var secEl) || secEl.ValueKind != JsonValueKind.String || string.IsNullOrEmpty(secEl.GetString()))
+                        throw new TalosSignatureException("missing activation_secret");
                     _licenseKeyHash = StateStore.HashLicenseKey(licenseKey);
-                    _activationSecret = root.GetProperty("activation_secret").GetString();
-                    _machineId = root.GetProperty("machine_id").GetString();
+                    _activationSecret = secEl.GetString();
+                    _machineId = root.TryGetProperty("machine_id", out var midEl) && midEl.ValueKind == JsonValueKind.String
+                        ? midEl.GetString() : null;
                     _binding = new StoredBinding
                     {
                         LicenseKeyHash = _licenseKeyHash,
@@ -778,6 +786,9 @@ namespace Talos.Sdk
                         // not per machine.
                         Keyset = _keysetToken ?? _binding?.Keyset,
                         TimeHighWater = _binding?.TimeHighWater ?? 0,
+                        ReleaseSeqHighWater = _binding?.ReleaseSeqHighWater ?? 0,
+                        PendingVersion = _binding?.PendingVersion,
+                        PendingReleaseSeq = _binding?.PendingReleaseSeq ?? 0,
                         // The machine's own identity survives an online activation,
                         // because it is an identity and not a verdict: an install that
                         // reaches the network once must not have to repeat the whole
@@ -1017,47 +1028,51 @@ namespace Talos.Sdk
         /// </remarks>
         public OfflineDocument CreateOfflineDeactivation()
         {
-            string? token = _binding?.OfflineToken;
-            if (string.IsNullOrEmpty(token))
-                throw new TalosException("no offline licence to hand back");
-
-            // Read what the file says about itself before dropping it: the
-            // receipt has to name the file and the machine, and afterwards there
-            // is nothing to read it from.
-            JsonElement claims;
-            try
+            using (new LicensingScope(this))
             {
-                claims = TalosCompact.VerifyCached(
-                    LicenseVerifyKeys(), "offline", _options.ProductToken, token!);
+                string? token = _binding?.OfflineToken;
+                if (string.IsNullOrEmpty(token))
+                    throw new TalosException("no offline licence to hand back");
+
+                // Read what the file says about itself before dropping it: the
+                // receipt has to name the file and the machine, and afterwards there
+                // is nothing to read it from.
+                JsonElement claims;
+                try
+                {
+                    claims = TalosCompact.VerifyCached(
+                        LicenseVerifyKeys(), "offline", _options.ProductToken, token!);
+                }
+                catch (TalosException e)
+                {
+                    throw new TalosException("the stored offline licence no longer verifies", e);
+                }
+                if (GetStr(claims, "binding") == "portable")
+                    throw new TalosException("portable offline licences have no bound seat to return");
+                string? key = _binding?.MachineKey;
+                if (string.IsNullOrEmpty(key))
+                    throw new TalosException("no offline licence to hand back");
+                var payload = new OfflineReceiptPayload
+                {
+                    Fid = GetStr(claims, "fid") ?? "",
+                    Mid = GetStr(claims, "mid") ?? "",
+                    Fph = _fingerprint,
+                    LocalTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                };
+
+                // Drop it first. The order is the point: see above.
+                Interlocked.Increment(ref _licensingGeneration);
+                StoredBinding b = BindingBase();
+                b.OfflineToken = null;
+                _binding = b;
+                Current = null;
+                _store?.Save(b);
+
+                return Offline.SignDocument(
+                    key!,
+                    Offline.ReceiptDomain,
+                    JsonSerializer.Serialize(payload, WireJson.Default.OfflineReceiptPayload));
             }
-            catch (TalosException e)
-            {
-                throw new TalosException("the stored offline licence no longer verifies", e);
-            }
-            if (GetStr(claims, "binding") == "portable")
-                throw new TalosException("portable offline licences have no bound seat to return");
-            string? key = _binding?.MachineKey;
-            if (string.IsNullOrEmpty(key))
-                throw new TalosException("no offline licence to hand back");
-            var payload = new OfflineReceiptPayload
-            {
-                Fid = GetStr(claims, "fid") ?? "",
-                Mid = GetStr(claims, "mid") ?? "",
-                Fph = _fingerprint,
-                LocalTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-            };
-
-            // Drop it first. The order is the point: see above.
-            StoredBinding b = BindingBase();
-            b.OfflineToken = null;
-            _binding = b;
-            Current = null;
-            _store?.Save(b);
-
-            return Offline.SignDocument(
-                key!,
-                Offline.ReceiptDomain,
-                JsonSerializer.Serialize(payload, WireJson.Default.OfflineReceiptPayload));
         }
 
         /// <summary>
@@ -1306,9 +1321,15 @@ namespace Talos.Sdk
         /// <summary>Mutate the persisted binding and write it back.</summary>
         private void Persist(Action<StoredBinding> patch)
         {
-            if (_store == null || _binding == null) return;
+            if (_binding == null) return;
             patch(_binding);
-            _store.Save(_binding);
+            _store?.Save(_binding);
+        }
+
+        private void CheckMachine(string? fph)
+        {
+            if (fph != null && !string.Equals(fph, _fingerprint, StringComparison.Ordinal))
+                throw new TalosSignatureException("token was issued for another machine");
         }
 
         /// <summary>
@@ -1383,9 +1404,12 @@ namespace Talos.Sdk
                 {
                     LicenseState? switched = OfflineSince(generation);
                     if (switched != null) return switched;
-                    string token = doc.RootElement.GetProperty("validation_token").GetString()!;
+                    if (!doc.RootElement.TryGetProperty("validation_token", out var vtEl) || vtEl.ValueKind != JsonValueKind.String)
+                        throw new TalosSignatureException("missing validation_token");
+                    string token = vtEl.GetString()!;
                     JsonElement claims = TalosCompact.Verify(
                         LicenseVerifyKeys(), "validation", _options.ProductToken, nonce, token);
+                    CheckMachine(GetStr(claims, "fph"));
 
                     string decision = claims.TryGetProperty("decision", out var d)
                         ? d.GetString() ?? "invalid"
@@ -1399,7 +1423,7 @@ namespace Talos.Sdk
             {
                 LicenseState? switched = OfflineSince(generation);
                 if (switched != null) return switched;
-                if (e is TalosApiException) throw;
+                if (e is TalosApiException api && !(api.StatusCode >= 500 && api.Error == null)) throw;
                 // An HTTP status is an *answer* — "revoked", "no such machine",
                 // "tenant suspended". Honouring a cached verdict over one would
                 // turn every negative answer into hours of grace, which is the
@@ -1516,9 +1540,12 @@ namespace Talos.Sdk
                 {
                     LicenseState? switched = OfflineSince(generation);
                     if (switched != null) return switched;
+                    if (!doc.RootElement.TryGetProperty("heartbeat_token", out var htEl) || htEl.ValueKind != JsonValueKind.String)
+                        throw new TalosSignatureException("missing heartbeat_token");
                     claims = TalosCompact.Verify(
                         LicenseVerifyKeys(), "heartbeat", _options.ProductToken, nonce,
-                        doc.RootElement.GetProperty("heartbeat_token").GetString()!);
+                        htEl.GetString()!);
+                    CheckMachine(GetStr(claims, "fph"));
 
                     string decision = GetStr(claims, "decision") ?? "invalid";
                     // The cadence comes from the SIGNED claims, never the response
@@ -1526,7 +1553,7 @@ namespace Talos.Sdk
                     // middle can tell a fleet to check in less often.
                     long? interval = Num(claims, "heartbeat_interval_s");
                     if (interval != null && interval.Value > 0)
-                        HeartbeatIntervalSeconds = (int)interval.Value;
+                        HeartbeatIntervalSeconds = (int)Math.Min(interval.Value, int.MaxValue);
                     // Every signed server clock we see pushes the high-water mark
                     // forward, not just validation's — a heartbeat is the most frequent
                     // call there is.
@@ -1679,8 +1706,8 @@ namespace Talos.Sdk
             long serverNow = claims.TryGetProperty("server_time", out var st) && st.ValueKind == JsonValueKind.Number
                 ? st.GetInt64() : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             long budget = Math.Max(1, expiresAt - serverNow);
-            int hinted = root.TryGetProperty("renew_after_s", out var r) && r.ValueKind == JsonValueKind.Number
-                ? r.GetInt32() : 0;
+            int hinted = root.TryGetProperty("renew_after_s", out var r) && r.ValueKind == JsonValueKind.Number && r.TryGetInt32(out var rh)
+                ? rh : 0;
             var lease = new Lease
             {
                 Id = GetStr(claims, "lease") ?? "",
@@ -1688,11 +1715,11 @@ namespace Talos.Sdk
                 ExpiresAt = expiresAt,
                 RenewAfterSeconds = hinted > 0 && hinted <= budget
                     ? hinted
-                    : (int)Math.Max(1, budget / 3),
-                SeatsInUse = claims.TryGetProperty("seats_in_use", out var s) && s.ValueKind == JsonValueKind.Number
-                    ? s.GetInt64() : 0,
-                MaxSeats = claims.TryGetProperty("max_seats", out var m) && m.ValueKind == JsonValueKind.Number
-                    ? m.GetInt32() : 0,
+                    : (int)Math.Min(Math.Max(1L, budget / 3), int.MaxValue),
+                SeatsInUse = claims.TryGetProperty("seats_in_use", out var s) && s.ValueKind == JsonValueKind.Number && s.TryGetInt64(out var siu)
+                    ? siu : 0,
+                MaxSeats = claims.TryGetProperty("max_seats", out var m) && m.ValueKind == JsonValueKind.Number && m.TryGetInt32(out var ms)
+                    ? ms : 0,
             };
 
             if (generation != _leaseGeneration)
@@ -2016,7 +2043,7 @@ namespace Talos.Sdk
             using (var sha = SHA256.Create())
             using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
                 actual = Hex(sha.ComputeHash(fs));
-            if (!string.Equals(actual, delta.Target.Sha256, StringComparison.Ordinal))
+            if (!string.Equals(actual, delta.Target.Sha256, StringComparison.OrdinalIgnoreCase))
                 throw new TalosSignatureException(
                     "applied update does not match the signed manifest: expected "
                     + delta.Target.Sha256 + ", got " + actual);
@@ -2110,7 +2137,7 @@ namespace Talos.Sdk
                     }
 
                     string actual = Hex(hasher.GetHashAndReset());
-                    if (!string.Equals(actual, sha256, StringComparison.Ordinal))
+                    if (!string.Equals(actual, sha256, StringComparison.OrdinalIgnoreCase))
                         throw new TalosSignatureException("artifact hash mismatch (tampered or wrong bytes)");
                 }
 
@@ -2289,7 +2316,21 @@ namespace Talos.Sdk
                 string? err = TryReadError(text);
                 throw new TalosApiException((int)response.StatusCode, err);
             }
-            return string.IsNullOrEmpty(text) ? JsonDocument.Parse("{}") : JsonDocument.Parse(text);
+            if (string.IsNullOrWhiteSpace(text)) return JsonDocument.Parse("{}");
+            try
+            {
+                var doc = JsonDocument.Parse(text);
+                if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                {
+                    doc.Dispose();
+                    throw new TalosSignatureException("unexpected JSON response shape");
+                }
+                return doc;
+            }
+            catch (JsonException)
+            {
+                throw new TalosSignatureException("malformed JSON response");
+            }
         }
 
         private static string? TryReadError(string text)
