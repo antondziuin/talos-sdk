@@ -2121,7 +2121,7 @@ namespace Talos.Sdk
             string? downloadPath, long size, string sha256, string destPath,
             IProgress<DownloadProgress>? progress, CancellationToken ct)
         {
-            if (string.IsNullOrEmpty(downloadPath)) throw new TalosException("artifact has no download path");
+            if (downloadPath == null || downloadPath.Length == 0) throw new TalosException("artifact has no download path");
             // `download_path` comes from the unsigned envelope; require a relative
             // same-origin path before attaching `x-talos-activation-secret`.
             if (!downloadPath.StartsWith("/", StringComparison.Ordinal)

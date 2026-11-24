@@ -1294,6 +1294,7 @@ impl RegistryLicenseClient {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_replacement(
         &self,
         candidate: ParsedManifest,

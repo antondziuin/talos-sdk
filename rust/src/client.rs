@@ -1776,7 +1776,9 @@ impl Inner {
         if !path.starts_with('/')
             || path.starts_with("//")
             || path.contains('\\')
-            || path.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+            || path
+                .bytes()
+                .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
         {
             return Err(Error::signature("invalid artifact download path"));
         }
