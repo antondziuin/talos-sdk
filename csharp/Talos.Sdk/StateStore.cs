@@ -475,21 +475,52 @@ namespace Talos.Sdk
                 Buffer.BlockCopy(iv, 0, outBytes, Magic.Length, IvLen);
                 Buffer.BlockCopy(sealedBytes, 0, outBytes, Magic.Length + IvLen, sealedBytes.Length);
 
-                string dir = Path.GetDirectoryName(_path)!;
-                Directory.CreateDirectory(dir);
-                // Write-then-replace: a crash mid-write leaves the previous
-                // binding intact rather than a half file that reads as "never
-                // activated".
-                string tmp = _path + ".tmp";
-                File.WriteAllBytes(tmp, outBytes);
+                string? dir = Path.GetDirectoryName(_path);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                // Write-then-replace with a random unique exclusive temp file so
+                // concurrent saves never clobber each other and symlinks are not followed.
+                byte[] suffixBytes = new byte[8];
+                using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(suffixBytes);
+                string tmp = _path + "." + BitConverter.ToString(suffixBytes).Replace("-", "").ToLowerInvariant() + ".tmp";
+                try
+                {
 #if NET8_0_OR_GREATER
-                File.Move(tmp, _path, overwrite: true);
-#else
-                if (File.Exists(_path))
-                    File.Replace(tmp, _path, null);
-                else
-                    File.Move(tmp, _path);
+                    if (!OperatingSystem.IsWindows())
+                    {
+                        using var fs = new FileStream(tmp, new FileStreamOptions
+                        {
+                            Mode = FileMode.CreateNew,
+                            Access = FileAccess.Write,
+                            Share = FileShare.None,
+                            UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                        });
+                        fs.Write(outBytes, 0, outBytes.Length);
+                        fs.Flush(true);
+                    }
+                    else
 #endif
+                    {
+                        using var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                        fs.Write(outBytes, 0, outBytes.Length);
+                        fs.Flush(true);
+                    }
+#if NET8_0_OR_GREATER
+                    File.Move(tmp, _path, overwrite: true);
+#else
+                    if (File.Exists(_path))
+                        File.Replace(tmp, _path, null);
+                    else
+                        File.Move(tmp, _path);
+#endif
+                }
+                catch
+                {
+                    try { File.Delete(tmp); } catch { }
+                    throw;
+                }
                 return true;
             }
             catch

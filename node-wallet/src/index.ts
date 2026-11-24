@@ -396,6 +396,8 @@ export class WalletLicenseClient {
       lease.instance_id !== this.instanceId ||
       !Number.isSafeInteger(lease.issued_at) ||
       !Number.isSafeInteger(lease.expires_at) ||
+      lease.issued_at < 0 ||
+      lease.expires_at < lease.issued_at ||
       lease.expires_at - lease.issued_at > 60 ||
       lease.issued_at < challenge.issued_at ||
       (this.certificate.license.expires_at !== 0 &&

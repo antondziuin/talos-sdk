@@ -169,8 +169,23 @@ namespace Talos.Sdk
             using var res = await _http.SendAsync(req, timeout.Token).ConfigureAwait(false);
             string raw = await res.Content.ReadAsStringAsync().ConfigureAwait(false);
             if (raw.Length > 65536) throw new HttpRequestException("response_too_large");
+            if (!res.IsSuccessStatusCode)
+            {
+                string? code = null;
+                try
+                {
+                    using var errDoc = JsonDocument.Parse(raw);
+                    if (errDoc.RootElement.ValueKind == JsonValueKind.Object
+                        && errDoc.RootElement.TryGetProperty("error", out var error)
+                        && error.ValueKind == JsonValueKind.String)
+                    {
+                        code = error.GetString();
+                    }
+                }
+                catch (JsonException) { }
+                throw new HttpRequestException(string.IsNullOrEmpty(code) ? "coordinator_unavailable" : code);
+            }
             using var doc = JsonDocument.Parse(raw);
-            if (!res.IsSuccessStatusCode) throw new HttpRequestException(doc.RootElement.TryGetProperty("error", out var error) ? error.GetString() : "coordinator_unavailable");
             return doc.RootElement.Clone();
         }
         private async Task Exchange(string action, CancellationToken ct)

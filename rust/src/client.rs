@@ -1469,9 +1469,18 @@ impl Inner {
         if let Some(interval) = number(claims.get("heartbeat_interval_s")).filter(|i| *i > 0) {
             m.heartbeat_interval = Some(interval);
         }
+        let decision = decision_of(&claims);
         // Every signed server clock pushes the mark forward, not only
         // validation's — a heartbeat is the most frequent call there is.
         Self::advance_clock(&mut m, &claims);
+        // If a signed heartbeat reports revocation/suspension/expiry/deactivation,
+        // drop any cached validation token so offline fallback cannot resurrect a
+        // revoked license until its old grace window expires.
+        if decision != Decision::Valid {
+            if let Some(binding) = m.binding.as_mut() {
+                binding.validation = None;
+            }
+        }
         self.save(&m);
         // A heartbeat carries the decision but not the entitlement bag; keep
         // the rest of the last activate/validate.
@@ -1479,7 +1488,7 @@ impl Inner {
         let state = self.adopt_locked(
             m,
             LicenseState {
-                decision: decision_of(&claims),
+                decision,
                 is_offline: false,
                 ..previous.unwrap_or_else(|| LicenseState::bare(Decision::Valid, false))
             },
@@ -1619,6 +1628,7 @@ impl Inner {
         let secret = self.require_activated()?;
         self.ensure_keyset()?;
         let floor = self.release_floor(options.current_release_seq);
+        let requested_channel = options.channel.clone().unwrap_or_else(|| self.channel());
         let body = self.post(
             "/v1/client/updates/check",
             json!({
@@ -1627,7 +1637,7 @@ impl Inner {
                 "activation_secret": secret,
                 "current_version": options.current_version.clone().or_else(|| self.app_version.clone()),
                 "current_release_seq": floor,
-                "channel": options.channel.clone().unwrap_or_else(|| self.channel()),
+                "channel": requested_channel,
             }),
         )?;
         if body.get("update_available") != Some(&Value::Bool(true)) {
@@ -1646,6 +1656,13 @@ impl Inner {
                 self.now(),
             )?
         };
+        if let Some(ch) = m.get("channel").and_then(Value::as_str) {
+            if ch != requested_channel {
+                return Err(Error::signature(format!(
+                    "manifest channel \"{ch}\" does not match requested channel \"{requested_channel}\""
+                )));
+            }
+        }
         let release_seq = number(m.get("release_seq")).unwrap_or(0);
         if floor.is_some_and(|floor| release_seq <= floor) {
             // Checked here as well as on the server: the server's answer is the
@@ -1753,6 +1770,16 @@ impl Inner {
     ) -> Result<()> {
         let secret = self.require_activated()?;
         let path = download_path.ok_or_else(|| Error::usage("artifact has no download path"))?;
+        // `download_path` comes from the unsigned envelope; require a relative
+        // origin path so concatenating onto `self.server_url` can never hijack
+        // the authority and exfiltrate `x-talos-activation-secret`.
+        if !path.starts_with('/')
+            || path.starts_with("//")
+            || path.contains('\\')
+            || path.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        {
+            return Err(Error::signature("invalid artifact download path"));
+        }
         let response = self
             .transport
             .send(HttpRequest {

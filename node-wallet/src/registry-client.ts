@@ -399,14 +399,16 @@ export class RegistryLicenseClient {
       if (typeof result !== "string" || !/^0x(?:[0-9a-f]{2})*$/i.test(result)) throw new RegistryLicenseError("invalid_registry_rpc_response");
       return result as Hex;
     };
-    const decode = <T extends "registryVersion" | "getLicense" | "checkLicense">(functionName: T, data: Hex) => {
-      try { return decodeFunctionResult({ abi: registryAbi, functionName, data }); }
+    const decode = <T>(fn: () => T): T => {
+      try { return fn(); }
       catch { throw new RegistryLicenseError("invalid_registry_rpc_response"); }
     };
-    const version = decode("registryVersion", await call(encodeFunctionData({ abi: registryAbi, functionName: "registryVersion" })));
+    const versionData = await call(encodeFunctionData({ abi: registryAbi, functionName: "registryVersion" }));
+    const version = decode(() => decodeFunctionResult({ abi: registryAbi, functionName: "registryVersion", data: versionData }));
     if (version !== 1n) throw new RegistryLicenseError("wrong_registry_version");
     const m = license.manifest;
-    const record = decode("getLicense", await call(encodeFunctionData({ abi: registryAbi, functionName: "getLicense", args: [this.options.issuer, this.options.productId, m.license_id] })));
+    const recordData = await call(encodeFunctionData({ abi: registryAbi, functionName: "getLicense", args: [this.options.issuer, this.options.productId, m.license_id] }));
+    const record = decode(() => decodeFunctionResult({ abi: registryAbi, functionName: "getLicense", args: [this.options.issuer, this.options.productId, m.license_id], data: recordData }));
     const [holder, device, notBefore, expiresAt, entitlementsHash, revision, status] = record;
     if (status > 3 || (status !== 0 && revision === 0n) || [notBefore, expiresAt, revision].some(v => v > BigInt(Number.MAX_SAFE_INTEGER))) throw new RegistryLicenseError("invalid_registry_record");
     const current = this.now();
@@ -417,7 +419,8 @@ export class RegistryLicenseClient {
       : notBefore > BigInt(timestamp) || notBefore > BigInt(current) ? "license_not_started"
       : expiresAt !== 0n && (expiresAt <= BigInt(timestamp) || expiresAt <= BigInt(current) || expiresAt <= notBefore) ? "license_expired" : undefined;
     if (!refusal) {
-      const valid = decode("checkLicense", await call(encodeFunctionData({ abi: registryAbi, functionName: "checkLicense", args: [this.options.issuer, this.options.productId, m.license_id, m.holder, this.deviceKey, license.entitlementsHash] })));
+      const checkData = await call(encodeFunctionData({ abi: registryAbi, functionName: "checkLicense", args: [this.options.issuer, this.options.productId, m.license_id, m.holder, this.deviceKey, license.entitlementsHash] }));
+      const valid = decode(() => decodeFunctionResult({ abi: registryAbi, functionName: "checkLicense", args: [this.options.issuer, this.options.productId, m.license_id, m.holder, this.deviceKey, license.entitlementsHash], data: checkData }));
       if (!valid) refusal = "registry_license_rejected";
     }
     const canonical = await this.rpc(url, "eth_getBlockByNumber", [block.tag, false]);

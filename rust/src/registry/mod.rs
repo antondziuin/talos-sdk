@@ -835,10 +835,20 @@ impl RegistryLicenseClient {
                         && binding.machine_public_key.as_deref() == Some(public.as_str())
                 })
                 .ok_or_else(|| RegistryError::new("device_state_not_saved"))?;
-            // The clock high-water marks belong to this computer, not to a license.
+            // The clock high-water marks and chain observations belong to this
+            // computer/chain, not just to one license: preserve terminal revocations
+            // and the highest observed head across code replacements.
             if let Some(old) = store.load() {
                 next.time_high_water = next.time_high_water.max(old.time_high_water);
                 next.offline_seen = next.offline_seen.max(old.offline_seen);
+                let old_chain = chain::parse_chain_state(old.registry_chain_state.as_deref())?;
+                let next_chain = chain::parse_chain_state(next.registry_chain_state.as_deref())?;
+                if let Some(merged) = merge_chain_states(old_chain, next_chain)? {
+                    next.registry_chain_state = Some(
+                        serde_json::to_string(&merged)
+                            .map_err(|_| RegistryError::new("invalid_registry_chain_state"))?,
+                    );
+                }
             }
             if !store.save(&next) {
                 return Err(RegistryError::new("device_state_not_saved"));
@@ -931,6 +941,18 @@ impl RegistryLicenseClient {
             let Some(basis) = OfflineBasis::parse(binding.registry_offline.as_deref()) else {
                 return Err(cause.clone());
             };
+            // Never let a cached offline basis override a terminally revoked
+            // license or a newer on-chain revision already recorded in chain state.
+            if let Some(seen) = chain::parse_chain_state(binding.registry_chain_state.as_deref())? {
+                if let Some(obs) = seen.licenses.get(&candidate.manifest.license_id) {
+                    if obs.revoked {
+                        return Err(RegistryError::new("license_revoked"));
+                    }
+                    if obs.revision > basis.revision {
+                        return Err(cause.clone());
+                    }
+                }
+            }
             // The same license, under the same terms, that was observed.
             if basis.license_id != candidate.manifest.license_id
                 || basis.entitlements_hash != candidate.entitlements_hash
@@ -1731,6 +1753,9 @@ impl RegistryLicenseClient {
                 .time_high_water
                 .max(observation.head.timestamp as i64);
             binding.offline_seen = binding.offline_seen.max(self.now() as i64);
+            if terminal || observation.refusal.is_some() {
+                binding.registry_offline = None;
+            }
             self.save_binding(binding)?;
             Ok(terminal)
         })?;
@@ -1848,6 +1873,53 @@ fn notify(
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(progress)));
     }
 }
+fn merge_chain_states(
+    old: Option<chain::RegistryChainState>,
+    next: Option<chain::RegistryChainState>,
+) -> RegistryResult<Option<chain::RegistryChainState>> {
+    match (old, next) {
+        (None, None) => Ok(None),
+        (Some(state), None) | (None, Some(state)) => Ok(Some(state)),
+        (Some(old), Some(next)) => {
+            let old_num = old
+                .head
+                .number
+                .parse::<u64>()
+                .map_err(|_| RegistryError::new("invalid_registry_chain_state"))?;
+            let next_num = next
+                .head
+                .number
+                .parse::<u64>()
+                .map_err(|_| RegistryError::new("invalid_registry_chain_state"))?;
+            let head = if next_num > old_num
+                || (next_num == old_num && next.head.timestamp >= old.head.timestamp)
+            {
+                next.head
+            } else {
+                old.head
+            };
+            let mut licenses = old.licenses;
+            for (id, obs) in next.licenses {
+                licenses
+                    .entry(id)
+                    .and_modify(|e| {
+                        e.revision = e.revision.max(obs.revision);
+                        e.revoked |= obs.revoked;
+                    })
+                    .or_insert(obs);
+            }
+            if licenses.len() > 64 {
+                return Err(RegistryError::new("invalid_registry_chain_state"));
+            }
+            Ok(Some(chain::RegistryChainState {
+                v: 1,
+                head,
+                licenses,
+            }))
+        }
+    }
+}
+
 const PORTABLE_KIND: &str = "talos-registry-portable-license";
 
 /// The application's pins in canonical form, validated.

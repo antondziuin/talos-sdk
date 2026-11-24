@@ -337,16 +337,25 @@ export class StateStore {
       const out = Buffer.concat([MAGIC, iv, c.getAuthTag(), body]);
 
       mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-      // Write-then-rename: a crash mid-write leaves the previous binding
-      // intact rather than a half file that reads as "never activated".
-      const tmp = `${this.path}.tmp`;
-      writeFileSync(tmp, out, { mode: 0o600 });
+      // Write-then-rename with a unique exclusive temp file so concurrent saves
+      // do not clobber each other and a planted symlink is never followed.
+      const tmp = `${this.path}.${randomBytes(8).toString("hex")}.tmp`;
       try {
-        chmodSync(tmp, 0o600); // no-op on Windows; explicit on POSIX umasks
-      } catch {
-        /* ignore */
+        writeFileSync(tmp, out, { flag: "wx", mode: 0o600 });
+        try {
+          chmodSync(tmp, 0o600); // no-op on Windows; explicit on POSIX umasks
+        } catch {
+          /* ignore */
+        }
+        renameSync(tmp, this.path);
+      } catch (err) {
+        try {
+          rmSync(tmp, { force: true });
+        } catch {
+          /* ignore */
+        }
+        throw err;
       }
-      renameSync(tmp, this.path);
       return true;
     } catch {
       return false;

@@ -230,7 +230,7 @@ namespace Talos.Sdk
             }
             catch (HttpRequestException) { throw new TransientRpcException("registry_rpc_unavailable"); }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new TransientRpcException("registry_rpc_unavailable"); }
-            catch (Exception e) when (e is JsonException || e is KeyNotFoundException || e is InvalidOperationException) { throw new RegistryLicenseException("invalid_registry_rpc_response"); }
+            catch (Exception e) when (e is JsonException || e is KeyNotFoundException || e is InvalidOperationException || e is FormatException || e is OverflowException) { throw new RegistryLicenseException("invalid_registry_rpc_response"); }
         }
 
         private static void Empty(Utf8JsonWriter w) { w.WriteStartArray(); w.WriteEndArray(); }
@@ -250,6 +250,7 @@ namespace Talos.Sdk
         private async Task<string> EthCall(string endpoint, string data, string block, CancellationToken ct)
         {
             var result = await Rpc(endpoint, "eth_call", w => { w.WriteStartArray(); w.WriteStartObject(); w.WriteString("to", _options.Contract); w.WriteString("data", data); w.WriteEndObject(); w.WriteStringValue(block); w.WriteEndArray(); }, ct).ConfigureAwait(false);
+            if (result.ValueKind != JsonValueKind.String) throw new RegistryLicenseException("invalid_registry_rpc_response");
             return result.GetString() ?? throw new RegistryLicenseException("invalid_registry_rpc_response");
         }
 
@@ -274,6 +275,7 @@ namespace Talos.Sdk
         private async Task<RegistryLicenseState> Read(string endpoint, RegistryLicenseManifest m, JsonElement entitlements, string entitlementsHash, int generation, CancellationToken ct)
         {
             var chain = await Rpc(endpoint, "eth_chainId", Empty, ct).ConfigureAwait(false);
+            if (chain.ValueKind != JsonValueKind.String) throw new RegistryLicenseException("invalid_registry_rpc_response");
             if (Quantity(chain.GetString()) != _options.ChainId) throw new RegistryLicenseException("wrong_rpc_chain");
             var saved = _store.Load(); var initial = ChainState(saved?.RegistryChainState);
             var block = Block(await BlockAt(endpoint, "latest", ct).ConfigureAwait(false)); bool reorg = false;
@@ -307,6 +309,7 @@ namespace Talos.Sdk
                 try { return Bytes(hex, len); }
                 catch (Exception e) when (e is ArgumentException || e is FormatException) { throw new RegistryLicenseException("invalid_registry_rpc_response"); }
             }
+            if (code.ValueKind != JsonValueKind.String) throw new RegistryLicenseException("invalid_registry_rpc_response");
             string codeHex = code.GetString() ?? "";
             if (codeHex.Length <= 2 || codeHex.Length % 2 != 0) throw new RegistryLicenseException("registry_contract_missing");
             CheckedBytes(codeHex, (codeHex.Length - 2) / 2);

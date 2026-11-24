@@ -333,8 +333,9 @@ impl StateStore {
         out.extend_from_slice(&iv);
         out.extend_from_slice(&sealed);
 
-        let dir = self.path.parent()?;
-        create_private_dir(dir).ok()?;
+        if let Some(dir) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            create_private_dir(dir).ok()?;
+        }
         // Write-then-rename: a crash mid-write leaves the previous binding
         // intact rather than a half file that reads as "never activated".
         let mut tmp = self.path.clone().into_os_string();

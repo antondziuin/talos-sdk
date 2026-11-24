@@ -1377,7 +1377,7 @@ export class TalosClient {
       // or a response that fails verification (a garbled or forged reply tells
       // us nothing, so per the trust model it is treated as unreachable, never
       // as valid).
-      if (e instanceof TalosApiError && !(e.status >= 500 && !e.code)) throw e;
+      if (e instanceof TalosApiError && !(e.statusCode >= 500 && !e.errorCode)) throw e;
       const offline = this.offlineDecision();
       if (!offline) throw e;
       return this.adopt(offline);
@@ -1534,7 +1534,14 @@ export class TalosClient {
       // Every signed server clock we see pushes the high-water mark forward, not
       // just validation's — a heartbeat is the most frequent call there is.
       this.advanceClock(claims);
-      this.persist({ timeHighWater: this.binding?.timeHighWater });
+      // If a signed heartbeat reports revocation/suspension/expiry/deactivation,
+      // clear any cached validation token so a subsequent offline fallback cannot
+      // resurrect a revoked licence until its old grace window expires.
+      this.persist(
+        decision === "valid"
+          ? { timeHighWater: this.binding?.timeHighWater }
+          : { validation: undefined, timeHighWater: this.binding?.timeHighWater },
+      );
       // A heartbeat carries the decision but not the entitlement bag; keep the
       // features from the last activate/validate.
       const state = this.adopt(
@@ -1616,13 +1623,16 @@ export class TalosClient {
       nonce,
     });
 
+    if (typeof body["lease_token"] !== "string") {
+      throw new TalosSignatureError("missing lease_token");
+    }
     // The lease token is signed: a MITM cannot fabricate a seat.
     const claims = verifyToken(
       this.licenseVerifyKeys(),
       "lease",
       this.options.productToken,
       nonce,
-      body["lease_token"] as string,
+      body["lease_token"],
     );
 
     // The signed grant must be for the instance and machine we asked about —
@@ -1737,13 +1747,14 @@ export class TalosClient {
   async checkForUpdate(opts: CheckForUpdateOptions = {}): Promise<UpdateInfo | null> {
     this.requireActivated();
     await this.ensureKeyset();
+    const requestedChannel = opts.channel ?? this.updateChannel();
     const body = await this.post("/v1/client/updates/check", {
       product_token: this.options.productToken,
       fingerprint: { composite: this.fingerprint, components: this.fp.components },
       activation_secret: this.activationSecret,
       current_version: opts.currentVersion ?? this.options.appVersion,
       current_release_seq: this.releaseFloor(opts.currentReleaseSeq),
-      channel: opts.channel ?? this.updateChannel(),
+      channel: requestedChannel,
     });
     if (body["update_available"] !== true) return null;
 
@@ -1753,6 +1764,11 @@ export class TalosClient {
     }
     // Trust only the signed manifest for version/seq/artifact metadata.
     const m = verifyManifest(this.releaseVerifyKeys(), this.options.productToken, manifestToken);
+    if (typeof m["channel"] === "string" && m["channel"] !== requestedChannel) {
+      throw new TalosSignatureError(
+        `manifest channel "${m["channel"]}" does not match requested channel "${requestedChannel}"`,
+      );
+    }
     const releaseSeq = typeof m["release_seq"] === "number" ? (m["release_seq"] as number) : 0;
     const floor = this.releaseFloor(opts.currentReleaseSeq);
     if (floor !== undefined && releaseSeq <= floor) {
@@ -1949,6 +1965,22 @@ export class TalosClient {
     onProgress?: DownloadProgressCallback,
   ): Promise<void> {
     if (!downloadPath) throw new TalosError("artifact has no download path");
+    // `download_path` comes from the unsigned response envelope; reject anything
+    // that could hijack the URL authority or escape the configured server origin
+    // before attaching `x-talos-activation-secret`.
+    if (
+      !downloadPath.startsWith("/") ||
+      downloadPath.startsWith("//") ||
+      downloadPath.includes("\\") ||
+      /[\s\r\n]/.test(downloadPath)
+    ) {
+      throw new TalosSignatureError("invalid artifact download path");
+    }
+    const base = new URL(this.options.serverUrl);
+    const resolved = new URL(downloadPath, base);
+    if (resolved.origin !== base.origin) {
+      throw new TalosSignatureError("artifact download path escapes server origin");
+    }
     const url = this.options.serverUrl.replace(/\/+$/, "") + downloadPath;
     const res = await this.doFetch(url, {
       method: "GET",
@@ -1977,7 +2009,12 @@ export class TalosClient {
       received += chunk.byteLength;
       if (received > size) throw new TalosSignatureError("artifact exceeds manifest size");
       hash.update(chunk);
-      await handle.write(chunk);
+      let written = 0;
+      while (written < chunk.byteLength) {
+        const res = await handle.write(chunk, written, chunk.byteLength - written);
+        if (res.bytesWritten <= 0) throw new TalosError("short write while saving artifact");
+        written += res.bytesWritten;
+      }
       onProgress?.({ bytesReceived: received, totalBytes: size });
     };
     try {

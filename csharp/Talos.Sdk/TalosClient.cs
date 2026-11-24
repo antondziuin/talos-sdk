@@ -730,7 +730,10 @@ namespace Talos.Sdk
                         // licence) is gone. Anything else is a real failure and must
                         // not be papered over by silently spending a seat.
                     }
-                    ForgetBinding();
+                    using (new LicensingScope(this))
+                    {
+                        ForgetBinding();
+                    }
                 }
 
                 string nonce = NewNonce();
@@ -836,18 +839,21 @@ namespace Talos.Sdk
         /// </remarks>
         private (string PrivateKey, string PublicKey) MachineKey()
         {
-            if (_binding?.MachineKey is { Length: > 0 } held
-                && _binding.MachinePublicKey is { Length: > 0 } pub)
+            using (new LicensingScope(this))
             {
-                return (held, pub);
+                if (_binding?.MachineKey is { Length: > 0 } held
+                    && _binding.MachinePublicKey is { Length: > 0 } pub)
+                {
+                    return (held, pub);
+                }
+                var key = Offline.GenerateMachineKey();
+                StoredBinding b = BindingBase();
+                b.MachineKey = key.PrivateKey;
+                b.MachinePublicKey = key.PublicKey;
+                _binding = b;
+                _store?.Save(b);
+                return key;
             }
-            var key = Offline.GenerateMachineKey();
-            StoredBinding b = BindingBase();
-            b.MachineKey = key.PrivateKey;
-            b.MachinePublicKey = key.PublicKey;
-            _binding = b;
-            _store?.Save(b);
-            return key;
         }
 
         /// <summary>
@@ -1458,11 +1464,17 @@ namespace Talos.Sdk
         /// </summary>
         private LicenseState? OfflineDecision()
         {
-            string? token = _binding?.Validation;
-            if (string.IsNullOrEmpty(token)) return null;
+            string? token;
+            long highWater;
+            using (new LicensingScope(this))
+            {
+                StoredBinding? b = _binding;
+                token = b?.Validation;
+                if (string.IsNullOrEmpty(token)) return null;
+                highWater = b!.TimeHighWater;
+            }
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-            long highWater = _binding!.TimeHighWater;
             if (highWater > 0 && now + ClockSkewSeconds < highWater)
             {
                 // Distinct from "expired": nothing has run out, the machine is
@@ -1558,7 +1570,13 @@ namespace Talos.Sdk
                     // forward, not just validation's — a heartbeat is the most frequent
                     // call there is.
                     AdvanceClock(claims);
-                    Persist(_ => { });
+                    // Clear any cached validation token on a negative signed
+                    // heartbeat so offline fallback cannot resurrect a revoked
+                    // licence until its old grace window expires.
+                    Persist(b =>
+                    {
+                        if (decision != "valid") b.Validation = null;
+                    });
                     // A heartbeat carries the decision but not the entitlement bag; keep
                     // the features from the last activate/validate.
                     state = Adopt(new LicenseState
@@ -1686,10 +1704,12 @@ namespace Talos.Sdk
                 .ConfigureAwait(false);
             JsonElement root = doc.RootElement;
 
+            if (!root.TryGetProperty("lease_token", out var ltEl) || ltEl.ValueKind != JsonValueKind.String)
+                throw new TalosSignatureException("missing lease_token");
             // The lease token is signed: a MITM cannot fabricate a seat.
             JsonElement claims = TalosCompact.Verify(
                 LicenseVerifyKeys(), "lease", _options.ProductToken, nonce,
-                root.GetProperty("lease_token").GetString()!);
+                ltEl.GetString()!);
 
             // The signed grant must be for the instance and machine we asked
             // about — otherwise a server could hand every process one seat's token.
@@ -1701,10 +1721,10 @@ namespace Talos.Sdk
             // scheduling hint; the budget comes from the token's OWN clock
             // (exp vs server_time) so a wrong local clock cannot collapse the
             // renew loop into a tight retry storm.
-            long expiresAt = claims.TryGetProperty("exp", out var e) && e.ValueKind == JsonValueKind.Number
-                ? e.GetInt64() : 0;
-            long serverNow = claims.TryGetProperty("server_time", out var st) && st.ValueKind == JsonValueKind.Number
-                ? st.GetInt64() : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            long expiresAt = claims.TryGetProperty("exp", out var e) && e.ValueKind == JsonValueKind.Number && e.TryGetInt64(out var expVal)
+                ? expVal : 0;
+            long serverNow = claims.TryGetProperty("server_time", out var st) && st.ValueKind == JsonValueKind.Number && st.TryGetInt64(out var stVal)
+                ? stVal : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             long budget = Math.Max(1, expiresAt - serverNow);
             int hinted = root.TryGetProperty("renew_after_s", out var r) && r.ValueKind == JsonValueKind.Number && r.TryGetInt32(out var rh)
                 ? rh : 0;
@@ -1845,6 +1865,7 @@ namespace Talos.Sdk
             RequireActivated();
             await EnsureKeysetAsync(ct).ConfigureAwait(false);
             opts ??= new CheckForUpdateOptions();
+            string requestedChannel = opts.Channel ?? UpdateChannel();
             var body = new UpdateCheckReq
             {
                 ProductToken = _options.ProductToken,
@@ -1852,7 +1873,7 @@ namespace Talos.Sdk
                 ActivationSecret = _activationSecret,
                 CurrentVersion = opts.CurrentVersion ?? _options.AppVersion,
                 CurrentReleaseSeq = ReleaseFloor(opts.CurrentReleaseSeq),
-                Channel = opts.Channel ?? UpdateChannel(),
+                Channel = requestedChannel,
             };
             using var doc = await PostAsync(
                 "/v1/client/updates/check", body, WireJson.Default.UpdateCheckReq, ct)
@@ -1861,13 +1882,17 @@ namespace Talos.Sdk
             if (!root.TryGetProperty("update_available", out var ua) || ua.ValueKind != JsonValueKind.True)
                 return null;
 
-            string manifest = root.GetProperty("manifest").GetString()
-                ?? throw new TalosSignatureException("update available but no manifest");
+            if (!root.TryGetProperty("manifest", out var manEl) || manEl.ValueKind != JsonValueKind.String)
+                throw new TalosSignatureException("update available but no manifest");
+            string manifest = manEl.GetString()!;
             // Trust only the signed manifest for version/seq/artifact metadata.
             JsonElement m = TalosCompact.VerifyManifest(ReleaseVerifyKeys(), _options.ProductToken, manifest);
+            string? manifestChannel = GetStr(m, "channel");
+            if (manifestChannel != null && manifestChannel != requestedChannel)
+                throw new TalosSignatureException($"manifest channel \"{manifestChannel}\" does not match requested channel \"{requestedChannel}\"");
 
-            long releaseSeq = m.TryGetProperty("release_seq", out var rs) && rs.ValueKind == JsonValueKind.Number
-                ? rs.GetInt64() : 0;
+            long releaseSeq = m.TryGetProperty("release_seq", out var rs) && rs.ValueKind == JsonValueKind.Number && rs.TryGetInt64(out var rsVal)
+                ? rsVal : 0;
             // Anti-downgrade, checked here as well as on the server: the
             // server's answer is the one an attacker replaces, and this one is
             // checked against a mark on this machine and a manifest signed by
@@ -2097,8 +2122,25 @@ namespace Talos.Sdk
             IProgress<DownloadProgress>? progress, CancellationToken ct)
         {
             if (string.IsNullOrEmpty(downloadPath)) throw new TalosException("artifact has no download path");
+            // `download_path` comes from the unsigned envelope; require a relative
+            // same-origin path before attaching `x-talos-activation-secret`.
+            if (!downloadPath.StartsWith("/", StringComparison.Ordinal)
+                || downloadPath.StartsWith("//", StringComparison.Ordinal)
+                || downloadPath.IndexOf('\\') >= 0
+                || downloadPath.Any(c => char.IsControl(c) || char.IsWhiteSpace(c)))
+            {
+                throw new TalosSignatureException("invalid artifact download path");
+            }
+            var baseUri = new Uri(_options.ServerUrl);
+            var targetUri = new Uri(_options.ServerUrl.TrimEnd('/') + downloadPath);
+            if (!string.Equals(targetUri.Scheme, baseUri.Scheme, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(targetUri.Host, baseUri.Host, StringComparison.OrdinalIgnoreCase)
+                || targetUri.Port != baseUri.Port)
+            {
+                throw new TalosSignatureException("artifact download path escapes server origin");
+            }
 
-            using var req = new HttpRequestMessage(HttpMethod.Get, _options.ServerUrl.TrimEnd('/') + downloadPath);
+            using var req = new HttpRequestMessage(HttpMethod.Get, targetUri);
             req.Headers.TryAddWithoutValidation("x-talos-product-token", _options.ProductToken);
             req.Headers.TryAddWithoutValidation("x-talos-activation-secret", _activationSecret);
             req.Headers.TryAddWithoutValidation("x-talos-fingerprint", _fingerprint);
